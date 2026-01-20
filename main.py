@@ -2,12 +2,13 @@
 Muse 2 EEG Stream Reader with Real-time Processing
 Connects directly to Muse 2 using BrainFlow and applies denoising/filtering
 """
-import numpy as np
+import time
 import argparse
+from collections import deque
+import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from scipy import signal
-from collections import deque
 from brainflow.board_shim import BoardShim, BrainFlowInputParams, BoardIds
 
 def parse_args():
@@ -94,8 +95,16 @@ class MuseBrainFlowProcessor:
         low = lowcut / nyquist
         high = highcut / nyquist
         
-        b, a = signal.butter(4, [low, high], btype='band')
-        filtered = signal.filtfilt(b, a, data)
+        try:
+            result = signal.butter(4, [low, high], btype='band')
+            if result is None or len(result) != 2:
+                filtered = data
+            else:
+                b, a = result
+                filtered = signal.filtfilt(b, a, data)
+        except Exception:
+            # If filtering fails, return original data
+            filtered = data
         return filtered
     
     def apply_notch_filter(self, data, freq=60):
@@ -128,7 +137,6 @@ class MuseBrainFlowProcessor:
         Yields:
             (raw_data, processed_data) tuples
         """
-        import time
         start_time = time.time()
 
         try:
