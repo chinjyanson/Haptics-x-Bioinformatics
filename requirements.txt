@@ -1,3 +1,9 @@
 brainflow
 muselsl
 meegkit
+bleak
+numpy
+scipy
+matplotlib
+mne
+pysimplegui

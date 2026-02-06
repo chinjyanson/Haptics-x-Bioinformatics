@@ -107,6 +107,9 @@ class PolarH10:
         if not self.device:
             await self.find_device()
         
+        if not self.device:
+            raise Exception("Device not found, cannot connect")
+        
         print(f"\nConnecting to {self.device.name}...")
         
         async with BleakClient(self.device.address) as client:
