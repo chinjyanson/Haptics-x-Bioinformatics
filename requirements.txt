@@ -5,5 +5,9 @@ bleak
 numpy
 scipy
 matplotlib
+pandas
 mne
 pysimplegui
+PyWavelets
+scikit-learn
+sounddevice

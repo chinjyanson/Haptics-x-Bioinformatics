@@ -20,6 +20,7 @@ import numpy as np
 # Import device classes
 from muse import MuseBrainFlowProcessor
 from polar import PolarH10, HEART_RATE_MEASUREMENT_UUID
+from esense import ESenseGSR
 
 
 @dataclass
@@ -38,6 +39,15 @@ class TimestampedHRSample:
 
 
 @dataclass
+class TimestampedGSRSample:
+    """Single GSR sample with synchronized timestamp"""
+    timestamp: float  # Unix timestamp
+    raw_audio: float  # Raw audio amplitude
+    filtered_signal: float  # Lowpass filtered signal
+    gsr_uS: float  # Calibrated conductance in microsiemens
+
+
+@dataclass
 class SynchronizedDataStore:
     """
     Central data store for synchronized multi-device data collection.
@@ -46,10 +56,12 @@ class SynchronizedDataStore:
     session_start: float = field(default_factory=time.time)
     eeg_data: List[TimestampedEEGSample] = field(default_factory=list)
     hr_data: List[TimestampedHRSample] = field(default_factory=list)
+    gsr_data: List[TimestampedGSRSample] = field(default_factory=list)
 
     # Metadata
     muse_sampling_rate: int = 256
     muse_channels: List[str] = field(default_factory=lambda: ['TP9', 'AF7', 'AF8', 'TP10'])
+    gsr_sampling_rate: int = 50  # Downsampled rate
 
     def add_eeg_sample(self, timestamp: float, channel_values: Dict[str, float]):
         """Add a timestamped EEG sample"""
@@ -65,6 +77,16 @@ class SynchronizedDataStore:
         )
         self.hr_data.append(sample)
 
+    def add_gsr_sample(self, timestamp: float, raw_audio: float, filtered_signal: float, gsr_uS: float):
+        """Add a timestamped GSR sample"""
+        sample = TimestampedGSRSample(
+            timestamp=timestamp,
+            raw_audio=raw_audio,
+            filtered_signal=filtered_signal,
+            gsr_uS=gsr_uS
+        )
+        self.gsr_data.append(sample)
+
     def get_relative_time(self, timestamp: float) -> float:
         """Convert absolute timestamp to relative time from session start"""
         return timestamp - self.session_start
@@ -78,6 +100,7 @@ class SynchronizedDataStore:
                 'session_start_iso': datetime.fromtimestamp(self.session_start).isoformat(),
                 'muse_sampling_rate': self.muse_sampling_rate,
                 'muse_channels': self.muse_channels,
+                'gsr_sampling_rate': self.gsr_sampling_rate,
             },
             'eeg_data': [
                 {
@@ -94,9 +117,19 @@ class SynchronizedDataStore:
                 }
                 for s in self.hr_data
             ],
+            'gsr_data': [
+                {
+                    'time': round(self.get_relative_time(s.timestamp), 6),
+                    'raw_audio': s.raw_audio,
+                    'filtered_signal': s.filtered_signal,
+                    'gsr_uS': s.gsr_uS
+                }
+                for s in self.gsr_data
+            ],
             'summary': {
                 'total_eeg_samples': len(self.eeg_data),
                 'total_hr_samples': len(self.hr_data),
+                'total_gsr_samples': len(self.gsr_data),
                 'duration_seconds': round(self.get_relative_time(time.time()), 2)
             }
         }
@@ -132,6 +165,16 @@ class SynchronizedDataStore:
                 f.write(f"{rel_time:.6f},{sample.heart_rate},{rr_str}\n")
         print(f"HR data saved to {hr_filepath}")
 
+        # Save GSR data
+        gsr_filepath = f"{base_filepath}_gsr.csv"
+        with open(gsr_filepath, 'w') as f:
+            # Header - time is relative time starting from 0
+            f.write("time,raw_audio,filtered_signal,gsr_uS\n")
+            for sample in self.gsr_data:
+                rel_time = self.get_relative_time(sample.timestamp)
+                f.write(f"{rel_time:.6f},{sample.raw_audio},{sample.filtered_signal},{sample.gsr_uS}\n")
+        print(f"GSR data saved to {gsr_filepath}")
+
 
 class SynchronizedCollector:
     """
@@ -148,6 +191,9 @@ class SynchronizedCollector:
                  muse_serial_port: Optional[str] = None,
                  muse_mac_address: Optional[str] = None,
                  polar_device_name: str = "Polar H10",
+                 gsr_device: Optional[int] = None,
+                 gsr_calibration_a: float = 1.0,
+                 gsr_calibration_b: float = 0.0,
                  buffer_duration: int = 10,
                  apply_ica: bool = True,
                  apply_filter: bool = True):
@@ -158,6 +204,9 @@ class SynchronizedCollector:
             muse_serial_port: Serial port for BLED112 dongle (optional)
             muse_mac_address: MAC address of Muse 2 (optional)
             polar_device_name: Name of Polar device to scan for
+            gsr_device: Audio input device index for eSense GSR (optional)
+            gsr_calibration_a: GSR calibration slope (µS = a * amplitude + b)
+            gsr_calibration_b: GSR calibration offset
             buffer_duration: EEG buffer duration in seconds
             apply_ica: Whether to apply ICA denoising to EEG
             apply_filter: Whether to apply bandpass/notch filters to EEG
@@ -165,6 +214,9 @@ class SynchronizedCollector:
         self.muse_serial_port = muse_serial_port
         self.muse_mac_address = muse_mac_address
         self.polar_device_name = polar_device_name
+        self.gsr_device = gsr_device
+        self.gsr_calibration_a = gsr_calibration_a
+        self.gsr_calibration_b = gsr_calibration_b
         self.buffer_duration = buffer_duration
         self.apply_ica = apply_ica
         self.apply_filter = apply_filter
@@ -179,16 +231,20 @@ class SynchronizedCollector:
         # Device instances (created during collection)
         self.muse: Optional[MuseBrainFlowProcessor] = None
         self.polar: Optional[PolarH10] = None
+        self.gsr: Optional[ESenseGSR] = None
 
         # Status tracking
         self.muse_connected = False
         self.polar_connected = False
+        self.gsr_connected = False
         self.muse_error: Optional[str] = None
         self.polar_error: Optional[str] = None
+        self.gsr_error: Optional[str] = None
 
         # Synchronization flags for simultaneous start
         self._muse_ready = threading.Event()
         self._polar_ready = threading.Event()
+        self._gsr_ready = threading.Event()
         self._start_recording = threading.Event()  # Signal to start actual recording
 
     def connect_muse(self) -> bool:
@@ -243,6 +299,49 @@ class SynchronizedCollector:
             self.polar_connected = False
             return False
 
+    def connect_gsr(self) -> bool:
+        """
+        Connect to eSense GSR device. Returns True if successful.
+        Tests audio input availability.
+        """
+        try:
+            import sounddevice as sd
+
+            # Create GSR instance (doesn't start streaming yet)
+            self.gsr = ESenseGSR(
+                device=self.gsr_device,
+                calibration_a=self.gsr_calibration_a,
+                calibration_b=self.gsr_calibration_b,
+                downsample_rate=50,
+                buffer_size=50  # Smaller buffer for more frequent updates
+            )
+
+            # Test that we can access the audio device
+            devices = sd.query_devices()
+            if self.gsr_device is not None:
+                if self.gsr_device >= len(devices):
+                    raise Exception(f"Audio device {self.gsr_device} not found")
+                device_info = devices[self.gsr_device]
+                if device_info['max_input_channels'] < 1:
+                    raise Exception(f"Device {self.gsr_device} has no input channels")
+                print(f"[GSR] Using device: {device_info['name']}")
+            else:
+                # Check default input device
+                default_input = sd.default.device[0]
+                if default_input is None or default_input < 0:
+                    raise Exception("No default audio input device found")
+                print(f"[GSR] Using default input device: {devices[default_input]['name']}")
+
+            print(f"[GSR] Connection test successful")
+            self.gsr_connected = True
+            self.gsr_error = None
+            self.data_store.gsr_sampling_rate = self.gsr.downsample_rate
+            return True
+        except Exception as e:
+            self.gsr_error = str(e)
+            self.gsr_connected = False
+            return False
+
     def disconnect_devices(self):
         """Disconnect all devices"""
         if self.muse:
@@ -254,6 +353,13 @@ class SynchronizedCollector:
             self.muse_connected = False
         self.polar = None
         self.polar_connected = False
+        if self.gsr:
+            try:
+                self.gsr.stop()
+            except:
+                pass
+            self.gsr = None
+            self.gsr_connected = False
 
     def _muse_collection_thread(self, duration: Optional[float]):
         """
@@ -481,6 +587,137 @@ class SynchronizedCollector:
             print(f"[Polar] Error: {e}")
             self.polar_connected = False
 
+    def _gsr_collection_thread(self, duration: Optional[float]):
+        """
+        Thread function for GSR data collection.
+        Uses the ESenseGSR callback mechanism.
+
+        Args:
+            duration: Collection duration in seconds, or None for indefinite
+        """
+        try:
+            # Initialize GSR if needed
+            if self.gsr is None:
+                print("[GSR] Initializing connection...")
+                self.gsr = ESenseGSR(
+                    device=self.gsr_device,
+                    calibration_a=self.gsr_calibration_a,
+                    calibration_b=self.gsr_calibration_b,
+                    downsample_rate=50,
+                    buffer_size=50
+                )
+            else:
+                print("[GSR] Using existing connection...")
+
+            # Override the GSR's internal callback to feed our data store
+            original_callback = self.gsr._audio_callback
+
+            def synchronized_callback(indata, frames, time_info, status):
+                """Custom callback that feeds data to our synchronized store."""
+                if status:
+                    print(f"[GSR] Audio status: {status}")
+
+                # Only record if recording has started
+                if not self._start_recording.is_set():
+                    # Still need to process to maintain filter state
+                    raw = indata[:, 0].copy()
+                    self.gsr._apply_filter(raw)
+                    return
+
+                # Process audio data
+                raw = indata[:, 0].copy()
+                filtered = self.gsr._apply_filter(raw)
+
+                # Downsample and store
+                self.gsr._downsample_accumulator.extend(zip(raw, filtered))
+
+                while len(self.gsr._downsample_accumulator) >= self.gsr.downsample_factor:
+                    chunk = self.gsr._downsample_accumulator[:self.gsr.downsample_factor]
+                    self.gsr._downsample_accumulator = self.gsr._downsample_accumulator[self.gsr.downsample_factor:]
+
+                    raw_vals = [c[0] for c in chunk]
+                    filt_vals = [c[1] for c in chunk]
+
+                    raw_ds = float(np.mean(raw_vals))
+                    filt_ds = float(np.mean(filt_vals))
+                    gsr_uS = self.gsr._convert_to_gsr(filt_ds)
+                    timestamp = time.time()
+
+                    # Thread-safe append to our data store
+                    with self._lock:
+                        self.data_store.add_gsr_sample(timestamp, raw_ds, filt_ds, gsr_uS)
+
+            # Start the audio stream with our custom callback
+            import sounddevice as sd
+            self.gsr._init_filter()
+            self.gsr._downsample_accumulator = []
+
+            self.gsr.stream = sd.InputStream(
+                callback=synchronized_callback,
+                channels=1,
+                samplerate=self.gsr.fs,
+                device=self.gsr.device,
+                dtype='float32'
+            )
+            self.gsr.stream.start()
+            self.gsr.is_streaming = True
+
+            # Signal that GSR is ready
+            print("[GSR] Ready, waiting for synchronized start...")
+            self._gsr_ready.set()
+
+            # Wait for start signal
+            while not self._start_recording.is_set() and not self._stop_event.is_set():
+                time.sleep(0.01)
+
+            if self._stop_event.is_set():
+                self.gsr.stream.stop()
+                self.gsr.stream.close()
+                self.gsr.is_streaming = False
+                return
+
+            print("[GSR] Starting data collection...")
+            start_time = time.time()
+            last_print = start_time
+
+            while not self._stop_event.is_set():
+                elapsed = time.time() - start_time
+                if duration and elapsed >= duration:
+                    break
+
+                # Print status every 5 seconds
+                if time.time() - last_print >= 5.0:
+                    with self._lock:
+                        gsr_count = len(self.data_store.gsr_data)
+                        if gsr_count > 0:
+                            latest_gsr = self.data_store.gsr_data[-1].gsr_uS
+                            rel_time = self.data_store.get_relative_time(time.time())
+                            print(f"[GSR] t={rel_time:.1f}s | GSR: {latest_gsr:.4f} µS | Samples: {gsr_count}")
+                    last_print = time.time()
+
+                time.sleep(0.1)
+
+            # Stop streaming
+            self.gsr.stream.stop()
+            self.gsr.stream.close()
+            self.gsr.is_streaming = False
+
+            with self._lock:
+                sample_count = len(self.data_store.gsr_data)
+            print(f"[GSR] Collection complete. {sample_count} samples collected.")
+
+        except Exception as e:
+            print(f"[GSR] Error: {e}")
+            self._gsr_ready.set()  # Set ready even on error to prevent hanging
+        finally:
+            if self.gsr and self.gsr.is_streaming:
+                try:
+                    self.gsr.stream.stop()
+                    self.gsr.stream.close()
+                    self.gsr.is_streaming = False
+                except:
+                    pass
+
     def collect(self, duration: float = 60, output_path: Optional[str] = None):
         """
         Start synchronized data collection from both devices.
@@ -570,6 +807,7 @@ class SynchronizedCollector:
         print(f"  - {json_path}")
         print(f"  - {base_path}_eeg.csv")
         print(f"  - {base_path}_hr.csv")
+        print(f"  - {base_path}_gsr.csv")
 
 
 def create_participant_folder(participant_id: str) -> Path:
@@ -592,7 +830,7 @@ def show_participant_screen() -> Optional[str]:
         [sg.Input(key='-PARTICIPANT_ID-', font=('Helvetica', 14), size=(30, 1), justification='center')],
         [sg.Text('')],
         [sg.Text('', key='-ERROR-', text_color='red', font=('Helvetica', 10))],
-        [sg.Button('Continue', size=(15, 1), font=('Helvetica', 12)),
+        [sg.Button('Continue', size=(15, 1), font=('Helvetica', 12), bind_return_key=True),
          sg.Button('Exit', size=(15, 1), font=('Helvetica', 12))]
     ]
 
@@ -622,7 +860,7 @@ def show_participant_screen() -> Optional[str]:
 
 
 def show_connection_screen(collector: SynchronizedCollector) -> bool:
-    """Show device connection screen with status updates. Returns True if both connected."""
+    """Show device connection screen with status updates. Returns True if all connected."""
     import FreeSimpleGUI as sg
 
     sg.theme('LightBlue2')
@@ -630,7 +868,7 @@ def show_connection_screen(collector: SynchronizedCollector) -> bool:
     layout = [
         [sg.Text('Connecting to Devices', font=('Helvetica', 20, 'bold'), justification='center', expand_x=True)],
         [sg.Text('')],
-        [sg.Text('Please ensure both devices are powered on and in range.', font=('Helvetica', 11))],
+        [sg.Text('Please ensure all devices are powered on and in range.', font=('Helvetica', 11))],
         [sg.Text('')],
 
         # Muse status
@@ -650,6 +888,15 @@ def show_connection_screen(collector: SynchronizedCollector) -> bool:
         ], font=('Helvetica', 12))],
 
         [sg.Text('')],
+
+        # GSR status
+        [sg.Frame('eSense GSR (Skin Response)', [
+            [sg.Text('Status:', font=('Helvetica', 11)),
+             sg.Text('Waiting...', key='-GSR_STATUS-', font=('Helvetica', 11, 'bold'), text_color='gray')],
+            [sg.ProgressBar(100, orientation='h', size=(30, 20), key='-GSR_PROGRESS-', bar_color=('blue', 'lightgray'))]
+        ], font=('Helvetica', 12))],
+
+        [sg.Text('')],
         [sg.Button('Connect Devices', size=(15, 1), font=('Helvetica', 12), key='-CONNECT-'),
          sg.Button('Skip Connection', size=(15, 1), font=('Helvetica', 12), key='-SKIP-', visible=False),
          sg.Button('Continue', size=(15, 1), font=('Helvetica', 12), key='-CONTINUE-', disabled=True),
@@ -657,10 +904,11 @@ def show_connection_screen(collector: SynchronizedCollector) -> bool:
     ]
 
     window = sg.Window('BCI Experiment - Device Connection', layout,
-                       element_justification='center', finalize=True, size=(550, 400))
+                       element_justification='center', finalize=True, size=(550, 500))
 
     muse_connected = False
     polar_connected = False
+    gsr_connected = False
 
     def connect_muse_thread():
         nonlocal muse_connected
@@ -669,6 +917,10 @@ def show_connection_screen(collector: SynchronizedCollector) -> bool:
     def connect_polar_thread():
         nonlocal polar_connected
         polar_connected = collector.connect_polar()
+
+    def connect_gsr_thread():
+        nonlocal gsr_connected
+        gsr_connected = collector.connect_gsr()
 
     while True:
         event, values = window.read(timeout=100)
@@ -682,19 +934,23 @@ def show_connection_screen(collector: SynchronizedCollector) -> bool:
             window['-CONNECT-'].update(disabled=True)
             window['-MUSE_STATUS-'].update('Connecting...', text_color='orange')
             window['-POLAR_STATUS-'].update('Connecting...', text_color='orange')
+            window['-GSR_STATUS-'].update('Connecting...', text_color='orange')
             window['-MUSE_PROGRESS-'].update(50)
             window['-POLAR_PROGRESS-'].update(50)
+            window['-GSR_PROGRESS-'].update(50)
             window.refresh()
 
             # Connect devices in threads
             muse_thread = threading.Thread(target=connect_muse_thread)
             polar_thread = threading.Thread(target=connect_polar_thread)
+            gsr_thread = threading.Thread(target=connect_gsr_thread)
 
             muse_thread.start()
             polar_thread.start()
+            gsr_thread.start()
 
             # Wait for connections with GUI updates
-            while muse_thread.is_alive() or polar_thread.is_alive():
+            while muse_thread.is_alive() or polar_thread.is_alive() or gsr_thread.is_alive():
                 event2, _ = window.read(timeout=100)
                 if event2 in (sg.WIN_CLOSED, 'Cancel'):
                     collector.disconnect_devices()
@@ -719,8 +975,17 @@ def show_connection_screen(collector: SynchronizedCollector) -> bool:
                 window['-POLAR_STATUS-'].update(f'Failed: {error_msg[:30]}', text_color='red')
                 window['-POLAR_PROGRESS-'].update(0)
 
-            # Enable continue if at least one device connected
-            if muse_connected and polar_connected:
+            # Update GSR status
+            if gsr_connected:
+                window['-GSR_STATUS-'].update('Connected', text_color='green')
+                window['-GSR_PROGRESS-'].update(100)
+            else:
+                error_msg = collector.gsr_error or 'Connection failed'
+                window['-GSR_STATUS-'].update(f'Failed: {error_msg[:30]}', text_color='red')
+                window['-GSR_PROGRESS-'].update(0)
+
+            # Enable continue if all devices connected
+            if muse_connected and polar_connected and gsr_connected:
                 window['-CONTINUE-'].update(disabled=False)
             else:
                 window['-CONNECT-'].update(disabled=False, text='Retry Connection')
@@ -870,8 +1135,12 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str) -
              sg.Text('0', key='-EEG_COUNT-', font=('Helvetica', 11, 'bold'))],
             [sg.Text('HR Samples:', font=('Helvetica', 11)),
              sg.Text('0', key='-HR_COUNT-', font=('Helvetica', 11, 'bold'))],
+            [sg.Text('GSR Samples:', font=('Helvetica', 11)),
+             sg.Text('0', key='-GSR_COUNT-', font=('Helvetica', 11, 'bold'))],
             [sg.Text('Latest HR:', font=('Helvetica', 11)),
-             sg.Text('-- bpm', key='-LATEST_HR-', font=('Helvetica', 11, 'bold'))]
+             sg.Text('-- bpm', key='-LATEST_HR-', font=('Helvetica', 11, 'bold'))],
+            [sg.Text('Latest GSR:', font=('Helvetica', 11)),
+             sg.Text('-- µS', key='-LATEST_GSR-', font=('Helvetica', 11, 'bold'))]
         ], font=('Helvetica', 12))],
 
         [sg.Text('')],
@@ -882,13 +1151,14 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str) -
     ]
 
     window = sg.Window('BCI Experiment - Recording', layout,
-                       element_justification='center', finalize=True, size=(500, 400),
+                       element_justification='center', finalize=True, size=(500, 450),
                        disable_close=True)  # Prevent accidental close
 
     # Reset synchronization events
     collector._stop_event.clear()
     collector._muse_ready.clear()
     collector._polar_ready.clear()
+    collector._gsr_ready.clear()
     collector._start_recording.clear()
 
     # Start Muse collection thread
@@ -906,7 +1176,15 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str) -
     polar_thread = threading.Thread(target=run_polar_async, daemon=True)
     polar_thread.start()
 
-    # Wait for both devices to be ready
+    # Start GSR collection thread
+    gsr_thread = threading.Thread(
+        target=collector._gsr_collection_thread,
+        args=(None,),  # None = run indefinitely
+        daemon=True
+    )
+    gsr_thread.start()
+
+    # Wait for all devices to be ready
     window['-STATUS-'].update('Waiting for Muse to be ready...')
     window.refresh()
 
@@ -927,21 +1205,31 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str) -
             window.close()
             return
 
-    # Both devices ready - set session_start and signal to start recording
+    window['-STATUS-'].update('Waiting for GSR to be ready...')
+    window.refresh()
+
+    while not collector._gsr_ready.is_set():
+        event, _ = window.read(timeout=100)
+        if event == '-STOP-' or event == sg.WIN_CLOSED:
+            collector._stop_event.set()
+            window.close()
+            return
+
+    # All devices ready - set session_start and signal to start recording
     window['-STATUS-'].update('Starting synchronized recording...')
     window.refresh()
 
     # Set the session start time RIGHT NOW - this is time=0
     collector.data_store.session_start = time.time()
 
-    # Signal both threads to start recording simultaneously
+    # Signal all threads to start recording simultaneously
     collector._start_recording.set()
 
     window['-STATUS-'].update('Data is being recorded...')
     window['-STOP-'].update(disabled=False)
     window.refresh()
 
-    print(f"[Sync] Both devices ready. Recording started at t=0")
+    print(f"[Sync] All devices ready. Recording started at t=0")
 
     # Update loop
     while True:
@@ -963,15 +1251,23 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str) -
         with collector._lock:
             eeg_count = len(collector.data_store.eeg_data)
             hr_count = len(collector.data_store.hr_data)
+            gsr_count = len(collector.data_store.gsr_data)
             if collector.data_store.hr_data:
                 latest_hr = collector.data_store.hr_data[-1].heart_rate
             else:
                 latest_hr = None
+            if collector.data_store.gsr_data:
+                latest_gsr = collector.data_store.gsr_data[-1].gsr_uS
+            else:
+                latest_gsr = None
 
         window['-EEG_COUNT-'].update(str(eeg_count))
         window['-HR_COUNT-'].update(str(hr_count))
+        window['-GSR_COUNT-'].update(str(gsr_count))
         if latest_hr:
             window['-LATEST_HR-'].update(f'{latest_hr} bpm')
+        if latest_gsr is not None:
+            window['-LATEST_GSR-'].update(f'{latest_gsr:.4f} µS')
 
     # Stop collection
     collector._stop_event.set()
@@ -981,6 +1277,7 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str) -
     # Wait for threads to finish
     muse_thread.join(timeout=5)
     polar_thread.join(timeout=5)
+    gsr_thread.join(timeout=5)
 
     # Save data
     collector.save_data(output_path)
@@ -998,6 +1295,7 @@ def show_completion_screen(collector: SynchronizedCollector, output_path: str) -
     total_duration = collector.data_store.get_relative_time(time.time())
     eeg_count = len(collector.data_store.eeg_data)
     hr_count = len(collector.data_store.hr_data)
+    gsr_count = len(collector.data_store.gsr_data)
 
     hours = int(total_duration // 3600)
     minutes = int((total_duration % 3600) // 60)
@@ -1013,6 +1311,14 @@ def show_completion_screen(collector: SynchronizedCollector, output_path: str) -
             hrv_text += f"SDNN: {metrics['sdnn']:.1f} ms\n"
             hrv_text += f"RMSSD: {metrics['rmssd']:.1f} ms"
 
+    # GSR summary if available
+    gsr_text = "Not available"
+    if collector.data_store.gsr_data:
+        gsr_values = [s.gsr_uS for s in collector.data_store.gsr_data]
+        gsr_text = f"Mean GSR: {np.mean(gsr_values):.4f} µS\n"
+        gsr_text += f"Min: {np.min(gsr_values):.4f} µS\n"
+        gsr_text += f"Max: {np.max(gsr_values):.4f} µS"
+
     layout = [
         [sg.Text('Experiment Complete!', font=('Helvetica', 24, 'bold'),
                  text_color='green', justification='center', expand_x=True)],
@@ -1024,12 +1330,16 @@ def show_completion_screen(collector: SynchronizedCollector, output_path: str) -
             [sg.Text(f'Duration: {duration_str}', font=('Helvetica', 12))],
             [sg.Text(f'EEG Samples: {eeg_count:,}', font=('Helvetica', 12))],
             [sg.Text(f'HR Samples: {hr_count:,}', font=('Helvetica', 12))],
+            [sg.Text(f'GSR Samples: {gsr_count:,}', font=('Helvetica', 12))],
         ], font=('Helvetica', 12))],
 
         [sg.Text('')],
 
         [sg.Frame('HRV Metrics', [
             [sg.Text(hrv_text, font=('Helvetica', 11))]
+        ], font=('Helvetica', 12)),
+         sg.Frame('GSR Summary', [
+            [sg.Text(gsr_text, font=('Helvetica', 11))]
         ], font=('Helvetica', 12))],
 
         [sg.Text('')],
@@ -1039,7 +1349,7 @@ def show_completion_screen(collector: SynchronizedCollector, output_path: str) -
     ]
 
     window = sg.Window('BCI Experiment - Complete', layout,
-                       element_justification='center', finalize=True, size=(500, 450))
+                       element_justification='center', finalize=True, size=(600, 500))
 
     while True:
         event, _ = window.read()
@@ -1055,7 +1365,7 @@ def main():
     import FreeSimpleGUI as sg
 
     parser = argparse.ArgumentParser(
-        description='Synchronized Muse 2 EEG and Polar H10 HR data collection'
+        description='Synchronized Muse 2 EEG, Polar H10 HR, and eSense GSR data collection'
     )
     parser.add_argument(
         '--muse-serial',
@@ -1074,6 +1384,29 @@ def main():
         type=str,
         default="Polar H10",
         help='Name of Polar device to scan for (default: "Polar H10")'
+    )
+    parser.add_argument(
+        '--gsr-device',
+        type=int,
+        default=None,
+        help='Audio input device index for eSense GSR (use --list-audio-devices to see options)'
+    )
+    parser.add_argument(
+        '--gsr-cal-a',
+        type=float,
+        default=1.0,
+        help='GSR calibration slope (µS = a * amplitude + b)'
+    )
+    parser.add_argument(
+        '--gsr-cal-b',
+        type=float,
+        default=0.0,
+        help='GSR calibration offset'
+    )
+    parser.add_argument(
+        '--list-audio-devices',
+        action='store_true',
+        help='List available audio input devices and exit'
     )
     parser.add_argument(
         '--no-ica',
@@ -1105,11 +1438,28 @@ def main():
 
     args = parser.parse_args()
 
+    # Handle list audio devices
+    if args.list_audio_devices:
+        import sounddevice as sd
+        print("\nAvailable audio input devices:")
+        print("-" * 50)
+        devices = sd.query_devices()
+        for i, dev in enumerate(devices):
+            if dev['max_input_channels'] > 0:
+                marker = " [DEFAULT]" if i == sd.default.device[0] else ""
+                print(f"  [{i}] {dev['name']}{marker}")
+                print(f"      Sample rates: {dev['default_samplerate']} Hz")
+        print("-" * 50)
+        return
+
     # Create collector
     collector = SynchronizedCollector(
         muse_serial_port=args.muse_serial,
         muse_mac_address=args.muse_mac,
         polar_device_name=args.polar_name,
+        gsr_device=args.gsr_device,
+        gsr_calibration_a=args.gsr_cal_a,
+        gsr_calibration_b=args.gsr_cal_b,
         apply_ica=not args.no_ica,
         apply_filter=not args.no_filter
     )
