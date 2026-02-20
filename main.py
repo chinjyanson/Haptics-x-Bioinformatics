@@ -48,6 +48,14 @@ class TimestampedGSRSample:
 
 
 @dataclass
+class TaskMarker:
+    """Task transition marker with synchronized timestamp"""
+    timestamp: float  # Unix timestamp
+    task_number: int  # Task index that just ended
+    event: str = "task_end"
+
+
+@dataclass
 class SynchronizedDataStore:
     """
     Central data store for synchronized multi-device data collection.
@@ -57,6 +65,7 @@ class SynchronizedDataStore:
     eeg_data: List[TimestampedEEGSample] = field(default_factory=list)
     hr_data: List[TimestampedHRSample] = field(default_factory=list)
     gsr_data: List[TimestampedGSRSample] = field(default_factory=list)
+    task_markers: List[TaskMarker] = field(default_factory=list)
 
     # Metadata
     muse_sampling_rate: int = 256
@@ -86,6 +95,11 @@ class SynchronizedDataStore:
             gsr_uS=gsr_uS
         )
         self.gsr_data.append(sample)
+
+    def add_task_marker(self, timestamp: float, task_number: int, event: str = "task_end"):
+        """Add a timestamped task marker"""
+        marker = TaskMarker(timestamp=timestamp, task_number=task_number, event=event)
+        self.task_markers.append(marker)
 
     def get_relative_time(self, timestamp: float) -> float:
         """Convert absolute timestamp to relative time from session start"""
@@ -126,10 +140,19 @@ class SynchronizedDataStore:
                 }
                 for s in self.gsr_data
             ],
+            'task_markers': [
+                {
+                    'time': round(self.get_relative_time(m.timestamp), 6),
+                    'task_number': m.task_number,
+                    'event': m.event
+                }
+                for m in self.task_markers
+            ],
             'summary': {
                 'total_eeg_samples': len(self.eeg_data),
                 'total_hr_samples': len(self.hr_data),
                 'total_gsr_samples': len(self.gsr_data),
+                'total_task_markers': len(self.task_markers),
                 'duration_seconds': round(self.get_relative_time(time.time()), 2)
             }
         }
@@ -174,6 +197,36 @@ class SynchronizedDataStore:
                 rel_time = self.get_relative_time(sample.timestamp)
                 f.write(f"{rel_time:.6f},{sample.raw_audio},{sample.filtered_signal},{sample.gsr_uS}\n")
         print(f"GSR data saved to {gsr_filepath}")
+
+    def save_task_markers(self, base_filepath: str):
+        """Save task markers to JSON and CSV files."""
+        markers_json = f"{base_filepath}_markers.json"
+        markers_csv = f"{base_filepath}_markers.csv"
+
+        with open(markers_json, 'w') as f:
+            json.dump(
+                {
+                    'session_start_unix': self.session_start,
+                    'markers': [
+                        {
+                            'time': round(self.get_relative_time(m.timestamp), 6),
+                            'task_number': m.task_number,
+                            'event': m.event
+                        }
+                        for m in self.task_markers
+                    ]
+                },
+                f,
+                indent=2
+            )
+        print(f"Task markers saved to {markers_json}")
+
+        with open(markers_csv, 'w') as f:
+            f.write("time,task_number,event\n")
+            for m in self.task_markers:
+                rel_time = self.get_relative_time(m.timestamp)
+                f.write(f"{rel_time:.6f},{m.task_number},{m.event}\n")
+        print(f"Task markers saved to {markers_csv}")
 
 
 class SynchronizedCollector:
@@ -803,11 +856,16 @@ class SynchronizedCollector:
         # Save CSVs (easier for analysis)
         self.data_store.save_csv(base_path)
 
+        # Save task markers (separate JSON and CSV)
+        self.data_store.save_task_markers(base_path)
+
         print(f"\nData saved to:")
         print(f"  - {json_path}")
         print(f"  - {base_path}_eeg.csv")
         print(f"  - {base_path}_hr.csv")
         print(f"  - {base_path}_gsr.csv")
+        print(f"  - {base_path}_markers.json")
+        print(f"  - {base_path}_markers.csv")
 
 
 def create_participant_folder(participant_id: str) -> Path:
@@ -1141,7 +1199,12 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str) -
              sg.Text('-- bpm', key='-LATEST_HR-', font=('Helvetica', 11, 'bold'))],
             [sg.Text('Latest GSR:', font=('Helvetica', 11)),
              sg.Text('-- µS', key='-LATEST_GSR-', font=('Helvetica', 11, 'bold'))]
-        ], font=('Helvetica', 12))],
+               ], font=('Helvetica', 12))],
+
+               [sg.Text('Current Task:', font=('Helvetica', 11)),
+                sg.Text('1', key='-TASK_NUM-', font=('Helvetica', 11, 'bold'))],
+               [sg.Text('Press Right Arrow to end current task and move to next.',
+                      font=('Helvetica', 10))],
 
         [sg.Text('')],
         [sg.Text('Press STOP when you are ready to end the experiment.', font=('Helvetica', 10))],
@@ -1154,12 +1217,17 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str) -
                        element_justification='center', finalize=True, size=(500, 450),
                        disable_close=True)  # Prevent accidental close
 
+    # Bind right arrow for task transitions (window must be focused)
+    window.bind("<Right>", "-NEXT_TASK-")
+
     # Reset synchronization events
     collector._stop_event.clear()
     collector._muse_ready.clear()
     collector._polar_ready.clear()
     collector._gsr_ready.clear()
     collector._start_recording.clear()
+
+    current_task = 1
 
     # Start Muse collection thread
     muse_thread = threading.Thread(
@@ -1235,6 +1303,15 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str) -
     while True:
         event, _ = window.read(timeout=500)  # Update every 500ms
 
+        if event == "-NEXT_TASK-":
+            # Mark end of current task and advance
+            timestamp = time.time()
+            with collector._lock:
+                collector.data_store.add_task_marker(timestamp, current_task, "task_end")
+            print(f"[Task] Ended task {current_task}")
+            current_task += 1
+            window['-TASK_NUM-'].update(str(current_task))
+
         if event == '-STOP-':
             # Confirm stop
             if sg.popup_yes_no('Are you sure you want to stop the experiment?',
@@ -1296,6 +1373,7 @@ def show_completion_screen(collector: SynchronizedCollector, output_path: str) -
     eeg_count = len(collector.data_store.eeg_data)
     hr_count = len(collector.data_store.hr_data)
     gsr_count = len(collector.data_store.gsr_data)
+    marker_count = len(collector.data_store.task_markers)
 
     hours = int(total_duration // 3600)
     minutes = int((total_duration % 3600) // 60)
@@ -1331,6 +1409,7 @@ def show_completion_screen(collector: SynchronizedCollector, output_path: str) -
             [sg.Text(f'EEG Samples: {eeg_count:,}', font=('Helvetica', 12))],
             [sg.Text(f'HR Samples: {hr_count:,}', font=('Helvetica', 12))],
             [sg.Text(f'GSR Samples: {gsr_count:,}', font=('Helvetica', 12))],
+            [sg.Text(f'Task Markers: {marker_count:,}', font=('Helvetica', 12))],
         ], font=('Helvetica', 12))],
 
         [sg.Text('')],

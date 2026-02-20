@@ -5,163 +5,263 @@ from bleak import BleakClient, BleakScanner
 import numpy as np
 from datetime import datetime
 from collections import deque
+import matplotlib
+matplotlib.use('MacOSX')
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.animation import FuncAnimation
+import threading
 
 # Polar H10 BLE Service UUIDs
-HEART_RATE_SERVICE_UUID = "0000180d-0000-1000-8000-00805f9b34fb"
+HEART_RATE_SERVICE_UUID     = "0000180d-0000-1000-8000-00805f9b34fb"
 HEART_RATE_MEASUREMENT_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
+
+# Rolling window size for HRV metrics (number of RR intervals)
+HRV_WINDOW = 30
+
 
 class PolarH10:
     def __init__(self, device_name="Polar H10"):
         self.device_name = device_name
         self.device = None
         self.client = None
-        self.rr_intervals = deque(maxlen=1000)  # Store last 1000 RR intervals
+        self.rr_intervals = deque(maxlen=1000)
         self.heart_rates = deque(maxlen=100)
-        
+
+        # Time-series history for live plot (elapsed seconds)
+        self.timestamps = deque(maxlen=300)
+        self.rmssd_history = deque(maxlen=300)
+        self.sdnn_history = deque(maxlen=300)
+        self.hr_history = deque(maxlen=300)
+        self.rr_history = deque(maxlen=300)
+
+        self._start_time = None
+
     async def find_device(self):
-        """Scan for Polar H10 device"""
         print(f"Scanning for {self.device_name}...")
         devices = await BleakScanner.discover(timeout=10.0)
-        
         for device in devices:
             if device.name and self.device_name in device.name:
                 print(f"Found device: {device.name} ({device.address})")
                 self.device = device
                 return device
-        
         raise Exception(f"Could not find {self.device_name}")
-    
+
     def parse_heart_rate_data(self, sender, data):
-        """
-        Parse heart rate measurement data according to BLE Heart Rate Service spec
-        
-        Byte 0: Flags
-        - Bit 0: Heart Rate Value Format (0 = uint8, 1 = uint16)
-        - Bit 1-2: Sensor Contact Status
-        - Bit 3: Energy Expended Status
-        - Bit 4: RR-Interval present
-        
-        Following bytes: HR value, then RR intervals if present
-        """
+        """Parse BLE Heart Rate Measurement characteristic."""
         flags = data[0]
-        hr_format = flags & 0x01  # 0 = uint8, 1 = uint16
+        hr_format = flags & 0x01
         rr_present = (flags & 0x10) != 0
-        
-        # Parse heart rate
+
         if hr_format == 0:
             heart_rate = data[1]
             offset = 2
         else:
             heart_rate = struct.unpack('<H', data[1:3])[0]
             offset = 3
-        
+
         self.heart_rates.append(heart_rate)
-        
-        # Parse RR intervals if present
+
         if rr_present:
-            # RR intervals are in units of 1/1024 seconds
             rr_data = data[offset:]
             num_rr = len(rr_data) // 2
-            
+            new_rr = []
             for i in range(num_rr):
                 rr_raw = struct.unpack('<H', rr_data[i*2:(i+1)*2])[0]
-                rr_ms = (rr_raw / 1024.0) * 1000.0  # Convert to milliseconds
+                rr_ms = (rr_raw / 1024.0) * 1000.0
                 self.rr_intervals.append(rr_ms)
-                
+                new_rr.append(rr_ms)
+
+            # Record rolling metrics for each new RR interval received
+            for rr_ms in new_rr:
+                self.rr_history.append(rr_ms)
+                self.hr_history.append(heart_rate)
+
+                elapsed = (datetime.now() - self._start_time).total_seconds() if self._start_time else 0
+                self.timestamps.append(elapsed)
+
+                metrics = self._rolling_hrv_metrics()
+                self.rmssd_history.append(metrics['rmssd'])
+                self.sdnn_history.append(metrics['sdnn'])
+
             timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            print(f"[{timestamp}] HR: {heart_rate} bpm | RR intervals: {[f'{rr:.1f}ms' for rr in list(self.rr_intervals)[-num_rr:]]}")
-    
+            print(f"[{timestamp}] HR: {heart_rate} bpm | RR: {[f'{rr:.1f}ms' for rr in new_rr]}")
+
+    def _rolling_hrv_metrics(self):
+        """Compute HRV metrics over the last HRV_WINDOW RR intervals."""
+        window = list(self.rr_intervals)[-HRV_WINDOW:]
+        if len(window) < 2:
+            return {'rmssd': 0.0, 'sdnn': 0.0}
+        arr = np.array(window)
+        diff = np.diff(arr)
+        rmssd = float(np.sqrt(np.mean(diff**2)))
+        sdnn = float(np.std(arr, ddof=1))
+        return {'rmssd': rmssd, 'sdnn': sdnn}
+
     def calculate_hrv_metrics(self):
-        """Calculate common HRV metrics from RR intervals"""
+        """Final summary HRV metrics over all collected RR intervals."""
         if len(self.rr_intervals) < 2:
             return None
-        
         rr_array = np.array(self.rr_intervals)
-        
-        # Time domain metrics
         mean_rr = np.mean(rr_array)
-        sdnn = np.std(rr_array, ddof=1)  # Standard deviation of NN intervals
-        
-        # Calculate successive differences
+        sdnn = np.std(rr_array, ddof=1)
         diff_rr = np.diff(rr_array)
-        rmssd = np.sqrt(np.mean(diff_rr**2))  # Root mean square of successive differences
-        
-        # NN50: number of successive differences > 50ms
+        rmssd = np.sqrt(np.mean(diff_rr**2))
         nn50 = np.sum(np.abs(diff_rr) > 50)
         pnn50 = (nn50 / len(diff_rr)) * 100 if len(diff_rr) > 0 else 0
-        
-        metrics = {
+        return {
             'mean_rr': mean_rr,
             'mean_hr': 60000 / mean_rr if mean_rr > 0 else 0,
             'sdnn': sdnn,
             'rmssd': rmssd,
             'nn50': nn50,
             'pnn50': pnn50,
-            'num_intervals': len(rr_array)
+            'num_intervals': len(rr_array),
         }
-        
-        return metrics
-    
-    async def connect_and_stream(self, duration=60):
-        """Connect to device and stream HRV data"""
+
+    def start_live_plot(self):
+        """Launch the live HRV plot (must be called from the main thread)."""
+        fig = plt.figure(figsize=(12, 8))
+        fig.patch.set_facecolor('#1a1a2e')
+        gs = gridspec.GridSpec(3, 1, hspace=0.45)
+
+        ax_rr   = fig.add_subplot(gs[0])
+        ax_hrv  = fig.add_subplot(gs[1])
+        ax_hr   = fig.add_subplot(gs[2])
+
+        for ax in (ax_rr, ax_hrv, ax_hr):
+            ax.set_facecolor('#16213e')
+            ax.tick_params(colors='#e0e0e0')
+            ax.xaxis.label.set_color('#e0e0e0')
+            ax.yaxis.label.set_color('#e0e0e0')
+            ax.title.set_color('#e0e0e0')
+            for spine in ax.spines.values():
+                spine.set_edgecolor('#444466')
+
+        line_rr,    = ax_rr.plot([], [], color='#00b4d8', lw=1.2)
+        line_rmssd, = ax_hrv.plot([], [], color='#f72585', lw=1.5, label='RMSSD')
+        line_sdnn,  = ax_hrv.plot([], [], color='#7209b7', lw=1.5, label='SDNN')
+        line_hr,    = ax_hr.plot([], [], color='#4cc9f0', lw=1.5)
+
+        ax_rr.set_title('RR Interval (ms)')
+        ax_rr.set_ylabel('ms')
+        ax_hrv.set_title(f'Rolling HRV (window = {HRV_WINDOW} beats)')
+        ax_hrv.set_ylabel('ms')
+        ax_hrv.legend(loc='upper left', facecolor='#1a1a2e', labelcolor='#e0e0e0', fontsize=8)
+        ax_hr.set_title('Heart Rate (bpm)')
+        ax_hr.set_ylabel('bpm')
+        ax_hr.set_xlabel('Time (s)')
+
+        txt_rmssd = ax_hrv.text(0.99, 0.88, '', transform=ax_hrv.transAxes,
+                                ha='right', va='top', color='#f72585', fontsize=9)
+        txt_sdnn  = ax_hrv.text(0.99, 0.68, '', transform=ax_hrv.transAxes,
+                                ha='right', va='top', color='#7209b7', fontsize=9)
+
+        def update(_):
+            if not self.timestamps:
+                return line_rr, line_rmssd, line_sdnn, line_hr, txt_rmssd, txt_sdnn
+
+            t = list(self.timestamps)
+            rr    = list(self.rr_history)
+            rmssd = list(self.rmssd_history)
+            sdnn  = list(self.sdnn_history)
+            hr    = list(self.hr_history)
+
+            n = min(len(t), len(rr), len(rmssd), len(sdnn), len(hr))
+            t, rr, rmssd, sdnn, hr = t[-n:], rr[-n:], rmssd[-n:], sdnn[-n:], hr[-n:]
+
+            for line, y in [(line_rr, rr), (line_rmssd, rmssd), (line_sdnn, sdnn), (line_hr, hr)]:
+                line.set_data(t, y)
+
+            for ax, data in [(ax_rr, rr), (ax_hrv, rmssd + sdnn), (ax_hr, hr)]:
+                ax.set_xlim(max(0, t[0]), t[-1] + 1)
+                if data:
+                    margin = (max(data) - min(data)) * 0.15 or 5
+                    ax.set_ylim(min(data) - margin, max(data) + margin)
+
+            if rmssd:
+                txt_rmssd.set_text(f'RMSSD: {rmssd[-1]:.1f} ms')
+            if sdnn:
+                txt_sdnn.set_text(f'SDNN:  {sdnn[-1]:.1f} ms')
+
+            return line_rr, line_rmssd, line_sdnn, line_hr, txt_rmssd, txt_sdnn
+
+        ani = FuncAnimation(fig, update, interval=500, blit=False, cache_frame_data=False)
+        plt.suptitle('Polar H10 — Live HRV Metrics', color='#e0e0e0', fontsize=13, y=0.98)
+
+        # Keep a reference so GC doesn't kill the animation
+        self._ani = ani
+        try:
+            plt.show()
+        except KeyboardInterrupt:
+            pass
+
+    async def connect_and_stream(self):
         if not self.device:
             await self.find_device()
-        
         if not self.device:
             raise Exception("Device not found, cannot connect")
-        
+
         print(f"\nConnecting to {self.device.name}...")
-        
+
         async with BleakClient(self.device.address) as client:
             self.client = client
             print(f"Connected: {client.is_connected}")
-            
-            # Subscribe to heart rate notifications
+            self._start_time = datetime.now()
+
             await client.start_notify(HEART_RATE_MEASUREMENT_UUID, self.parse_heart_rate_data)
-            print(f"Streaming HRV data for {duration} seconds...\n")
-            
-            # Stream for specified duration
-            await asyncio.sleep(duration)
-            
-            # Stop notifications
+            print("Streaming HRV data — press Ctrl+C to stop.\n")
+
+            try:
+                while True:
+                    await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                pass
+
             await client.stop_notify(HEART_RATE_MEASUREMENT_UUID)
-            print("\n" + "="*70)
-            print("Data collection complete!")
-            
-            # Calculate and display HRV metrics
-            metrics = self.calculate_hrv_metrics()
-            if metrics:
-                print("\n--- HRV Metrics ---")
-                print(f"Number of RR intervals: {metrics['num_intervals']}")
-                print(f"Mean RR interval: {metrics['mean_rr']:.1f} ms")
-                print(f"Mean Heart Rate: {metrics['mean_hr']:.1f} bpm")
-                print(f"SDNN (standard deviation): {metrics['sdnn']:.1f} ms")
-                print(f"RMSSD: {metrics['rmssd']:.1f} ms")
-                print(f"NN50: {metrics['nn50']}")
-                print(f"pNN50: {metrics['pnn50']:.1f}%")
-                print("="*70)
-            
-            return metrics
 
 
-async def main():
-    """Main function to run the HRV data collection"""
-    # You can customize the device name if your Polar H10 has a different identifier
-    polar = PolarH10(device_name="Polar H10")
-    
-    try:
-        # Stream data for 60 seconds (adjust as needed)
-        metrics = await polar.connect_and_stream(duration=60)
-        
-        # Access the collected RR intervals if needed for further analysis
-        if metrics:
-            print(f"\nCollected {len(polar.rr_intervals)} RR intervals")
-            print(f"RR intervals available in polar.rr_intervals")
-            
-    except Exception as e:
-        print(f"Error: {e}")
+def run_ble(polar):
+    """Run the asyncio BLE loop in a background thread."""
+    async def _run():
+        task = asyncio.create_task(polar.connect_and_stream())
+        polar._ble_task = task
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":
-    # Run the async main function
-    asyncio.run(main())
+    polar = PolarH10(device_name="Polar H10")
+
+    # BLE runs in a background thread; plot stays on the main thread (macOS requirement)
+    ble_thread = threading.Thread(target=run_ble, args=(polar,), daemon=True)
+    ble_thread.start()
+
+    try:
+        # start_live_plot blocks on plt.show() — must be called from the main thread
+        polar.start_live_plot()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print("\nStopped — printing final summary...")
+        # Cancel the BLE task so connect_and_stream exits cleanly
+        task = getattr(polar, '_ble_task', None)
+        if task and not task.done():
+            task.cancel()
+        ble_thread.join(timeout=3)
+
+        metrics = polar.calculate_hrv_metrics()
+        if metrics:
+            print("\n--- Final HRV Summary ---")
+            print(f"Number of RR intervals : {metrics['num_intervals']}")
+            print(f"Mean RR interval       : {metrics['mean_rr']:.1f} ms")
+            print(f"Mean Heart Rate        : {metrics['mean_hr']:.1f} bpm")
+            print(f"SDNN                   : {metrics['sdnn']:.1f} ms")
+            print(f"RMSSD                  : {metrics['rmssd']:.1f} ms")
+            print(f"NN50                   : {metrics['nn50']}")
+            print(f"pNN50                  : {metrics['pnn50']:.1f}%")
+            print("="*70)
