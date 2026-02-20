@@ -1133,6 +1133,72 @@ By clicking "I Agree", you confirm that:
     return False
 
 
+def show_reconnect_screen(collector: 'SynchronizedCollector') -> bool:
+    """
+    Block until all device threads signal they are ready (or user aborts).
+    Show live status for each device so the researcher can see progress.
+    Returns True when all devices are ready, False if aborted.
+    """
+    import FreeSimpleGUI as sg
+
+    sg.theme('LightBlue2')
+
+    def status_row(label, key_status):
+        return [
+            sg.Text(f'{label}:', font=('Helvetica', 11), size=(22, 1)),
+            sg.Text('Connecting...', key=key_status, font=('Helvetica', 11, 'bold'),
+                    text_color='orange', size=(18, 1)),
+        ]
+
+    layout = [
+        [sg.Text('Reconnecting Devices', font=('Helvetica', 20, 'bold'),
+                 justification='center', expand_x=True)],
+        [sg.Text('Please wait while all sensors reconnect...',
+                 font=('Helvetica', 11), justification='center', expand_x=True)],
+        [sg.Text('')],
+        [sg.Frame('Device Status', [
+            status_row('Muse 2 EEG',  '-MUSE_S-'),
+            status_row('Polar H10 HR', '-POLAR_S-'),
+            status_row('eSense GSR',   '-GSR_S-'),
+        ], font=('Helvetica', 12), pad=(10, 10))],
+        [sg.Text('')],
+        [sg.Button('Abort', size=(12, 1), font=('Helvetica', 12),
+                   button_color=('white', 'red'), key='-ABORT-')],
+    ]
+
+    window = sg.Window('BCI Experiment - Reconnecting', layout,
+                       element_justification='center', finalize=True, size=(440, 280),
+                       disable_close=True)
+
+    result = False
+    while True:
+        event, _ = window.read(timeout=100)
+
+        if event == '-ABORT-':
+            if sg.popup_yes_no('Abort the experiment?',
+                               title='Confirm Abort', font=('Helvetica', 11)) == 'Yes':
+                break
+
+        muse_ready  = collector._muse_ready.is_set()
+        polar_ready = collector._polar_ready.is_set()
+        gsr_ready   = collector._gsr_ready.is_set()
+
+        for key, ready in [('-MUSE_S-', muse_ready), ('-POLAR_S-', polar_ready), ('-GSR_S-', gsr_ready)]:
+            elem = window[key]
+            if elem is not None:
+                if ready:
+                    elem.update(value='Ready', text_color='green')
+                else:
+                    elem.update(value='Connecting...', text_color='orange')
+
+        if muse_ready and polar_ready and gsr_ready:
+            result = True
+            break
+
+    window.close()
+    return result
+
+
 def show_countdown_screen() -> bool:
     """Show countdown before experiment starts. Returns True when complete."""
     import FreeSimpleGUI as sg
@@ -1173,8 +1239,65 @@ def show_countdown_screen() -> bool:
     return True
 
 
-def show_experiment_screen(collector: SynchronizedCollector, output_path: str) -> None:
-    """Show experiment running screen with stop button. Runs until user stops."""
+def _reset_data_store(collector: 'SynchronizedCollector'):
+    """Reset the collector's data store for a fresh session, preserving device rates."""
+    prev_muse_rate = collector.data_store.muse_sampling_rate
+    prev_gsr_rate = collector.data_store.gsr_sampling_rate
+    collector.data_store = SynchronizedDataStore()
+    collector.data_store.muse_sampling_rate = prev_muse_rate
+    collector.data_store.gsr_sampling_rate = prev_gsr_rate
+
+
+def start_collection_threads(collector: 'SynchronizedCollector'):
+    """
+    Start all device collection threads and return them.
+    Resets synchronization events before starting.
+    Call this before the countdown so devices connect during the swap/countdown window.
+
+    Returns:
+        (muse_thread, polar_thread, gsr_thread)
+    """
+    collector._stop_event.clear()
+    collector._muse_ready.clear()
+    collector._polar_ready.clear()
+    collector._gsr_ready.clear()
+    collector._start_recording.clear()
+
+    muse_thread = threading.Thread(
+        target=collector._muse_collection_thread,
+        args=(None,),
+        daemon=True
+    )
+    muse_thread.start()
+
+    def run_polar_async():
+        asyncio.run(collector._polar_collection_async(None))
+
+    polar_thread = threading.Thread(target=run_polar_async, daemon=True)
+    polar_thread.start()
+
+    gsr_thread = threading.Thread(
+        target=collector._gsr_collection_thread,
+        args=(None,),
+        daemon=True
+    )
+    gsr_thread.start()
+
+    return muse_thread, polar_thread, gsr_thread
+
+
+def show_experiment_screen(collector: SynchronizedCollector, output_path: str,
+                           threads=None) -> None:
+    """
+    Show experiment running screen with stop button. Runs until user stops.
+
+    Args:
+        collector: The synchronized data collector.
+        output_path: Base path to save data to.
+        threads: Optional (muse_thread, polar_thread, gsr_thread) if already started
+                 before this call (e.g. during countdown). If None, threads are
+                 started here (legacy / session-0 behaviour).
+    """
     import FreeSimpleGUI as sg
 
     sg.theme('LightBlue2')
@@ -1220,37 +1343,14 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str) -
     # Bind right arrow for task transitions (window must be focused)
     window.bind("<Right>", "-NEXT_TASK-")
 
-    # Reset synchronization events
-    collector._stop_event.clear()
-    collector._muse_ready.clear()
-    collector._polar_ready.clear()
-    collector._gsr_ready.clear()
-    collector._start_recording.clear()
-
     current_task = 1
 
-    # Start Muse collection thread
-    muse_thread = threading.Thread(
-        target=collector._muse_collection_thread,
-        args=(None,),  # None = run indefinitely
-        daemon=True
-    )
-    muse_thread.start()
-
-    # Start Polar collection in a thread (we'll run the async loop there)
-    def run_polar_async():
-        asyncio.run(collector._polar_collection_async(None))  # None = run indefinitely
-
-    polar_thread = threading.Thread(target=run_polar_async, daemon=True)
-    polar_thread.start()
-
-    # Start GSR collection thread
-    gsr_thread = threading.Thread(
-        target=collector._gsr_collection_thread,
-        args=(None,),  # None = run indefinitely
-        daemon=True
-    )
-    gsr_thread.start()
+    if threads is not None:
+        # Threads were pre-started before the countdown — reuse them.
+        muse_thread, polar_thread, gsr_thread = threads
+    else:
+        # Legacy path: start threads now (used when called without pre-starting).
+        muse_thread, polar_thread, gsr_thread = start_collection_threads(collector)
 
     # Wait for all devices to be ready
     window['-STATUS-'].update('Waiting for Muse to be ready...')
@@ -1348,13 +1448,23 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str) -
 
     # Stop collection
     collector._stop_event.set()
-    window['-STOP-'].update('Saving data...', disabled=True)
+    window['-STOP-'].update('Stopping devices...', disabled=True)
     window.refresh()
 
-    # Wait for threads to finish
-    muse_thread.join(timeout=5)
-    polar_thread.join(timeout=5)
-    gsr_thread.join(timeout=5)
+    # Wait for threads to finish — Muse BrainFlow release can be slow, give it up to 15s
+    muse_thread.join(timeout=15)
+    if muse_thread.is_alive():
+        print("[Muse] WARNING: thread did not exit cleanly within timeout.")
+
+    polar_thread.join(timeout=10)
+    gsr_thread.join(timeout=10)
+
+    # Give the Bluetooth stack a moment to fully release the BrainFlow session
+    # before any subsequent prepare_session() call on the next device round.
+    time.sleep(2.0)
+
+    window['-STOP-'].update('Saving data...', disabled=True)
+    window.refresh()
 
     # Save data
     collector.save_data(output_path)
@@ -1362,73 +1472,185 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str) -
     window.close()
 
 
-def show_completion_screen(collector: SynchronizedCollector, output_path: str) -> None:
-    """Show experiment completion summary."""
+def show_nasa_tlx_screen(device_name: str) -> Optional[Dict[str, int]]:
+    """
+    Show NASA TLX questionnaire for the given device condition.
+    Returns a dict of dimension -> score (0-100), or None if cancelled.
+    """
     import FreeSimpleGUI as sg
 
     sg.theme('LightBlue2')
 
-    # Calculate summary stats
-    total_duration = collector.data_store.get_relative_time(time.time())
-    eeg_count = len(collector.data_store.eeg_data)
-    hr_count = len(collector.data_store.hr_data)
-    gsr_count = len(collector.data_store.gsr_data)
-    marker_count = len(collector.data_store.task_markers)
+    dimensions = [
+        ('Mental Demand',    'How mentally demanding was the task?'),
+        ('Physical Demand',  'How physically demanding was the task?'),
+        ('Temporal Demand',  'How hurried or rushed was the pace of the task?'),
+        ('Performance',      'How successful were you in accomplishing the task?'),
+        ('Effort',           'How hard did you have to work to accomplish your level of performance?'),
+        ('Frustration',      'How insecure, discouraged, irritated, stressed, and annoyed were you?'),
+    ]
 
-    hours = int(total_duration // 3600)
-    minutes = int((total_duration % 3600) // 60)
-    seconds = int(total_duration % 60)
-    duration_str = f'{hours:02d}:{minutes:02d}:{seconds:02d}'
+    slider_rows = []
+    for dim, desc in dimensions:
+        key = f'-{dim.upper().replace(" ", "_")}-'
+        slider_rows += [
+            [sg.Text(dim, font=('Helvetica', 12, 'bold'))],
+            [sg.Text(desc, font=('Helvetica', 10), text_color='gray')],
+            [sg.Text('Low', font=('Helvetica', 9)),
+             sg.Slider(range=(0, 100), default_value=50, orientation='h',
+                       size=(40, 20), key=key, font=('Helvetica', 10)),
+             sg.Text('High', font=('Helvetica', 9))],
+            [sg.Text('')],
+        ]
 
-    # HRV metrics if available
-    hrv_text = "Not available"
-    if collector.polar:
-        metrics = collector.polar.calculate_hrv_metrics()
-        if metrics:
-            hrv_text = f"Mean HR: {metrics['mean_hr']:.1f} bpm\n"
-            hrv_text += f"SDNN: {metrics['sdnn']:.1f} ms\n"
-            hrv_text += f"RMSSD: {metrics['rmssd']:.1f} ms"
+    layout = [
+        [sg.Text(f'NASA Task Load Index — {device_name}',
+                 font=('Helvetica', 18, 'bold'), justification='center', expand_x=True)],
+        [sg.Text('Please rate your experience with the device you just used.',
+                 font=('Helvetica', 11), justification='center', expand_x=True)],
+        [sg.Text('')],
+        [sg.Column(slider_rows, scrollable=True, vertical_scroll_only=True, size=(620, 420))],
+        [sg.Text('')],
+        [sg.Button('Submit', size=(15, 1), font=('Helvetica', 12), key='-SUBMIT-'),
+         sg.Button('Cancel', size=(15, 1), font=('Helvetica', 12))]
+    ]
 
-    # GSR summary if available
-    gsr_text = "Not available"
-    if collector.data_store.gsr_data:
-        gsr_values = [s.gsr_uS for s in collector.data_store.gsr_data]
-        gsr_text = f"Mean GSR: {np.mean(gsr_values):.4f} µS\n"
-        gsr_text += f"Min: {np.min(gsr_values):.4f} µS\n"
-        gsr_text += f"Max: {np.max(gsr_values):.4f} µS"
+    window = sg.Window(f'NASA TLX — {device_name}', layout,
+                       element_justification='center', finalize=True, size=(680, 620))
+
+    scores = None
+    while True:
+        event, values = window.read()
+        if event in (sg.WIN_CLOSED, 'Cancel'):
+            break
+        if event == '-SUBMIT-':
+            scores = {}
+            for dim, _ in dimensions:
+                key = f'-{dim.upper().replace(" ", "_")}-'
+                scores[dim] = int(values[key])
+            break
+
+    window.close()
+    return scores
+
+
+def show_device_swap_screen(next_device: str) -> bool:
+    """
+    Show a screen prompting the researcher to swap to the next device.
+    Returns True when ready to continue, False if cancelled.
+    """
+    import FreeSimpleGUI as sg
+
+    sg.theme('LightBlue2')
+
+    layout = [
+        [sg.Text('Device Swap', font=('Helvetica', 24, 'bold'),
+                 justification='center', expand_x=True)],
+        [sg.Text('')],
+        [sg.Text('The current session has ended.', font=('Helvetica', 13),
+                 justification='center', expand_x=True)],
+        [sg.Text('')],
+        [sg.Frame('Next Step', [
+            [sg.Text(f'Please swap to the next device:', font=('Helvetica', 12))],
+            [sg.Text(f'   {next_device}', font=('Helvetica', 16, 'bold'), text_color='navy')],
+        ], font=('Helvetica', 12))],
+        [sg.Text('')],
+        [sg.Text('When the new device is in place and the participant is ready,',
+                 font=('Helvetica', 11))],
+        [sg.Text('click Continue to proceed to the next session.',
+                 font=('Helvetica', 11))],
+        [sg.Text('')],
+        [sg.Button('Continue to Next Session', size=(25, 2), font=('Helvetica', 12),
+                   button_color=('white', 'green'), key='-CONTINUE-'),
+         sg.Button('Abort Experiment', size=(18, 2), font=('Helvetica', 12),
+                   button_color=('white', 'red'), key='-ABORT-')]
+    ]
+
+    window = sg.Window('BCI Experiment — Device Swap', layout,
+                       element_justification='center', finalize=True, size=(540, 380),
+                       disable_close=True)
+
+    result = False
+    while True:
+        event, _ = window.read()
+        if event == '-CONTINUE-':
+            result = True
+            break
+        if event == '-ABORT-':
+            if sg.popup_yes_no('Are you sure you want to abort the experiment?',
+                               title='Confirm Abort', font=('Helvetica', 11)) == 'Yes':
+                break
+
+    window.close()
+    return result
+
+
+def show_completion_screen(sessions: List[Dict], output_base: str) -> None:
+    """
+    Show experiment completion summary for all three device sessions.
+
+    Args:
+        sessions: list of dicts with keys 'device', 'collector', 'output_path', 'tlx_scores'
+        output_base: base output folder path shown to user
+    """
+    import FreeSimpleGUI as sg
+
+    sg.theme('LightBlue2')
+
+    tlx_dim_order = ['Mental Demand', 'Physical Demand', 'Temporal Demand',
+                     'Performance', 'Effort', 'Frustration']
+
+    session_rows = []
+    for s in sessions:
+        device = s['device']
+        data_store: SynchronizedDataStore = s['data_store']
+        tlx: Optional[Dict[str, int]] = s['tlx_scores']
+
+        last_ts = (data_store.eeg_data[-1].timestamp if data_store.eeg_data
+                   else data_store.session_start)
+        total_duration = data_store.get_relative_time(last_ts)
+        hours = int(total_duration // 3600)
+        mins = int((total_duration % 3600) // 60)
+        secs = int(total_duration % 60)
+
+        eeg_count = len(data_store.eeg_data)
+        hr_count = len(data_store.hr_data)
+        gsr_count = len(data_store.gsr_data)
+
+        tlx_lines = []
+        if tlx:
+            for dim in tlx_dim_order:
+                tlx_lines.append([sg.Text(f'  {dim}: {tlx[dim]}', font=('Helvetica', 10))])
+            avg_tlx = sum(tlx.values()) / len(tlx)
+            tlx_lines.append([sg.Text(f'  Average TLX: {avg_tlx:.1f}', font=('Helvetica', 10, 'bold'))])
+        else:
+            tlx_lines.append([sg.Text('  Not completed', font=('Helvetica', 10), text_color='red')])
+
+        session_rows.append(
+            sg.Frame(f'{device}', [
+                [sg.Text(f'Duration: {hours:02d}:{mins:02d}:{secs:02d}  |  '
+                         f'EEG: {eeg_count:,}  |  HR: {hr_count:,}  |  GSR: {gsr_count:,}',
+                         font=('Helvetica', 10))],
+                [sg.Text('NASA TLX Scores:', font=('Helvetica', 10, 'bold'))],
+                *tlx_lines,
+            ], font=('Helvetica', 11))
+        )
 
     layout = [
         [sg.Text('Experiment Complete!', font=('Helvetica', 24, 'bold'),
                  text_color='green', justification='center', expand_x=True)],
+        [sg.Text('Thank you for participating.', font=('Helvetica', 13),
+                 justification='center', expand_x=True)],
         [sg.Text('')],
-        [sg.Text('Thank you for participating.', font=('Helvetica', 14))],
+        *[[row] for row in session_rows],
         [sg.Text('')],
-
-        [sg.Frame('Session Summary', [
-            [sg.Text(f'Duration: {duration_str}', font=('Helvetica', 12))],
-            [sg.Text(f'EEG Samples: {eeg_count:,}', font=('Helvetica', 12))],
-            [sg.Text(f'HR Samples: {hr_count:,}', font=('Helvetica', 12))],
-            [sg.Text(f'GSR Samples: {gsr_count:,}', font=('Helvetica', 12))],
-            [sg.Text(f'Task Markers: {marker_count:,}', font=('Helvetica', 12))],
-        ], font=('Helvetica', 12))],
-
-        [sg.Text('')],
-
-        [sg.Frame('HRV Metrics', [
-            [sg.Text(hrv_text, font=('Helvetica', 11))]
-        ], font=('Helvetica', 12)),
-         sg.Frame('GSR Summary', [
-            [sg.Text(gsr_text, font=('Helvetica', 11))]
-        ], font=('Helvetica', 12))],
-
-        [sg.Text('')],
-        [sg.Text(f'Data saved to: {output_path}', font=('Helvetica', 10))],
+        [sg.Text(f'Data saved to: {output_base}', font=('Helvetica', 10))],
         [sg.Text('')],
         [sg.Button('Close', size=(15, 1), font=('Helvetica', 12))]
     ]
 
-    window = sg.Window('BCI Experiment - Complete', layout,
-                       element_justification='center', finalize=True, size=(600, 500))
+    window = sg.Window('BCI Experiment — Complete', layout,
+                       element_justification='center', finalize=True, size=(650, 620))
 
     while True:
         event, _ = window.read()
@@ -1564,6 +1786,8 @@ def main():
             raise
     else:
         # GUI mode
+        DEVICES = ['Auditory', 'Vibrations', 'Shape Changing']
+
         try:
             # Step 1: Participant ID
             participant_id = show_participant_screen()
@@ -1573,13 +1797,12 @@ def main():
 
             # Create participant folder
             participant_folder = create_participant_folder(participant_id)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = str(participant_folder / f"session_{timestamp}")
+            session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
             print(f"Participant: {participant_id}")
-            print(f"Data will be saved to: {output_path}")
+            print(f"Data will be saved under: {participant_folder}")
 
-            # Step 2: Device Connection
+            # Step 2: Device Connection (done once — sensors stay on throughout)
             if not show_connection_screen(collector):
                 print("Experiment cancelled at device connection.")
                 collector.disconnect_devices()
@@ -1591,17 +1814,84 @@ def main():
                 collector.disconnect_devices()
                 return
 
-            # Step 4: Countdown
-            if not show_countdown_screen():
-                print("Experiment cancelled at countdown.")
-                collector.disconnect_devices()
-                return
+            # Run three device sessions
+            completed_sessions = []
 
-            # Step 5: Run Experiment
-            show_experiment_screen(collector, output_path)
+            # Pre-start threads for the first session.
+            _reset_data_store(collector)
+            session_threads = start_collection_threads(collector)
 
-            # Step 6: Completion Screen
-            show_completion_screen(collector, output_path)
+            for session_idx, device_name in enumerate(DEVICES):
+                print(f"\n{'='*60}")
+                print(f"SESSION {session_idx + 1}/3: {device_name}")
+                print(f"{'='*60}")
+
+                # Per-session output path
+                device_slug = device_name.lower().replace(' ', '_')
+                output_path = str(
+                    participant_folder / f"session_{session_timestamp}_{device_slug}"
+                )
+
+                # Wait for all devices to be fully ready before the countdown.
+                # This covers both session 1 (initial connect) and sessions 2/3
+                # (reconnect after swap). The screen auto-advances once all ready.
+                if not show_reconnect_screen(collector):
+                    print(f"Experiment aborted at reconnect screen for {device_name}.")
+                    collector._stop_event.set()
+                    collector.disconnect_devices()
+                    return
+
+                # Countdown
+                if not show_countdown_screen():
+                    print(f"Experiment cancelled at countdown for {device_name}.")
+                    collector._stop_event.set()
+                    collector.disconnect_devices()
+                    return
+
+                # Run the experiment — threads already started and ready
+                show_experiment_screen(collector, output_path, threads=session_threads)
+
+                # NASA TLX for this device
+                tlx_scores = show_nasa_tlx_screen(device_name)
+                if tlx_scores is None:
+                    print(f"NASA TLX skipped for {device_name}.")
+
+                # Save TLX scores alongside sensor data
+                if tlx_scores:
+                    tlx_path = f"{output_path}_nasa_tlx.json"
+                    with open(tlx_path, 'w') as f:
+                        json.dump({
+                            'device': device_name,
+                            'participant_id': participant_id,
+                            'scores': tlx_scores,
+                            'average': sum(tlx_scores.values()) / len(tlx_scores)
+                        }, f, indent=2)
+                    print(f"NASA TLX scores saved to {tlx_path}")
+
+                completed_sessions.append({
+                    'device': device_name,
+                    'data_store': collector.data_store,  # snapshot before reset
+                    'output_path': output_path,
+                    'tlx_scores': tlx_scores,
+                })
+
+                # Device swap screen (not shown after the last session)
+                if session_idx < len(DEVICES) - 1:
+                    next_device = DEVICES[session_idx + 1]
+                    if not show_device_swap_screen(next_device):
+                        print("Experiment aborted at device swap.")
+                        collector.disconnect_devices()
+                        break
+
+                    # User confirmed swap — reset state and start connecting the
+                    # next Muse session immediately. show_reconnect_screen at the
+                    # top of the next iteration will block until all are ready.
+                    _reset_data_store(collector)
+                    print(f"[Session] Starting device threads for {next_device}...")
+                    session_threads = start_collection_threads(collector)
+
+            # Step 8: Final completion screen
+            show_completion_screen(completed_sessions, str(participant_folder))
 
             print("\nExperiment completed successfully!")
 
