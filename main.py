@@ -22,6 +22,14 @@ from muse import MuseBrainFlowProcessor
 from polar import PolarH10, HEART_RATE_MEASUREMENT_UUID
 from esense import ESenseGSR
 
+# ── Experiment configuration ──────────────────────────────────────────────────
+TASKS_PER_DEVICE = 5   # Number of tasks per device session (change here to adjust)
+
+# ── Device enable flags — set to False to run without a device ────────────────
+USE_MUSE  = True
+USE_POLAR = False
+USE_GSR   = False
+
 
 @dataclass
 class TimestampedEEGSample:
@@ -249,7 +257,10 @@ class SynchronizedCollector:
                  gsr_calibration_b: float = 0.0,
                  buffer_duration: int = 10,
                  apply_ica: bool = True,
-                 apply_filter: bool = True):
+                 apply_filter: bool = True,
+                 use_muse: bool = True,
+                 use_polar: bool = True,
+                 use_gsr: bool = True):
         """
         Initialize the synchronized collector.
 
@@ -273,6 +284,11 @@ class SynchronizedCollector:
         self.buffer_duration = buffer_duration
         self.apply_ica = apply_ica
         self.apply_filter = apply_filter
+
+        # Device enable flags
+        self.use_muse  = use_muse
+        self.use_polar = use_polar
+        self.use_gsr   = use_gsr
 
         # Data store with synchronized timestamps
         self.data_store = SynchronizedDataStore()
@@ -932,7 +948,9 @@ def show_connection_screen(collector: SynchronizedCollector) -> bool:
         # Muse status
         [sg.Frame('Muse 2 EEG Headband', [
             [sg.Text('Status:', font=('Helvetica', 11)),
-             sg.Text('Waiting...', key='-MUSE_STATUS-', font=('Helvetica', 11, 'bold'), text_color='gray')],
+             sg.Text('Disabled' if not collector.use_muse else 'Waiting...',
+                     key='-MUSE_STATUS-', font=('Helvetica', 11, 'bold'),
+                     text_color='gray' if collector.use_muse else 'purple')],
             [sg.ProgressBar(100, orientation='h', size=(30, 20), key='-MUSE_PROGRESS-', bar_color=('blue', 'lightgray'))]
         ], font=('Helvetica', 12))],
 
@@ -941,7 +959,9 @@ def show_connection_screen(collector: SynchronizedCollector) -> bool:
         # Polar status
         [sg.Frame('Polar H10 Heart Rate Monitor', [
             [sg.Text('Status:', font=('Helvetica', 11)),
-             sg.Text('Waiting...', key='-POLAR_STATUS-', font=('Helvetica', 11, 'bold'), text_color='gray')],
+             sg.Text('Disabled' if not collector.use_polar else 'Waiting...',
+                     key='-POLAR_STATUS-', font=('Helvetica', 11, 'bold'),
+                     text_color='gray' if collector.use_polar else 'purple')],
             [sg.ProgressBar(100, orientation='h', size=(30, 20), key='-POLAR_PROGRESS-', bar_color=('blue', 'lightgray'))]
         ], font=('Helvetica', 12))],
 
@@ -950,7 +970,9 @@ def show_connection_screen(collector: SynchronizedCollector) -> bool:
         # GSR status
         [sg.Frame('eSense GSR (Skin Response)', [
             [sg.Text('Status:', font=('Helvetica', 11)),
-             sg.Text('Waiting...', key='-GSR_STATUS-', font=('Helvetica', 11, 'bold'), text_color='gray')],
+             sg.Text('Disabled' if not collector.use_gsr else 'Waiting...',
+                     key='-GSR_STATUS-', font=('Helvetica', 11, 'bold'),
+                     text_color='gray' if collector.use_gsr else 'purple')],
             [sg.ProgressBar(100, orientation='h', size=(30, 20), key='-GSR_PROGRESS-', bar_color=('blue', 'lightgray'))]
         ], font=('Helvetica', 12))],
 
@@ -964,9 +986,9 @@ def show_connection_screen(collector: SynchronizedCollector) -> bool:
     window = sg.Window('BCI Experiment - Device Connection', layout,
                        element_justification='center', finalize=True, size=(550, 500))
 
-    muse_connected = False
-    polar_connected = False
-    gsr_connected = False
+    muse_connected  = not collector.use_muse   # disabled counts as "ok"
+    polar_connected = not collector.use_polar
+    gsr_connected   = not collector.use_gsr
 
     def connect_muse_thread():
         nonlocal muse_connected
@@ -990,25 +1012,34 @@ def show_connection_screen(collector: SynchronizedCollector) -> bool:
 
         if event == '-CONNECT-':
             window['-CONNECT-'].update(disabled=True)
-            window['-MUSE_STATUS-'].update('Connecting...', text_color='orange')
-            window['-POLAR_STATUS-'].update('Connecting...', text_color='orange')
-            window['-GSR_STATUS-'].update('Connecting...', text_color='orange')
-            window['-MUSE_PROGRESS-'].update(50)
-            window['-POLAR_PROGRESS-'].update(50)
-            window['-GSR_PROGRESS-'].update(50)
+            if collector.use_muse:
+                window['-MUSE_STATUS-'].update('Connecting...', text_color='orange')
+                window['-MUSE_PROGRESS-'].update(50)
+            if collector.use_polar:
+                window['-POLAR_STATUS-'].update('Connecting...', text_color='orange')
+                window['-POLAR_PROGRESS-'].update(50)
+            if collector.use_gsr:
+                window['-GSR_STATUS-'].update('Connecting...', text_color='orange')
+                window['-GSR_PROGRESS-'].update(50)
             window.refresh()
 
-            # Connect devices in threads
-            muse_thread = threading.Thread(target=connect_muse_thread)
-            polar_thread = threading.Thread(target=connect_polar_thread)
-            gsr_thread = threading.Thread(target=connect_gsr_thread)
-
-            muse_thread.start()
-            polar_thread.start()
-            gsr_thread.start()
+            # Connect only enabled devices in threads
+            threads = []
+            if collector.use_muse:
+                t = threading.Thread(target=connect_muse_thread)
+                t.start()
+                threads.append(t)
+            if collector.use_polar:
+                t = threading.Thread(target=connect_polar_thread)
+                t.start()
+                threads.append(t)
+            if collector.use_gsr:
+                t = threading.Thread(target=connect_gsr_thread)
+                t.start()
+                threads.append(t)
 
             # Wait for connections with GUI updates
-            while muse_thread.is_alive() or polar_thread.is_alive() or gsr_thread.is_alive():
+            while any(t.is_alive() for t in threads):
                 event2, _ = window.read(timeout=100)
                 if event2 in (sg.WIN_CLOSED, 'Cancel'):
                     collector.disconnect_devices()
@@ -1016,7 +1047,10 @@ def show_connection_screen(collector: SynchronizedCollector) -> bool:
                     return False
 
             # Update Muse status
-            if muse_connected:
+            if not collector.use_muse:
+                window['-MUSE_STATUS-'].update('Disabled', text_color='purple')
+                window['-MUSE_PROGRESS-'].update(0)
+            elif muse_connected:
                 window['-MUSE_STATUS-'].update('Connected', text_color='green')
                 window['-MUSE_PROGRESS-'].update(100)
             else:
@@ -1025,7 +1059,10 @@ def show_connection_screen(collector: SynchronizedCollector) -> bool:
                 window['-MUSE_PROGRESS-'].update(0)
 
             # Update Polar status
-            if polar_connected:
+            if not collector.use_polar:
+                window['-POLAR_STATUS-'].update('Disabled', text_color='purple')
+                window['-POLAR_PROGRESS-'].update(0)
+            elif polar_connected:
                 window['-POLAR_STATUS-'].update('Connected', text_color='green')
                 window['-POLAR_PROGRESS-'].update(100)
             else:
@@ -1034,7 +1071,10 @@ def show_connection_screen(collector: SynchronizedCollector) -> bool:
                 window['-POLAR_PROGRESS-'].update(0)
 
             # Update GSR status
-            if gsr_connected:
+            if not collector.use_gsr:
+                window['-GSR_STATUS-'].update('Disabled', text_color='purple')
+                window['-GSR_PROGRESS-'].update(0)
+            elif gsr_connected:
                 window['-GSR_STATUS-'].update('Connected', text_color='green')
                 window['-GSR_PROGRESS-'].update(100)
             else:
@@ -1042,7 +1082,7 @@ def show_connection_screen(collector: SynchronizedCollector) -> bool:
                 window['-GSR_STATUS-'].update(f'Failed: {error_msg[:30]}', text_color='red')
                 window['-GSR_PROGRESS-'].update(0)
 
-            # Enable continue if all devices connected
+            # Enable continue if all enabled devices connected
             if muse_connected and polar_connected and gsr_connected:
                 window['-CONTINUE-'].update(disabled=False)
             else:
@@ -1143,11 +1183,13 @@ def show_reconnect_screen(collector: 'SynchronizedCollector') -> bool:
 
     sg.theme('LightBlue2')
 
-    def status_row(label, key_status):
+    def status_row(label, key_status, disabled=False):
+        init_text  = 'Disabled'  if disabled else 'Connecting...'
+        init_color = 'purple'    if disabled else 'orange'
         return [
             sg.Text(f'{label}:', font=('Helvetica', 11), size=(22, 1)),
-            sg.Text('Connecting...', key=key_status, font=('Helvetica', 11, 'bold'),
-                    text_color='orange', size=(18, 1)),
+            sg.Text(init_text, key=key_status, font=('Helvetica', 11, 'bold'),
+                    text_color=init_color, size=(18, 1)),
         ]
 
     layout = [
@@ -1157,9 +1199,9 @@ def show_reconnect_screen(collector: 'SynchronizedCollector') -> bool:
                  font=('Helvetica', 11), justification='center', expand_x=True)],
         [sg.Text('')],
         [sg.Frame('Device Status', [
-            status_row('Muse 2 EEG',  '-MUSE_S-'),
-            status_row('Polar H10 HR', '-POLAR_S-'),
-            status_row('eSense GSR',   '-GSR_S-'),
+            status_row('Muse 2 EEG',  '-MUSE_S-',  disabled=not collector.use_muse),
+            status_row('Polar H10 HR', '-POLAR_S-', disabled=not collector.use_polar),
+            status_row('eSense GSR',   '-GSR_S-',  disabled=not collector.use_gsr),
         ], font=('Helvetica', 12), pad=(10, 10))],
         [sg.Text('')],
         [sg.Button('Abort', size=(12, 1), font=('Helvetica', 12),
@@ -1179,11 +1221,17 @@ def show_reconnect_screen(collector: 'SynchronizedCollector') -> bool:
                                title='Confirm Abort', font=('Helvetica', 11)) == 'Yes':
                 break
 
-        muse_ready  = collector._muse_ready.is_set()
-        polar_ready = collector._polar_ready.is_set()
-        gsr_ready   = collector._gsr_ready.is_set()
+        muse_ready  = (not collector.use_muse)  or collector._muse_ready.is_set()
+        polar_ready = (not collector.use_polar) or collector._polar_ready.is_set()
+        gsr_ready   = (not collector.use_gsr)   or collector._gsr_ready.is_set()
 
-        for key, ready in [('-MUSE_S-', muse_ready), ('-POLAR_S-', polar_ready), ('-GSR_S-', gsr_ready)]:
+        for key, ready, enabled in [
+            ('-MUSE_S-',  muse_ready,  collector.use_muse),
+            ('-POLAR_S-', polar_ready, collector.use_polar),
+            ('-GSR_S-',   gsr_ready,   collector.use_gsr),
+        ]:
+            if not enabled:
+                continue  # leave label as 'Disabled'
             elem = window[key]
             if elem is not None:
                 if ready:
@@ -1263,25 +1311,37 @@ def start_collection_threads(collector: 'SynchronizedCollector'):
     collector._gsr_ready.clear()
     collector._start_recording.clear()
 
-    muse_thread = threading.Thread(
-        target=collector._muse_collection_thread,
-        args=(None,),
-        daemon=True
-    )
-    muse_thread.start()
+    if collector.use_muse:
+        muse_thread = threading.Thread(
+            target=collector._muse_collection_thread,
+            args=(None,),
+            daemon=True
+        )
+        muse_thread.start()
+    else:
+        collector._muse_ready.set()
+        muse_thread = None
 
-    def run_polar_async():
-        asyncio.run(collector._polar_collection_async(None))
+    if collector.use_polar:
+        def run_polar_async():
+            asyncio.run(collector._polar_collection_async(None))
 
-    polar_thread = threading.Thread(target=run_polar_async, daemon=True)
-    polar_thread.start()
+        polar_thread = threading.Thread(target=run_polar_async, daemon=True)
+        polar_thread.start()
+    else:
+        collector._polar_ready.set()
+        polar_thread = None
 
-    gsr_thread = threading.Thread(
-        target=collector._gsr_collection_thread,
-        args=(None,),
-        daemon=True
-    )
-    gsr_thread.start()
+    if collector.use_gsr:
+        gsr_thread = threading.Thread(
+            target=collector._gsr_collection_thread,
+            args=(None,),
+            daemon=True
+        )
+        gsr_thread.start()
+    else:
+        collector._gsr_ready.set()
+        gsr_thread = None
 
     return muse_thread, polar_thread, gsr_thread
 
@@ -1325,12 +1385,12 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str,
                ], font=('Helvetica', 12))],
 
                [sg.Text('Current Task:', font=('Helvetica', 11)),
-                sg.Text('1', key='-TASK_NUM-', font=('Helvetica', 11, 'bold'))],
+                sg.Text(f'1 / {TASKS_PER_DEVICE}', key='-TASK_NUM-', font=('Helvetica', 11, 'bold'))],
                [sg.Text('Press Right Arrow to end current task and move to next.',
                       font=('Helvetica', 10))],
 
         [sg.Text('')],
-        [sg.Text('Press STOP when you are ready to end the experiment.', font=('Helvetica', 10))],
+        [sg.Text(f'Session ends automatically after task {TASKS_PER_DEVICE}.', font=('Helvetica', 10))],
         [sg.Text('')],
         [sg.Button('STOP EXPERIMENT', size=(20, 2), font=('Helvetica', 14, 'bold'),
                    button_color=('white', 'red'), key='-STOP-', disabled=True)]
@@ -1352,36 +1412,39 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str,
         # Legacy path: start threads now (used when called without pre-starting).
         muse_thread, polar_thread, gsr_thread = start_collection_threads(collector)
 
-    # Wait for all devices to be ready
-    window['-STATUS-'].update('Waiting for Muse to be ready...')
-    window.refresh()
+    # Wait for all enabled devices to be ready
+    if collector.use_muse:
+        window['-STATUS-'].update('Waiting for Muse to be ready...')
+        window.refresh()
 
-    while not collector._muse_ready.is_set():
-        event, _ = window.read(timeout=100)
-        if event == '-STOP-' or event == sg.WIN_CLOSED:
-            collector._stop_event.set()
-            window.close()
-            return
+        while not collector._muse_ready.is_set():
+            event, _ = window.read(timeout=100)
+            if event == '-STOP-' or event == sg.WIN_CLOSED:
+                collector._stop_event.set()
+                window.close()
+                return
 
-    window['-STATUS-'].update('Waiting for Polar to be ready...')
-    window.refresh()
+    if collector.use_polar:
+        window['-STATUS-'].update('Waiting for Polar to be ready...')
+        window.refresh()
 
-    while not collector._polar_ready.is_set():
-        event, _ = window.read(timeout=100)
-        if event == '-STOP-' or event == sg.WIN_CLOSED:
-            collector._stop_event.set()
-            window.close()
-            return
+        while not collector._polar_ready.is_set():
+            event, _ = window.read(timeout=100)
+            if event == '-STOP-' or event == sg.WIN_CLOSED:
+                collector._stop_event.set()
+                window.close()
+                return
 
-    window['-STATUS-'].update('Waiting for GSR to be ready...')
-    window.refresh()
+    if collector.use_gsr:
+        window['-STATUS-'].update('Waiting for GSR to be ready...')
+        window.refresh()
 
-    while not collector._gsr_ready.is_set():
-        event, _ = window.read(timeout=100)
-        if event == '-STOP-' or event == sg.WIN_CLOSED:
-            collector._stop_event.set()
-            window.close()
-            return
+        while not collector._gsr_ready.is_set():
+            event, _ = window.read(timeout=100)
+            if event == '-STOP-' or event == sg.WIN_CLOSED:
+                collector._stop_event.set()
+                window.close()
+                return
 
     # All devices ready - set session_start and signal to start recording
     window['-STATUS-'].update('Starting synchronized recording...')
@@ -1404,17 +1467,25 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str,
         event, _ = window.read(timeout=500)  # Update every 500ms
 
         if event == "-NEXT_TASK-":
-            # Mark end of current task and advance
+            # Mark end of current task
             timestamp = time.time()
             with collector._lock:
                 collector.data_store.add_task_marker(timestamp, current_task, "task_end")
             print(f"[Task] Ended task {current_task}")
+
+            if current_task >= TASKS_PER_DEVICE:
+                # All tasks done — end the session automatically
+                print(f"[Task] All {TASKS_PER_DEVICE} tasks complete. Ending session.")
+                break
+
             current_task += 1
-            window['-TASK_NUM-'].update(str(current_task))
+            elem = window['-TASK_NUM-']
+            if elem is not None:
+                elem.update(value=f'{current_task} / {TASKS_PER_DEVICE}')
 
         if event == '-STOP-':
-            # Confirm stop
-            if sg.popup_yes_no('Are you sure you want to stop the experiment?',
+            # Manual early stop with confirmation
+            if sg.popup_yes_no('Are you sure you want to stop the experiment early?',
                               title='Confirm Stop', font=('Helvetica', 11)) == 'Yes':
                 break
 
@@ -1452,12 +1523,15 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str,
     window.refresh()
 
     # Wait for threads to finish — Muse BrainFlow release can be slow, give it up to 15s
-    muse_thread.join(timeout=15)
-    if muse_thread.is_alive():
-        print("[Muse] WARNING: thread did not exit cleanly within timeout.")
+    if muse_thread is not None:
+        muse_thread.join(timeout=15)
+        if muse_thread.is_alive():
+            print("[Muse] WARNING: thread did not exit cleanly within timeout.")
 
-    polar_thread.join(timeout=10)
-    gsr_thread.join(timeout=10)
+    if polar_thread is not None:
+        polar_thread.join(timeout=10)
+    if gsr_thread is not None:
+        gsr_thread.join(timeout=10)
 
     # Give the Bluetooth stack a moment to fully release the BrainFlow session
     # before any subsequent prepare_session() call on the next device round.
@@ -1762,7 +1836,10 @@ def main():
         gsr_calibration_a=args.gsr_cal_a,
         gsr_calibration_b=args.gsr_cal_b,
         apply_ica=not args.no_ica,
-        apply_filter=not args.no_filter
+        apply_filter=not args.no_filter,
+        use_muse=USE_MUSE,
+        use_polar=USE_POLAR,
+        use_gsr=USE_GSR,
     )
 
     if args.no_gui:
