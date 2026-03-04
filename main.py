@@ -5,6 +5,7 @@ with timestamp synchronization for cognitive load analysis.
 """
 
 import asyncio
+import random
 import time
 import json
 import threading
@@ -21,14 +22,18 @@ import numpy as np
 from muse import MuseBrainFlowProcessor
 from polar import PolarH10, HEART_RATE_MEASUREMENT_UUID
 from esense import ESenseGSR
+from arduino.bridge import ArduinoBridge, TimestampedArduinoEvent, ARDUINO_DEFAULT_PORT, ARDUINO_DEFAULT_BAUD
 
 # ── Experiment configuration ──────────────────────────────────────────────────
 TASKS_PER_DEVICE = 5   # Number of tasks per device session (change here to adjust)
 
 # ── Device enable flags — set to False to run without a device ────────────────
-USE_MUSE  = True
-USE_POLAR = False
-USE_GSR   = False
+USE_MUSE    = True
+USE_POLAR   = False
+USE_GSR     = False
+USE_ARDUINO = True
+
+from haptics import HapticsController, load_haptic_targets
 
 
 @dataclass
@@ -61,6 +66,7 @@ class TaskMarker:
     timestamp: float  # Unix timestamp
     task_number: int  # Task index that just ended
     event: str = "task_end"
+    extra: Dict[str, Any] = field(default_factory=dict)  # Optional metadata (e.g. encoder_error)
 
 
 @dataclass
@@ -74,6 +80,7 @@ class SynchronizedDataStore:
     hr_data: List[TimestampedHRSample] = field(default_factory=list)
     gsr_data: List[TimestampedGSRSample] = field(default_factory=list)
     task_markers: List[TaskMarker] = field(default_factory=list)
+    arduino_data: List[TimestampedArduinoEvent] = field(default_factory=list)
 
     # Metadata
     muse_sampling_rate: int = 256
@@ -104,10 +111,17 @@ class SynchronizedDataStore:
         )
         self.gsr_data.append(sample)
 
-    def add_task_marker(self, timestamp: float, task_number: int, event: str = "task_end"):
-        """Add a timestamped task marker"""
-        marker = TaskMarker(timestamp=timestamp, task_number=task_number, event=event)
+    def add_task_marker(self, timestamp: float, task_number: int, event: str = "task_end",
+                        extra: Optional[Dict[str, Any]] = None):
+        """Add a timestamped task marker with optional extra metadata."""
+        marker = TaskMarker(timestamp=timestamp, task_number=task_number, event=event,
+                            extra=extra or {})
         self.task_markers.append(marker)
+
+    def add_arduino_event(self, timestamp: float, event_type: str, data: Dict[str, Any]):
+        """Add a timestamped Arduino event (encoder delta, button press, ack, etc.)."""
+        event = TimestampedArduinoEvent(timestamp=timestamp, event_type=event_type, data=data)
+        self.arduino_data.append(event)
 
     def get_relative_time(self, timestamp: float) -> float:
         """Convert absolute timestamp to relative time from session start"""
@@ -156,11 +170,20 @@ class SynchronizedDataStore:
                 }
                 for m in self.task_markers
             ],
+            'arduino_data': [
+                {
+                    'time': round(self.get_relative_time(e.timestamp), 6),
+                    'event_type': e.event_type,
+                    'data': e.data,
+                }
+                for e in self.arduino_data
+            ],
             'summary': {
                 'total_eeg_samples': len(self.eeg_data),
                 'total_hr_samples': len(self.hr_data),
                 'total_gsr_samples': len(self.gsr_data),
                 'total_task_markers': len(self.task_markers),
+                'total_arduino_events': len(self.arduino_data),
                 'duration_seconds': round(self.get_relative_time(time.time()), 2)
             }
         }
@@ -206,6 +229,16 @@ class SynchronizedDataStore:
                 f.write(f"{rel_time:.6f},{sample.raw_audio},{sample.filtered_signal},{sample.gsr_uS}\n")
         print(f"GSR data saved to {gsr_filepath}")
 
+        # Save Arduino event data
+        arduino_filepath = f"{base_filepath}_arduino.csv"
+        with open(arduino_filepath, 'w') as f:
+            f.write("time,event_type,data_json\n")
+            for event in self.arduino_data:
+                rel_time = self.get_relative_time(event.timestamp)
+                data_str = json.dumps(event.data).replace('"', '""')
+                f.write(f'{rel_time:.6f},{event.event_type},"{data_str}"\n')
+        print(f"Arduino data saved to {arduino_filepath}")
+
     def save_task_markers(self, base_filepath: str):
         """Save task markers to JSON and CSV files."""
         markers_json = f"{base_filepath}_markers.json"
@@ -219,7 +252,8 @@ class SynchronizedDataStore:
                         {
                             'time': round(self.get_relative_time(m.timestamp), 6),
                             'task_number': m.task_number,
-                            'event': m.event
+                            'event': m.event,
+                            **m.extra,
                         }
                         for m in self.task_markers
                     ]
@@ -230,10 +264,20 @@ class SynchronizedDataStore:
         print(f"Task markers saved to {markers_json}")
 
         with open(markers_csv, 'w') as f:
-            f.write("time,task_number,event\n")
+            # Collect all extra keys across all markers for consistent columns
+            extra_keys = []
+            for m in self.task_markers:
+                for k in m.extra:
+                    if k not in extra_keys:
+                        extra_keys.append(k)
+            f.write("time,task_number,event" + ("," + ",".join(extra_keys) if extra_keys else "") + "\n")
             for m in self.task_markers:
                 rel_time = self.get_relative_time(m.timestamp)
-                f.write(f"{rel_time:.6f},{m.task_number},{m.event}\n")
+                extra_vals = ",".join(str(m.extra.get(k, "")) for k in extra_keys)
+                row = f"{rel_time:.6f},{m.task_number},{m.event}"
+                if extra_keys:
+                    row += "," + extra_vals
+                f.write(row + "\n")
         print(f"Task markers saved to {markers_csv}")
 
 
@@ -260,7 +304,11 @@ class SynchronizedCollector:
                  apply_filter: bool = True,
                  use_muse: bool = True,
                  use_polar: bool = True,
-                 use_gsr: bool = True):
+                 use_gsr: bool = True,
+                 arduino_port: Optional[str] = None,
+                 arduino_baud: int = 115200,
+                 use_arduino: bool = True,
+                 audio_out_device: Optional[int] = None):
         """
         Initialize the synchronized collector.
 
@@ -274,6 +322,10 @@ class SynchronizedCollector:
             buffer_duration: EEG buffer duration in seconds
             apply_ica: Whether to apply ICA denoising to EEG
             apply_filter: Whether to apply bandpass/notch filters to EEG
+            arduino_port: Serial port for Arduino Uno R3 (e.g. /dev/ttyACM0)
+            arduino_baud: Baud rate for Arduino serial (default 115200)
+            use_arduino: Whether to use the Arduino device
+            audio_out_device: Output device index for haptic audio (None = system default)
         """
         self.muse_serial_port = muse_serial_port
         self.muse_mac_address = muse_mac_address
@@ -284,11 +336,13 @@ class SynchronizedCollector:
         self.buffer_duration = buffer_duration
         self.apply_ica = apply_ica
         self.apply_filter = apply_filter
+        self.audio_out_device = audio_out_device
 
         # Device enable flags
-        self.use_muse  = use_muse
-        self.use_polar = use_polar
-        self.use_gsr   = use_gsr
+        self.use_muse    = use_muse
+        self.use_polar   = use_polar
+        self.use_gsr     = use_gsr
+        self.use_arduino = use_arduino
 
         # Data store with synchronized timestamps
         self.data_store = SynchronizedDataStore()
@@ -303,18 +357,53 @@ class SynchronizedCollector:
         self.gsr: Optional[ESenseGSR] = None
 
         # Status tracking
-        self.muse_connected = False
+        self.muse_connected  = False
         self.polar_connected = False
-        self.gsr_connected = False
-        self.muse_error: Optional[str] = None
+        self.gsr_connected   = False
+        self.muse_error:  Optional[str] = None
         self.polar_error: Optional[str] = None
-        self.gsr_error: Optional[str] = None
+        self.gsr_error:   Optional[str] = None
 
         # Synchronization flags for simultaneous start
-        self._muse_ready = threading.Event()
-        self._polar_ready = threading.Event()
-        self._gsr_ready = threading.Event()
+        self._muse_ready    = threading.Event()
+        self._polar_ready   = threading.Event()
+        self._gsr_ready     = threading.Event()
         self._start_recording = threading.Event()  # Signal to start actual recording
+
+        # Arduino bridge (None when use_arduino=False)
+        self.arduino: Optional[ArduinoBridge] = (
+            ArduinoBridge(
+                port=arduino_port,
+                baud=arduino_baud,
+                data_store=self.data_store,
+                lock=self._lock,
+                stop_event=self._stop_event,
+                start_recording_event=self._start_recording,
+            )
+            if use_arduino else None
+        )
+
+    # ── Arduino delegation properties ────────────────────────────────────────
+    # These let GUI code reference collector.arduino_connected / .arduino_error /
+    # ._arduino_ready without knowing about ArduinoBridge internals.
+
+    @property
+    def arduino_connected(self) -> bool:
+        return self.arduino.connected if self.arduino else False
+
+    @property
+    def arduino_error(self) -> Optional[str]:
+        return self.arduino.error if self.arduino else None
+
+    @property
+    def _arduino_ready(self) -> threading.Event:
+        if self.arduino is None:
+            e = threading.Event()
+            e.set()
+            return e
+        return self.arduino.ready
+
+    # ── Device connection helpers ─────────────────────────────────────────────
 
     def connect_muse(self) -> bool:
         """
@@ -429,6 +518,8 @@ class SynchronizedCollector:
                 pass
             self.gsr = None
             self.gsr_connected = False
+        if self.arduino:
+            self.arduino.disconnect()
 
     def _muse_collection_thread(self, duration: Optional[float]):
         """
@@ -977,6 +1068,17 @@ def show_connection_screen(collector: SynchronizedCollector) -> bool:
         ], font=('Helvetica', 12))],
 
         [sg.Text('')],
+
+        # Arduino status
+        [sg.Frame('Arduino Uno R3 (Encoder + Vibration)', [
+            [sg.Text('Status:', font=('Helvetica', 11)),
+             sg.Text('Disabled' if not collector.use_arduino else 'Waiting...',
+                     key='-ARDUINO_STATUS-', font=('Helvetica', 11, 'bold'),
+                     text_color='gray' if collector.use_arduino else 'purple')],
+            [sg.ProgressBar(100, orientation='h', size=(30, 20), key='-ARDUINO_PROGRESS-', bar_color=('blue', 'lightgray'))]
+        ], font=('Helvetica', 12))],
+
+        [sg.Text('')],
         [sg.Button('Connect Devices', size=(15, 1), font=('Helvetica', 12), key='-CONNECT-'),
          sg.Button('Skip Connection', size=(15, 1), font=('Helvetica', 12), key='-SKIP-', visible=False),
          sg.Button('Continue', size=(15, 1), font=('Helvetica', 12), key='-CONTINUE-', disabled=True),
@@ -984,11 +1086,12 @@ def show_connection_screen(collector: SynchronizedCollector) -> bool:
     ]
 
     window = sg.Window('BCI Experiment - Device Connection', layout,
-                       element_justification='center', finalize=True, size=(550, 500))
+                       element_justification='center', finalize=True, size=(550, 650))
 
-    muse_connected  = not collector.use_muse   # disabled counts as "ok"
-    polar_connected = not collector.use_polar
-    gsr_connected   = not collector.use_gsr
+    muse_connected    = not collector.use_muse   # disabled counts as "ok"
+    polar_connected   = not collector.use_polar
+    gsr_connected     = not collector.use_gsr
+    arduino_connected = not collector.use_arduino
 
     def connect_muse_thread():
         nonlocal muse_connected
@@ -1001,6 +1104,11 @@ def show_connection_screen(collector: SynchronizedCollector) -> bool:
     def connect_gsr_thread():
         nonlocal gsr_connected
         gsr_connected = collector.connect_gsr()
+
+    def connect_arduino_thread():
+        nonlocal arduino_connected
+        if collector.arduino:
+            arduino_connected = collector.arduino.connect()
 
     while True:
         event, values = window.read(timeout=100)
@@ -1021,6 +1129,9 @@ def show_connection_screen(collector: SynchronizedCollector) -> bool:
             if collector.use_gsr:
                 window['-GSR_STATUS-'].update('Connecting...', text_color='orange')
                 window['-GSR_PROGRESS-'].update(50)
+            if collector.use_arduino:
+                window['-ARDUINO_STATUS-'].update('Connecting...', text_color='orange')
+                window['-ARDUINO_PROGRESS-'].update(50)
             window.refresh()
 
             # Connect only enabled devices in threads
@@ -1035,6 +1146,10 @@ def show_connection_screen(collector: SynchronizedCollector) -> bool:
                 threads.append(t)
             if collector.use_gsr:
                 t = threading.Thread(target=connect_gsr_thread)
+                t.start()
+                threads.append(t)
+            if collector.use_arduino:
+                t = threading.Thread(target=connect_arduino_thread)
                 t.start()
                 threads.append(t)
 
@@ -1082,8 +1197,20 @@ def show_connection_screen(collector: SynchronizedCollector) -> bool:
                 window['-GSR_STATUS-'].update(f'Failed: {error_msg[:30]}', text_color='red')
                 window['-GSR_PROGRESS-'].update(0)
 
+            # Update Arduino status
+            if not collector.use_arduino:
+                window['-ARDUINO_STATUS-'].update('Disabled', text_color='purple')
+                window['-ARDUINO_PROGRESS-'].update(0)
+            elif arduino_connected:
+                window['-ARDUINO_STATUS-'].update('Connected', text_color='green')
+                window['-ARDUINO_PROGRESS-'].update(100)
+            else:
+                error_msg = collector.arduino_error or 'Connection failed'
+                window['-ARDUINO_STATUS-'].update(f'Failed: {error_msg[:30]}', text_color='red')
+                window['-ARDUINO_PROGRESS-'].update(0)
+
             # Enable continue if all enabled devices connected
-            if muse_connected and polar_connected and gsr_connected:
+            if muse_connected and polar_connected and gsr_connected and arduino_connected:
                 window['-CONTINUE-'].update(disabled=False)
             else:
                 window['-CONNECT-'].update(disabled=False, text='Retry Connection')
@@ -1199,9 +1326,10 @@ def show_reconnect_screen(collector: 'SynchronizedCollector') -> bool:
                  font=('Helvetica', 11), justification='center', expand_x=True)],
         [sg.Text('')],
         [sg.Frame('Device Status', [
-            status_row('Muse 2 EEG',  '-MUSE_S-',  disabled=not collector.use_muse),
-            status_row('Polar H10 HR', '-POLAR_S-', disabled=not collector.use_polar),
-            status_row('eSense GSR',   '-GSR_S-',  disabled=not collector.use_gsr),
+            status_row('Muse 2 EEG',      '-MUSE_S-',    disabled=not collector.use_muse),
+            status_row('Polar H10 HR',    '-POLAR_S-',   disabled=not collector.use_polar),
+            status_row('eSense GSR',      '-GSR_S-',     disabled=not collector.use_gsr),
+            status_row('Arduino Uno R3',  '-ARDUINO_S-', disabled=not collector.use_arduino),
         ], font=('Helvetica', 12), pad=(10, 10))],
         [sg.Text('')],
         [sg.Button('Abort', size=(12, 1), font=('Helvetica', 12),
@@ -1221,14 +1349,16 @@ def show_reconnect_screen(collector: 'SynchronizedCollector') -> bool:
                                title='Confirm Abort', font=('Helvetica', 11)) == 'Yes':
                 break
 
-        muse_ready  = (not collector.use_muse)  or collector._muse_ready.is_set()
-        polar_ready = (not collector.use_polar) or collector._polar_ready.is_set()
-        gsr_ready   = (not collector.use_gsr)   or collector._gsr_ready.is_set()
+        muse_ready    = (not collector.use_muse)    or collector._muse_ready.is_set()
+        polar_ready   = (not collector.use_polar)   or collector._polar_ready.is_set()
+        gsr_ready     = (not collector.use_gsr)     or collector._gsr_ready.is_set()
+        arduino_ready = (not collector.use_arduino) or collector._arduino_ready.is_set()
 
         for key, ready, enabled in [
-            ('-MUSE_S-',  muse_ready,  collector.use_muse),
-            ('-POLAR_S-', polar_ready, collector.use_polar),
-            ('-GSR_S-',   gsr_ready,   collector.use_gsr),
+            ('-MUSE_S-',    muse_ready,    collector.use_muse),
+            ('-POLAR_S-',   polar_ready,   collector.use_polar),
+            ('-GSR_S-',     gsr_ready,     collector.use_gsr),
+            ('-ARDUINO_S-', arduino_ready, collector.use_arduino),
         ]:
             if not enabled:
                 continue  # leave label as 'Disabled'
@@ -1239,7 +1369,7 @@ def show_reconnect_screen(collector: 'SynchronizedCollector') -> bool:
                 else:
                     elem.update(value='Connecting...', text_color='orange')
 
-        if muse_ready and polar_ready and gsr_ready:
+        if muse_ready and polar_ready and gsr_ready and arduino_ready:
             result = True
             break
 
@@ -1294,6 +1424,8 @@ def _reset_data_store(collector: 'SynchronizedCollector'):
     collector.data_store = SynchronizedDataStore()
     collector.data_store.muse_sampling_rate = prev_muse_rate
     collector.data_store.gsr_sampling_rate = prev_gsr_rate
+    if collector.arduino:
+        collector.arduino._data_store = collector.data_store
 
 
 def start_collection_threads(collector: 'SynchronizedCollector'):
@@ -1303,12 +1435,14 @@ def start_collection_threads(collector: 'SynchronizedCollector'):
     Call this before the countdown so devices connect during the swap/countdown window.
 
     Returns:
-        (muse_thread, polar_thread, gsr_thread)
+        (muse_thread, polar_thread, gsr_thread, arduino_thread)
     """
     collector._stop_event.clear()
     collector._muse_ready.clear()
     collector._polar_ready.clear()
     collector._gsr_ready.clear()
+    if collector.arduino:
+        collector.arduino.ready.clear()
     collector._start_recording.clear()
 
     if collector.use_muse:
@@ -1343,24 +1477,53 @@ def start_collection_threads(collector: 'SynchronizedCollector'):
         collector._gsr_ready.set()
         gsr_thread = None
 
-    return muse_thread, polar_thread, gsr_thread
+    if collector.use_arduino and collector.arduino:
+        arduino_thread = threading.Thread(
+            target=collector.arduino.collection_thread,
+            args=(None,),
+            daemon=True
+        )
+        arduino_thread.start()
+    else:
+        if collector.arduino:
+            collector.arduino.ready.set()
+        arduino_thread = None
+
+    return muse_thread, polar_thread, gsr_thread, arduino_thread
 
 
 def show_experiment_screen(collector: SynchronizedCollector, output_path: str,
-                           threads=None) -> None:
+                           threads=None, haptics: Optional[HapticsController] = None,
+                           haptic_targets: Optional[List[int]] = None) -> None:
     """
     Show experiment running screen with stop button. Runs until user stops.
 
     Args:
-        collector: The synchronized data collector.
-        output_path: Base path to save data to.
-        threads: Optional (muse_thread, polar_thread, gsr_thread) if already started
-                 before this call (e.g. during countdown). If None, threads are
-                 started here (legacy / session-0 behaviour).
+        collector:      The synchronized data collector.
+        output_path:    Base path to save data to.
+        threads:        Optional (muse_thread, polar_thread, gsr_thread, arduino_thread)
+                        if already started before this call. If None, threads are
+                        started here (legacy behaviour).
+        haptics:        Optional HapticsController for audio/vibration feedback.
+                        If None, no feedback is given.
+        haptic_targets: List of target tick positions, one per task. If None or
+                        shorter than TASKS_PER_DEVICE, missing entries default to 0.
     """
     import FreeSimpleGUI as sg
 
     sg.theme('LightBlue2')
+
+    # ── Oddball stimulus constants ─────────────────────────────────────────
+    _OB_SOA_MS    = 600   # stimulus onset asynchrony (ms)
+    _OB_STIM_MS   = 100   # stimulus visible duration (ms)
+    _OB_PROB      = 0.20  # oddball probability
+    _OB_CX        = 150   # canvas centre x
+    _OB_CY        = 150   # canvas centre y
+    _OB_R         = 60    # circle radius (pixels)
+    _OB_BG        = '#1e1e1e'
+    _OB_FIX_COL   = '#dcdcdc'
+    _OB_STD_COL   = '#6495ed'   # blue — standard
+    _OB_ODD_COL   = '#dc322f'   # red  — oddball
 
     layout = [
         [sg.Text('Experiment in Progress', font=('Helvetica', 20, 'bold'), justification='center', expand_x=True)],
@@ -1368,36 +1531,46 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str,
         [sg.Text('Initializing devices...', key='-STATUS-', font=('Helvetica', 12))],
         [sg.Text('')],
 
-        # Status display
-        [sg.Frame('Recording Status', [
-            [sg.Text('Duration:', font=('Helvetica', 11)),
-             sg.Text('00:00:00', key='-DURATION-', font=('Helvetica', 14, 'bold'))],
-            [sg.Text('EEG Samples:', font=('Helvetica', 11)),
-             sg.Text('0', key='-EEG_COUNT-', font=('Helvetica', 11, 'bold'))],
-            [sg.Text('HR Samples:', font=('Helvetica', 11)),
-             sg.Text('0', key='-HR_COUNT-', font=('Helvetica', 11, 'bold'))],
-            [sg.Text('GSR Samples:', font=('Helvetica', 11)),
-             sg.Text('0', key='-GSR_COUNT-', font=('Helvetica', 11, 'bold'))],
-            [sg.Text('Latest HR:', font=('Helvetica', 11)),
-             sg.Text('-- bpm', key='-LATEST_HR-', font=('Helvetica', 11, 'bold'))],
-            [sg.Text('Latest GSR:', font=('Helvetica', 11)),
-             sg.Text('-- µS', key='-LATEST_GSR-', font=('Helvetica', 11, 'bold'))]
-               ], font=('Helvetica', 12))],
+        [sg.Column([
+            # Left: recording status
+            [sg.Frame('Recording Status', [
+                [sg.Text('Duration:', font=('Helvetica', 11)),
+                 sg.Text('00:00:00', key='-DURATION-', font=('Helvetica', 14, 'bold'))],
+                [sg.Text('EEG Samples:', font=('Helvetica', 11)),
+                 sg.Text('0', key='-EEG_COUNT-', font=('Helvetica', 11, 'bold'))],
+                [sg.Text('HR Samples:', font=('Helvetica', 11)),
+                 sg.Text('0', key='-HR_COUNT-', font=('Helvetica', 11, 'bold'))],
+                [sg.Text('GSR Samples:', font=('Helvetica', 11)),
+                 sg.Text('0', key='-GSR_COUNT-', font=('Helvetica', 11, 'bold'))],
+                [sg.Text('Arduino Events:', font=('Helvetica', 11)),
+                 sg.Text('0', key='-ARDUINO_COUNT-', font=('Helvetica', 11, 'bold'))],
+                [sg.Text('Latest HR:', font=('Helvetica', 11)),
+                 sg.Text('-- bpm', key='-LATEST_HR-', font=('Helvetica', 11, 'bold'))],
+                [sg.Text('Latest GSR:', font=('Helvetica', 11)),
+                 sg.Text('-- µS', key='-LATEST_GSR-', font=('Helvetica', 11, 'bold'))],
+            ], font=('Helvetica', 12))],
+            [sg.Text('Current Task:', font=('Helvetica', 11)),
+             sg.Text(f'1 / {TASKS_PER_DEVICE}', key='-TASK_NUM-', font=('Helvetica', 11, 'bold'))],
+            [sg.Text('Press Right Arrow to end current task and move to next.', font=('Helvetica', 10))],
+            [sg.Text('')],
+            [sg.Text(f'Session ends automatically after task {TASKS_PER_DEVICE}.', font=('Helvetica', 10))],
+            [sg.Text('')],
+            [sg.Button('STOP EXPERIMENT', size=(20, 2), font=('Helvetica', 14, 'bold'),
+                       button_color=('white', 'red'), key='-STOP-', disabled=True)],
+        ], vertical_alignment='top'),
 
-               [sg.Text('Current Task:', font=('Helvetica', 11)),
-                sg.Text(f'1 / {TASKS_PER_DEVICE}', key='-TASK_NUM-', font=('Helvetica', 11, 'bold'))],
-               [sg.Text('Press Right Arrow to end current task and move to next.',
-                      font=('Helvetica', 10))],
-
-        [sg.Text('')],
-        [sg.Text(f'Session ends automatically after task {TASKS_PER_DEVICE}.', font=('Helvetica', 10))],
-        [sg.Text('')],
-        [sg.Button('STOP EXPERIMENT', size=(20, 2), font=('Helvetica', 14, 'bold'),
-                   button_color=('white', 'red'), key='-STOP-', disabled=True)]
+         sg.Column([
+            # Right: oddball stimulus canvas
+            [sg.Text('Oddball Task', font=('Helvetica', 12, 'bold'), justification='center')],
+            [sg.Text('Count the RED circles', font=('Helvetica', 10), justification='center')],
+            [sg.Graph(canvas_size=(300, 300), graph_bottom_left=(0, 300),
+                      graph_top_right=(300, 0),
+                      background_color=_OB_BG, key='-ODDBALL-')],
+        ], vertical_alignment='top', element_justification='center')],
     ]
 
     window = sg.Window('BCI Experiment - Recording', layout,
-                       element_justification='center', finalize=True, size=(500, 450),
+                       element_justification='center', finalize=True, size=(820, 520),
                        disable_close=True)  # Prevent accidental close
 
     # Bind right arrow for task transitions (window must be focused)
@@ -1405,12 +1578,20 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str,
 
     current_task = 1
 
+    # Normalise haptic_targets to a full-length list (pad with 0 if needed)
+    _targets: List[int] = list(haptic_targets) if haptic_targets else []
+    while len(_targets) < TASKS_PER_DEVICE:
+        _targets.append(0)
+
+    # Track last arduino_data index so we only feed new encoder events to haptics
+    _last_arduino_idx: int = 0
+
     if threads is not None:
         # Threads were pre-started before the countdown — reuse them.
-        muse_thread, polar_thread, gsr_thread = threads
+        muse_thread, polar_thread, gsr_thread, arduino_thread = threads
     else:
         # Legacy path: start threads now (used when called without pre-starting).
-        muse_thread, polar_thread, gsr_thread = start_collection_threads(collector)
+        muse_thread, polar_thread, gsr_thread, arduino_thread = start_collection_threads(collector)
 
     # Wait for all enabled devices to be ready
     if collector.use_muse:
@@ -1446,6 +1627,17 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str,
                 window.close()
                 return
 
+    if collector.use_arduino:
+        window['-STATUS-'].update('Waiting for Arduino to be ready...')
+        window.refresh()
+
+        while not collector._arduino_ready.is_set():
+            event, _ = window.read(timeout=100)
+            if event == '-STOP-' or event == sg.WIN_CLOSED:
+                collector._stop_event.set()
+                window.close()
+                return
+
     # All devices ready - set session_start and signal to start recording
     window['-STATUS-'].update('Starting synchronized recording...')
     window.refresh()
@@ -1462,16 +1654,63 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str,
 
     print(f"[Sync] All devices ready. Recording started at t=0")
 
-    # Update loop
+    # Start haptics and arm the first task target
+    if haptics is not None:
+        haptics.start()
+        haptics.set_target(_targets[0])
+        print(f"[Haptics] Session started. Task 1 target = {_targets[0]} ticks.")
+
+    # ── Oddball state machine initialisation ──────────────────────────────
+    # States: 'fixation' → show "+" and wait ISI, then → 'stimulus'
+    #         'stimulus' → show circle, then → 'fixation'
+    _ob_canvas      = window['-ODDBALL-']
+    _ob_state       = 'fixation'           # current state
+    _ob_deadline    = time.monotonic()     # when to transition next
+    _ob_trial       = 0
+    _ob_is_oddball  = False
+
+    def _ob_draw_fixation():
+        _ob_canvas.erase()
+        _ob_canvas.draw_text('+', (_OB_CX, _OB_CY), color=_OB_FIX_COL,
+                             font=('Helvetica', 36, 'bold'))
+
+    def _ob_draw_stimulus(is_oddball: bool):
+        colour = _OB_ODD_COL if is_oddball else _OB_STD_COL
+        _ob_canvas.erase()
+        _ob_canvas.draw_circle((_OB_CX, _OB_CY), _OB_R, fill_color=colour, line_color=colour)
+
+    _ob_draw_fixation()
+
+    # Update loop — 50 ms timeout gives ~20 Hz tick for oddball state machine
     while True:
-        event, _ = window.read(timeout=500)  # Update every 500ms
+        event, _ = window.read(timeout=50)
+
+        # Feed new encoder deltas to haptics
+        if haptics is not None:
+            with collector._lock:
+                new_events = collector.data_store.arduino_data[_last_arduino_idx:]
+                _last_arduino_idx += len(new_events)
+            for ev in new_events:
+                if ev.event_type == "encoder":
+                    haptics.update_encoder(ev.data.get("delta", 0))
 
         if event == "-NEXT_TASK-":
-            # Mark end of current task
+            # Record error before advancing
+            enc_error = (haptics.current_position - haptics.target) if haptics else 0
+            enc_pos   = haptics.current_position if haptics else 0
+            enc_target = haptics.target if haptics else 0
+
             timestamp = time.time()
             with collector._lock:
-                collector.data_store.add_task_marker(timestamp, current_task, "task_end")
-            print(f"[Task] Ended task {current_task}")
+                collector.data_store.add_task_marker(
+                    timestamp, current_task, "task_end",
+                    extra={
+                        "encoder_position": enc_pos,
+                        "target":           enc_target,
+                        "encoder_error":    enc_error,
+                    }
+                )
+            print(f"[Task] Ended task {current_task}  encoder_error={enc_error:+d}")
 
             if current_task >= TASKS_PER_DEVICE:
                 # All tasks done — end the session automatically
@@ -1479,6 +1718,10 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str,
                 break
 
             current_task += 1
+            # Arm next task target
+            if haptics is not None:
+                haptics.set_target(_targets[current_task - 1])
+                print(f"[Haptics] Task {current_task} target = {_targets[current_task - 1]} ticks.")
             elem = window['-TASK_NUM-']
             if elem is not None:
                 elem.update(value=f'{current_task} / {TASKS_PER_DEVICE}')
@@ -1500,6 +1743,7 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str,
             eeg_count = len(collector.data_store.eeg_data)
             hr_count = len(collector.data_store.hr_data)
             gsr_count = len(collector.data_store.gsr_data)
+            arduino_count = len(collector.data_store.arduino_data)
             if collector.data_store.hr_data:
                 latest_hr = collector.data_store.hr_data[-1].heart_rate
             else:
@@ -1512,10 +1756,41 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str,
         window['-EEG_COUNT-'].update(str(eeg_count))
         window['-HR_COUNT-'].update(str(hr_count))
         window['-GSR_COUNT-'].update(str(gsr_count))
+        window['-ARDUINO_COUNT-'].update(str(arduino_count))
         if latest_hr:
             window['-LATEST_HR-'].update(f'{latest_hr} bpm')
         if latest_gsr is not None:
             window['-LATEST_GSR-'].update(f'{latest_gsr:.4f} µS')
+
+        # ── Oddball state machine tick ─────────────────────────────────────
+        now = time.monotonic()
+        if _ob_state == 'fixation' and now >= _ob_deadline:
+            # ISI elapsed — pick and show next stimulus
+            _ob_is_oddball = random.random() < _OB_PROB
+            _ob_draw_stimulus(_ob_is_oddball)
+            onset_time = time.time()
+            stim_label = "oddball" if _ob_is_oddball else "standard"
+            with collector._lock:
+                collector.data_store.add_task_marker(
+                    timestamp=onset_time,
+                    task_number=0,
+                    event="oddball_onset" if _ob_is_oddball else "standard_onset",
+                    extra={"stim_type": stim_label, "trial_number": _ob_trial},
+                )
+            print(f"[Oddball] trial {_ob_trial + 1:04d}: {stim_label}")
+            _ob_trial    += 1
+            _ob_state     = 'stimulus'
+            _ob_deadline  = now + _OB_STIM_MS / 1000.0
+
+        elif _ob_state == 'stimulus' and now >= _ob_deadline:
+            # Stimulus duration elapsed — return to fixation
+            _ob_draw_fixation()
+            _ob_state    = 'fixation'
+            _ob_deadline = now + (_OB_SOA_MS - _OB_STIM_MS) / 1000.0
+
+    # Stop haptics before threads so motors are zeroed and audio is silenced
+    if haptics is not None:
+        haptics.stop()
 
     # Stop collection
     collector._stop_event.set()
@@ -1532,6 +1807,10 @@ def show_experiment_screen(collector: SynchronizedCollector, output_path: str,
         polar_thread.join(timeout=10)
     if gsr_thread is not None:
         gsr_thread.join(timeout=10)
+    if arduino_thread is not None:
+        arduino_thread.join(timeout=5)
+        if arduino_thread.is_alive():
+            print("[Arduino] WARNING: thread did not exit cleanly within timeout.")
 
     # Give the Bluetooth stack a moment to fully release the BrainFlow session
     # before any subsequent prepare_session() call on the next device round.
@@ -1779,9 +2058,15 @@ def main():
         help='GSR calibration offset'
     )
     parser.add_argument(
+        '--audio-out-device',
+        type=int,
+        default=None,
+        help='Audio output device index for haptic feedback (use --list-audio-devices to see options)'
+    )
+    parser.add_argument(
         '--list-audio-devices',
         action='store_true',
-        help='List available audio input devices and exit'
+        help='List available audio input/output devices and exit'
     )
     parser.add_argument(
         '--no-ica',
@@ -1792,6 +2077,18 @@ def main():
         '--no-filter',
         action='store_true',
         help='Disable bandpass/notch filtering for EEG data'
+    )
+    parser.add_argument(
+        '--arduino-port',
+        type=str,
+        default=ARDUINO_DEFAULT_PORT,
+        help='Serial port for Arduino Uno R3 (e.g. /dev/ttyACM0 or COM3)'
+    )
+    parser.add_argument(
+        '--arduino-baud',
+        type=int,
+        default=ARDUINO_DEFAULT_BAUD,
+        help='Baud rate for Arduino serial communication (default: 115200)'
     )
     parser.add_argument(
         '--no-gui',
@@ -1816,14 +2113,19 @@ def main():
     # Handle list audio devices
     if args.list_audio_devices:
         import sounddevice as sd
-        print("\nAvailable audio input devices:")
-        print("-" * 50)
         devices = sd.query_devices()
+        print("\nAvailable audio INPUT devices (for --gsr-device):")
+        print("-" * 50)
         for i, dev in enumerate(devices):
             if dev['max_input_channels'] > 0:
                 marker = " [DEFAULT]" if i == sd.default.device[0] else ""
-                print(f"  [{i}] {dev['name']}{marker}")
-                print(f"      Sample rates: {dev['default_samplerate']} Hz")
+                print(f"  [{i}] {dev['name']}{marker}  ({dev['default_samplerate']:.0f} Hz)")
+        print("\nAvailable audio OUTPUT devices (for --audio-out-device):")
+        print("-" * 50)
+        for i, dev in enumerate(devices):
+            if dev['max_output_channels'] > 0:
+                marker = " [DEFAULT]" if i == sd.default.device[1] else ""
+                print(f"  [{i}] {dev['name']}{marker}  ({dev['default_samplerate']:.0f} Hz)")
         print("-" * 50)
         return
 
@@ -1840,7 +2142,14 @@ def main():
         use_muse=USE_MUSE,
         use_polar=USE_POLAR,
         use_gsr=USE_GSR,
+        arduino_port=args.arduino_port,
+        arduino_baud=args.arduino_baud,
+        use_arduino=USE_ARDUINO,
+        audio_out_device=args.audio_out_device,
     )
+
+    # Load haptic targets once — used by all three device sessions
+    haptic_targets_all = load_haptic_targets()
 
     if args.no_gui:
         # Command-line mode (original behavior)
@@ -1925,8 +2234,26 @@ def main():
                     collector.disconnect_devices()
                     return
 
+                # Build a per-session HapticsController
+                session_mode = {
+                    "Auditory":       "auditory",
+                    "Vibrations":     "vibrations",
+                    "Shape Changing": "shape_changing",
+                }.get(device_name, "auditory")
+                haptics = HapticsController(
+                    arduino_bridge=collector.arduino,
+                    session_mode=session_mode,
+                    audio_out_device=collector.audio_out_device,
+                )
+                session_targets = haptic_targets_all.get(device_name, [0] * TASKS_PER_DEVICE)
+
                 # Run the experiment — threads already started and ready
-                show_experiment_screen(collector, output_path, threads=session_threads)
+                show_experiment_screen(
+                    collector, output_path,
+                    threads=session_threads,
+                    haptics=haptics,
+                    haptic_targets=session_targets,
+                )
 
                 # NASA TLX for this device
                 tlx_scores = show_nasa_tlx_screen(device_name)

@@ -11,3 +11,4 @@ pysimplegui
 PyWavelets
 scikit-learn
 sounddevice
+pygame
