@@ -18,8 +18,8 @@
  *
  *   Arduino → Python:
  *     {"type":"ready"}                    — sent once on boot
- *     {"type":"encoder","delta":N}        — accumulated ticks since last report (every 50 ms if non-zero)
- *     {"type":"ack","cmd":"start","task":N} — start command acknowledgement
+ *     {"type":"encoder","delta":N,"position":P} — delta ticks + absolute position (every 50 ms if non-zero)
+ *     {"type":"ack","cmd":"start","task":N} — start command acknowledgement (also resets position to 0)
  *     {"type":"ack","cmd":"stop"}           — stop command acknowledgement
  *
  *   Pin assignments: ENC_A=2(INT0)  ENC_B=3(INT1)  VIB1=9(PWM)  VIB2=10(PWM)
@@ -37,6 +37,9 @@ static const uint8_t VIB2    = 10;  // PWM pin for vibration motor 2
 // ── Encoder state (volatile — shared with ISR) ────────────────────────────────
 volatile int32_t encoderDelta = 0;
 volatile uint8_t lastEncoded  = 0;
+
+// ── Absolute encoder position (accumulated, can be reset via command) ─────────
+int32_t encoderPosition = 0;
 
 // ── Encoder reporting interval (adjustable via set_report_interval command) ───
 uint32_t encoderReportMs = 50;
@@ -68,6 +71,8 @@ void handleCommand(const char* jsonStr) {
 
     if (strcmp(cmd, "start") == 0) {
         int task = doc["task"] | 0;
+        // Reset encoder position at task start
+        encoderPosition = 0;
         StaticJsonDocument<64> ack;
         ack["type"] = "ack";
         ack["cmd"]  = "start";
@@ -151,9 +156,13 @@ void loop() {
         interrupts();
 
         if (delta != 0) {
-            StaticJsonDocument<48> doc;
-            doc["type"]  = "encoder";
-            doc["delta"] = delta;
+            // Update absolute position
+            encoderPosition += delta;
+            
+            StaticJsonDocument<64> doc;
+            doc["type"]     = "encoder";
+            doc["delta"]    = delta;
+            doc["position"] = encoderPosition;
             serializeJson(doc, Serial);
             Serial.println();
         }
