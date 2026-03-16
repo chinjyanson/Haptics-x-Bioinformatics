@@ -573,20 +573,17 @@ class SynchronizedCollector:
                 if duration and elapsed >= duration:
                     break
 
-                # Get new data from Muse
-                eeg_data = self.muse.get_data()
+                # Get new data from Muse — hardware timestamps come from the device
+                eeg_data, hw_timestamps = self.muse.get_data()
 
                 if eeg_data is not None and eeg_data.shape[1] > 0:
-                    # Timestamp for this batch
-                    current_time = time.time()
                     n_samples = eeg_data.shape[1]
 
-                    # Calculate timestamp for each sample based on sampling rate
-                    sample_interval = 1.0 / self.muse.sampling_rate
-
                     for i in range(n_samples):
-                        # Estimate timestamp for each sample
-                        sample_timestamp = current_time - (n_samples - 1 - i) * sample_interval
+                        # Use the hardware timestamp from the Muse 2's internal clock
+                        # (aligned to host clock by BrainFlow). This avoids OS scheduling
+                        # jitter from calling time.time() after batch arrival.
+                        sample_timestamp = float(hw_timestamps[i])
 
                         # Create channel value dict
                         channel_values = {
@@ -984,12 +981,55 @@ def create_participant_folder(participant_id: str) -> Path:
 
 
 
+def _reset_data_store(collector: SynchronizedCollector) -> None:
+    """Reset collector state for a new session."""
+    collector.data_store = SynchronizedDataStore()
+    collector._stop_event.clear()
+    collector._muse_ready.clear()
+    collector._polar_ready.clear()
+    collector._gsr_ready.clear()
+    collector._start_recording.clear()
+    if collector.arduino is not None:
+        collector.arduino.data_store = collector.data_store
+
+
+def start_collection_threads(collector: SynchronizedCollector):
+    """Start all device collection threads and return them as a tuple."""
+    muse_thread = threading.Thread(
+        target=collector._muse_collection_thread, args=(None,), daemon=True
+    )
+    polar_thread = threading.Thread(
+        target=lambda: asyncio.run(collector._polar_collection_async(None)), daemon=True
+    )
+    gsr_thread = threading.Thread(
+        target=collector._gsr_collection_thread, args=(None,), daemon=True
+    )
+    if collector.arduino is not None:
+        arduino_thread = threading.Thread(
+            target=collector.arduino.collection_thread, args=(None,), daemon=True
+        )
+    else:
+        arduino_thread = threading.Thread(target=lambda: None, daemon=True)
+
+    muse_thread.start()
+    polar_thread.start()
+    gsr_thread.start()
+    arduino_thread.start()
+    return muse_thread, polar_thread, gsr_thread, arduino_thread
+
+
 def main():
     """Main entry point for synchronized data collection with GUI"""
     import argparse
 
     parser = argparse.ArgumentParser(
         description='Synchronized Muse 2 EEG, Polar H10 HR, and eSense GSR data collection'
+    )
+    parser.add_argument(
+        '--muse-serial',
+        type=str,
+        default=None,
+        help='Serial port for BLED112 dongle (e.g. /dev/ttyACM0 or COM3); omit for native Bluetooth'
     )
     parser.add_argument(
         '--muse-mac',

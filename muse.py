@@ -86,12 +86,18 @@ class MuseBrainFlowProcessor:
         """Pull available EEG data from the board.
 
         Returns:
-            ndarray(4, n_samples) or None if no data available.
+            (eeg, timestamps) where:
+                eeg        -- ndarray(4, n_samples), EEG channels in µV
+                timestamps -- ndarray(n_samples,), hardware timestamps from the
+                              Muse 2's internal clock, aligned to the host clock
+                              by BrainFlow (Unix seconds, float64).
+            Returns (None, None) if no data is available.
         """
         data = self.board.get_board_data()
         if data.size == 0:
-            return None
-        return data[self.eeg_channels, :]
+            return None, None
+        timestamp_channel = BoardShim.get_timestamp_channel(self.board_id)
+        return data[self.eeg_channels, :], data[timestamp_channel, :]
 
     def stop(self):
         """Stop streaming and release the BrainFlow session."""
