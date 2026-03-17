@@ -1662,6 +1662,67 @@ def save_session_summary(odd_epochs, std_epochs, time_ms, band_df,
     print(f"[analysis] Saved {json_path}")
 
 
+# ── GSR analysis ─────────────────────────────────────────────────────────────
+
+def run_gsr_analysis(gsr_path, events_path, out_prefix=''):
+    """
+    Load GSR CSV and markers CSV, plot the GSR signal with task_end markers
+    overlaid, plus the rolling-statistics analysis plot.
+    Saves two PNGs alongside other session outputs.
+    """
+    print("\n[analysis] --- GSR Analysis ---")
+    if not os.path.exists(gsr_path):
+        print(f"[analysis] WARNING: GSR file not found: {gsr_path}, skipping.")
+        return
+
+    import pandas as pd
+
+    gsr_df = pd.read_csv(gsr_path)
+    if 'timestamp' in gsr_df.columns:
+        gsr_df['time'] = gsr_df['timestamp'] - gsr_df['timestamp'].iloc[0]
+
+    # Load task_end markers
+    task_ends = []
+    if events_path and os.path.exists(events_path):
+        ev = pd.read_csv(events_path)
+        task_ends = ev[ev['event'] == 'task_end'][['time', 'task_number']].values.tolist()
+
+    is_calibrated = gsr_df['gsr_uS'].abs().max() > 1e-3
+    unit      = "µS" if is_calibrated else "a.u."
+    gsr_label = f"GSR ({unit})"
+
+    # ── Plot 1: GSR signal with task markers ──────────────────────────────────
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.plot(gsr_df['time'], gsr_df['gsr_uS'], 'r-', linewidth=0.8, label='GSR')
+
+    colors = plt.cm.tab10.colors
+    for t, task_num in task_ends:
+        color = colors[int(task_num) % len(colors)]
+        ax.axvline(x=t, color=color, linestyle='--', linewidth=1.2,
+                   label=f'Task {int(task_num)} end')
+
+    # Deduplicate legend entries
+    handles, labels = ax.get_legend_handles_labels()
+    seen = {}
+    for h, l in zip(handles, labels):
+        if l not in seen:
+            seen[l] = h
+    ax.legend(seen.values(), seen.keys(), fontsize=8, loc='upper right')
+
+    ax.set_xlabel('Time (seconds)')
+    ax.set_ylabel(gsr_label)
+    ax.set_title('GSR Signal with Task Markers')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    fname = f"{out_prefix}gsr_signal.png"
+    plt.savefig(fname, dpi=150)
+    plt.close(fig)
+    print(f"[analysis] Saved {fname}")
+
+    # ── Plot 2: rolling-statistics analysis ───────────────────────────────────
+    plot_gsr_analysis(gsr_path, save_path=f"{out_prefix}gsr_analysis.png")
+
+
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
 def analyse_session(erp_path, psd_path, events_path,
@@ -1748,7 +1809,175 @@ def analyse_session(erp_path, psd_path, events_path,
                          complexity_df, conn_data, task_intervals,
                          baseline_features, out_prefix)
 
+    # Stage 13: GSR analysis
+    # GSR CSV lives alongside the markers CSV: same dir, _gsr.csv suffix
+    gsr_path = events_path.replace('_markers.csv', '_gsr.csv')
+    run_gsr_analysis(gsr_path, events_path, out_prefix)
+
     print("\n[analysis] Session complete.")
+
+
+# ── GSR plotting ──────────────────────────────────────────────────────────────
+
+def plot_gsr_data(filepath: str, save_path: str | None = None):
+    """
+    Plot GSR data from a CSV file.
+
+    Creates a 3-panel figure showing:
+    1. Raw audio signal
+    2. Filtered signal
+    3. GSR conductance (µS)
+
+    Args:
+        filepath: Path to GSR CSV file
+        save_path: Optional path to save the figure
+    """
+    import pandas as pd
+
+    df = pd.read_csv(filepath)
+
+    if 'timestamp' in df.columns:
+        df['time'] = df['timestamp'] - df['timestamp'].iloc[0]
+    elif 'time' not in df.columns:
+        raise ValueError("CSV must have 'timestamp' or 'time' column")
+
+    is_calibrated = df['gsr_uS'].abs().max() > 1e-3
+    unit = "µS" if is_calibrated else "a.u."
+    gsr_label = f"GSR ({unit})"
+    calibration_note = "" if is_calibrated else "\n⚠ Uncalibrated — values are raw audio amplitude, not µS"
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    fig.suptitle('eSense GSR Recording Analysis', fontsize=14, fontweight='bold')
+
+    axes[0].plot(df['time'], df['raw_audio'], 'b-', linewidth=0.5, alpha=0.7)
+    axes[0].set_ylabel('Raw Audio\nAmplitude')
+    axes[0].set_title('Raw Audio Signal (Microphone Input)')
+    axes[0].grid(True, alpha=0.3)
+    axes[0].margins(y=0.1)
+
+    axes[1].plot(df['time'], df['filtered_signal'], 'g-', linewidth=0.8)
+    axes[1].set_ylabel('Filtered Signal\nAmplitude')
+    axes[1].set_title('Lowpass Filtered Signal (5 Hz cutoff)')
+    axes[1].grid(True, alpha=0.3)
+    axes[1].margins(y=0.1)
+
+    axes[2].plot(df['time'], df['gsr_uS'], 'r-', linewidth=1)
+    axes[2].set_ylabel(gsr_label)
+    axes[2].set_xlabel('Time (seconds)')
+    axes[2].set_title('Galvanic Skin Response (Conductance)')
+    axes[2].grid(True, alpha=0.3)
+
+    duration   = df['time'].iloc[-1]
+    n_samples  = len(df)
+    sample_rate = n_samples / duration if duration > 0 else 0
+    gsr_mean, gsr_std = df['gsr_uS'].mean(), df['gsr_uS'].std()
+    gsr_min,  gsr_max = df['gsr_uS'].min(),  df['gsr_uS'].max()
+    stats_text = (
+        f"Duration: {duration:.1f}s | Samples: {n_samples:,} | Rate: {sample_rate:.1f} Hz\n"
+        f"GSR - Mean: {gsr_mean:.2e} | Std: {gsr_std:.2e} | Range: [{gsr_min:.2e}, {gsr_max:.2e}]"
+        f"{calibration_note}"
+    )
+    fig.text(0.5, 0.02, stats_text, ha='center', fontsize=10,
+             bbox=dict(boxstyle='round', facecolor='wheat' if is_calibrated else 'lightyellow', alpha=0.5))
+
+    plt.tight_layout()
+    plt.subplots_adjust(bottom=0.1)
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"[analysis] GSR plot saved to {save_path}")
+        plt.close(fig)
+    else:
+        plt.show()
+    return fig
+
+
+def plot_gsr_analysis(filepath: str, window_size: float = 5.0, save_path: str | None = None):
+    """
+    Plot detailed GSR analysis with rolling statistics.
+
+    Creates a 4-panel figure showing:
+    1. GSR signal with rolling mean
+    2. Rolling standard deviation (variability)
+    3. Rate of change (derivative)
+    4. Distribution histogram
+
+    Args:
+        filepath: Path to GSR CSV file
+        window_size: Rolling window size in seconds
+        save_path: Optional path to save the figure
+    """
+    import pandas as pd
+
+    df = pd.read_csv(filepath)
+
+    if 'timestamp' in df.columns:
+        df['time'] = df['timestamp'] - df['timestamp'].iloc[0]
+
+    duration      = df['time'].iloc[-1]
+    n_samples     = len(df)
+    sample_rate   = n_samples / duration if duration > 0 else 50
+    window_samples = int(window_size * sample_rate)
+
+    df['rolling_mean'] = df['gsr_uS'].rolling(window=window_samples, center=True).mean()
+    df['rolling_std']  = df['gsr_uS'].rolling(window=window_samples, center=True).std()
+    df['derivative']   = np.gradient(df['gsr_uS'], df['time'])
+
+    is_calibrated    = df['gsr_uS'].abs().max() > 1e-3
+    unit             = "µS" if is_calibrated else "a.u."
+    gsr_label        = f"GSR ({unit})"
+    calibration_note = "" if is_calibrated else "⚠ Uncalibrated — values are raw audio amplitude, not µS"
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle('eSense GSR Detailed Analysis', fontsize=14, fontweight='bold')
+
+    axes[0, 0].plot(df['time'], df['gsr_uS'], 'lightblue', linewidth=0.5, alpha=0.7, label='Raw GSR')
+    axes[0, 0].plot(df['time'], df['rolling_mean'], 'b-', linewidth=1.5, label=f'Rolling Mean ({window_size}s)')
+    axes[0, 0].set_xlabel('Time (seconds)')
+    axes[0, 0].set_ylabel(gsr_label)
+    axes[0, 0].set_title('GSR Signal with Trend')
+    axes[0, 0].legend(loc='upper right')
+    axes[0, 0].grid(True, alpha=0.3)
+
+    axes[0, 1].plot(df['time'], df['rolling_std'], 'orange', linewidth=1)
+    axes[0, 1].fill_between(df['time'], 0, df['rolling_std'], alpha=0.3, color='orange')
+    axes[0, 1].set_xlabel('Time (seconds)')
+    axes[0, 1].set_ylabel(f'Std Dev ({unit})')
+    axes[0, 1].set_title(f'GSR Variability (Rolling Std, {window_size}s window)')
+    axes[0, 1].grid(True, alpha=0.3)
+
+    axes[1, 0].plot(df['time'], df['derivative'], 'green', linewidth=0.5)
+    axes[1, 0].axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+    axes[1, 0].set_xlabel('Time (seconds)')
+    axes[1, 0].set_ylabel(f'dGSR/dt ({unit}/s)')
+    axes[1, 0].set_title('Rate of Change (Phasic Activity Indicator)')
+    axes[1, 0].grid(True, alpha=0.3)
+
+    axes[1, 1].hist(df['gsr_uS'], bins=50, color='purple', alpha=0.7, edgecolor='black')
+    axes[1, 1].axvline(x=df['gsr_uS'].mean(), color='red', linestyle='--', linewidth=2,
+                       label=f"Mean: {df['gsr_uS'].mean():.2e}")
+    axes[1, 1].axvline(x=df['gsr_uS'].median(), color='orange', linestyle='--', linewidth=2,
+                       label=f"Median: {df['gsr_uS'].median():.2e}")
+    axes[1, 1].set_xlabel(gsr_label)
+    axes[1, 1].set_ylabel('Count')
+    axes[1, 1].set_title('GSR Distribution')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    if calibration_note:
+        fig.text(0.5, 0.01, calibration_note, ha='center', fontsize=10,
+                 color='darkorange', bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
+        plt.subplots_adjust(bottom=0.07)
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"[analysis] GSR analysis plot saved to {save_path}")
+        plt.close(fig)
+    else:
+        plt.show()
+    return fig
 
 
 def main(participant_id, data_dir='data', out_dir='output'):
