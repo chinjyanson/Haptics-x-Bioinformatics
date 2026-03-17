@@ -302,10 +302,7 @@ class SynchronizedCollector:
                  muse_mac_address: Optional[str] = None,
                  polar_device_name: str = "Polar H10",
                  gsr_device: Optional[int] = None,
-                 gsr_calibration_a: float = 1.0,
-                 gsr_calibration_b: float = 0.0,
                  buffer_duration: int = 10,
-                 apply_ica: bool = True,
                  apply_filter: bool = True,
                  use_muse: bool = True,
                  use_polar: bool = True,
@@ -322,10 +319,7 @@ class SynchronizedCollector:
             muse_mac_address: MAC address of Muse 2 (optional)
             polar_device_name: Name of Polar device to scan for
             gsr_device: Audio input device index for eSense GSR (optional)
-            gsr_calibration_a: GSR calibration slope (µS = a * amplitude + b)
-            gsr_calibration_b: GSR calibration offset
             buffer_duration: EEG buffer duration in seconds
-            apply_ica: Whether to apply ICA denoising to EEG
             apply_filter: Whether to apply bandpass/notch filters to EEG
             arduino_port: Serial port for Arduino Uno R3 (e.g. /dev/ttyACM0)
             arduino_baud: Baud rate for Arduino serial (default 115200)
@@ -336,10 +330,7 @@ class SynchronizedCollector:
         self.muse_mac_address = muse_mac_address
         self.polar_device_name = polar_device_name
         self.gsr_device = gsr_device
-        self.gsr_calibration_a = gsr_calibration_a
-        self.gsr_calibration_b = gsr_calibration_b
         self.buffer_duration = buffer_duration
-        self.apply_ica = apply_ica
         self.apply_filter = apply_filter
         self.audio_out_device = audio_out_device
 
@@ -474,8 +465,6 @@ class SynchronizedCollector:
             # Create GSR instance (doesn't start streaming yet)
             self.gsr = ESenseGSR(
                 device=self.gsr_device,
-                calibration_a=self.gsr_calibration_a,
-                calibration_b=self.gsr_calibration_b,
                 downsample_rate=50,
                 buffer_size=50  # Smaller buffer for more frequent updates
             )
@@ -807,8 +796,6 @@ class SynchronizedCollector:
                 print("[GSR] Initializing connection...")
                 self.gsr = ESenseGSR(
                     device=self.gsr_device,
-                    calibration_a=self.gsr_calibration_a,
-                    calibration_b=self.gsr_calibration_b,
                     downsample_rate=50,
                     buffer_size=50
                 )
@@ -1098,18 +1085,7 @@ def main():
         default=None,
         help='Audio input device index for eSense GSR (use --list-audio-devices to see options)'
     )
-    parser.add_argument(
-        '--gsr-cal-a',
-        type=float,
-        default=1.0,
-        help='GSR calibration slope (µS = a * amplitude + b)'
-    )
-    parser.add_argument(
-        '--gsr-cal-b',
-        type=float,
-        default=0.0,
-        help='GSR calibration offset'
-    )
+
     parser.add_argument(
         '--audio-out-device',
         type=int,
@@ -1121,11 +1097,7 @@ def main():
         action='store_true',
         help='List available audio input/output devices and exit'
     )
-    parser.add_argument(
-        '--no-ica',
-        action='store_true',
-        help='Disable ICA denoising for EEG data'
-    )
+
     parser.add_argument(
         '--no-filter',
         action='store_true',
@@ -1143,23 +1115,7 @@ def main():
         default=ARDUINO_DEFAULT_BAUD,
         help='Baud rate for Arduino serial communication (default: 115200)'
     )
-    parser.add_argument(
-        '--no-gui',
-        action='store_true',
-        help='Run without GUI (command-line mode)'
-    )
-    parser.add_argument(
-        '--duration', '-d',
-        type=int,
-        default=None,
-        help='Collection duration in seconds (only for --no-gui mode)'
-    )
-    parser.add_argument(
-        '--output', '-o',
-        type=str,
-        default=None,
-        help='Output path (only for --no-gui mode)'
-    )
+
 
     args = parser.parse_args()
 
@@ -1188,9 +1144,6 @@ def main():
         muse_mac_address=args.muse_mac,
         polar_device_name=args.polar_name,
         gsr_device=args.gsr_device,
-        gsr_calibration_a=args.gsr_cal_a,
-        gsr_calibration_b=args.gsr_cal_b,
-        apply_ica=not args.no_ica,
         apply_filter=not args.no_filter,
         use_muse=USE_MUSE,
         use_polar=USE_POLAR,
@@ -1204,28 +1157,8 @@ def main():
     # Load haptic targets once — used by all three device sessions
     haptic_targets_all = load_haptic_targets()
 
-    if args.no_gui:
-        # Command-line mode (original behavior)
-        if args.output is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            args.output = f"data/raw/session_{timestamp}"
-
-        duration = args.duration if args.duration else 60
-
-        try:
-            data_store = collector.collect(
-                duration=duration,
-                output_path=args.output
-            )
-            print("\nCollection completed successfully!")
-        except KeyboardInterrupt:
-            print("\nCollection interrupted by user.")
-        except Exception as e:
-            print(f"\nError during collection: {e}")
-            raise
-    else:
-        # GUI mode
-        DEVICES = ['Auditory', 'Vibrations', 'Shape Changing']
+    DEVICES = ['Auditory', 'Vibrations', 'Shape Changing']
+    if True:
 
         try:
             # Step 1: Participant ID
@@ -1267,7 +1200,7 @@ def main():
                     collector.muse_connected = False
 
                 # Step 4a: EEG calibration — live signal check before baseline.
-                calib_muse = show_calibration_screen()
+                calib_muse = show_calibration_screen(gsr=collector.gsr if collector.use_gsr else None)
                 if calib_muse is None:
                     print("Experiment cancelled at EEG calibration.")
                     collector.disconnect_devices()

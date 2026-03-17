@@ -1209,19 +1209,19 @@ def show_baseline_screen(participant_id: str, session_id: str, data_dir: str = '
     return True
 
 
-def show_calibration_screen():
+def show_calibration_screen(gsr=None):
     """
     Show a live EEG calibration screen before baseline recording.
 
     Connects to the Muse 2, displays a real-time scrolling plot of all 4 EEG
     channels (TP9, AF7, AF8, TP10) so the experimenter can verify electrode
-    contact quality.  The user clicks 'Proceed to Baseline' when satisfied, or
-    'Abort' to cancel.
+    contact quality.
+
+    If gsr is provided, runs a GSR baseline measurement (clips disconnected)
+    after the user clicks 'Proceed to Baseline'.
 
     Returns the live MuseBrainFlowProcessor if the user proceeds (caller must
-    stop it), or None if aborted or connection failed.  Keeping the session
-    open avoids a BrainFlow BLE teardown/reconnect cycle between calibration
-    and baseline.
+    stop it), or None if aborted or connection failed.
     """
     import FreeSimpleGUI as sg
     import numpy as np
@@ -1327,6 +1327,24 @@ def show_calibration_screen():
                 break
 
             if event == '-PROCEED-':
+                # ── GSR baseline measurement (if GSR is enabled) ──────────
+                if gsr is not None:
+                    import time as _t
+                    sg.popup_quick_message(
+                        'Remove eSense finger clips from skin.\n'
+                        'Measuring GSR baseline (4 seconds)…',
+                        title='GSR Calibration', font=('Helvetica', 12),
+                        auto_close_duration=3)
+                    _t.sleep(1)  # give user time to remove clips
+                    try:
+                        gsr.measure_baseline(duration=4.0)
+                        sg.popup_quick_message(
+                            f'GSR baseline set: {gsr.amplitude_baseline:.5f}\n'
+                            'You may now reattach the finger clips.',
+                            title='GSR Baseline Done', font=('Helvetica', 12),
+                            auto_close_duration=3)
+                    except Exception as e:
+                        print(f'[GSR] Baseline measurement failed: {e}')
                 result = True
                 break
 

@@ -23,6 +23,11 @@ from threading import Lock
 from typing import Optional
 
 
+# Fixed gain applied before the physics model.
+# Increase if µS values read too low; decrease if too high.
+GSR_CALIBRATION_A: float = 100.0
+
+
 class ESenseGSR:
     """Real-time GSR acquisition from eSense via audio input."""
 
@@ -32,7 +37,7 @@ class ESenseGSR:
         cutoff: float = 5.0,
         filter_order: int = 4,
         downsample_rate: int = 50,
-        calibration_a: float = 10.0,
+        calibration_a: float = GSR_CALIBRATION_A,
         calibration_b: float = 0.0,
         output_dir: str = "output",
         buffer_size: int = 100,
