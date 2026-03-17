@@ -24,8 +24,6 @@ from polar import PolarH10, HEART_RATE_MEASUREMENT_UUID
 from esense import ESenseGSR
 from arduino.bridge import ArduinoBridge, TimestampedArduinoEvent, ARDUINO_DEFAULT_PORT, ARDUINO_DEFAULT_BAUD
 
-# ── Experiment configuration ──────────────────────────────────────────────────
-TASKS_PER_DEVICE = 5   # Number of tasks per device session (change here to adjust)
 
 # ── Device enable flags — set to False to run without a device ────────────────
 USE_MUSE    = True
@@ -34,7 +32,7 @@ USE_GSR     = False
 USE_ARDUINO = True
 
 # ── Baseline recording flag — set to False to skip baseline at session start ──
-RUN_BASELINE = True
+RUN_BASELINE = False
 
 from haptics import HapticsController, load_haptic_targets
 import baseline
@@ -244,6 +242,140 @@ class SynchronizedDataStore:
                 f.write(f'{rel_time:.6f},{event.event_type},"{data_str}"\n')
         print(f"Arduino data saved to {arduino_filepath}")
 
+    def get_session_slice(self, session_id: str):
+        """Return (start_ts, end_ts) for the given session_id using task markers."""
+        start_ts = end_ts = None
+        for m in self.task_markers:
+            if m.event == "session_start" and m.extra.get("session_id") == session_id:
+                start_ts = m.timestamp
+            if m.event == "session_end" and m.extra.get("session_id") == session_id:
+                end_ts = m.timestamp
+        return start_ts, end_ts
+
+    def save_session_data(self, base_filepath: str, session_id: str):
+        """Save data sliced to a single session's time window.
+        Time values in each file start from 0 (= session_start marker)."""
+        start_ts, end_ts = self.get_session_slice(session_id)
+        if start_ts is None:
+            print(f"[DataStore] WARNING: no session_start marker for '{session_id}'; saving all data.")
+            start_ts = self.session_start
+        end_ts_cmp = end_ts if end_ts is not None else float('inf')
+
+        def rel(ts):
+            return ts - start_ts
+
+        output_dir = Path(base_filepath).parent
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # EEG
+        eeg_filepath = f"{base_filepath}_eeg.csv"
+        with open(eeg_filepath, 'w') as f:
+            f.write("time," + ",".join(self.muse_channels) + "\n")
+            for s in self.eeg_data:
+                if s.timestamp < start_ts or s.timestamp > end_ts_cmp:
+                    continue
+                ch_vals = ",".join(str(s.channels.get(ch, 0)) for ch in self.muse_channels)
+                f.write(f"{rel(s.timestamp):.6f},{ch_vals}\n")
+        print(f"EEG data saved to {eeg_filepath}")
+
+        # HR
+        hr_filepath = f"{base_filepath}_hr.csv"
+        with open(hr_filepath, 'w') as f:
+            f.write("time,heart_rate,rr_intervals\n")
+            for s in self.hr_data:
+                if s.timestamp < start_ts or s.timestamp > end_ts_cmp:
+                    continue
+                rr_str = ";".join(f"{rr:.2f}" for rr in s.rr_intervals)
+                f.write(f"{rel(s.timestamp):.6f},{s.heart_rate},{rr_str}\n")
+        print(f"HR data saved to {hr_filepath}")
+
+        # GSR
+        gsr_filepath = f"{base_filepath}_gsr.csv"
+        with open(gsr_filepath, 'w') as f:
+            f.write("time,raw_audio,filtered_signal,gsr_uS\n")
+            for s in self.gsr_data:
+                if s.timestamp < start_ts or s.timestamp > end_ts_cmp:
+                    continue
+                f.write(f"{rel(s.timestamp):.6f},{s.raw_audio},{s.filtered_signal},{s.gsr_uS}\n")
+        print(f"GSR data saved to {gsr_filepath}")
+
+        # Arduino
+        arduino_filepath = f"{base_filepath}_arduino.csv"
+        with open(arduino_filepath, 'w') as f:
+            f.write("time,event_type,data_json\n")
+            for e in self.arduino_data:
+                if e.timestamp < start_ts or e.timestamp > end_ts_cmp:
+                    continue
+                data_str = json.dumps(e.data).replace('"', '""')
+                f.write(f'{rel(e.timestamp):.6f},{e.event_type},"{data_str}"\n')
+        print(f"Arduino data saved to {arduino_filepath}")
+
+        # Task markers (exclude session_start/session_end meta-markers)
+        markers_json = f"{base_filepath}_markers.json"
+        markers_csv  = f"{base_filepath}_markers.csv"
+        session_markers = [
+            m for m in self.task_markers
+            if m.timestamp >= start_ts and m.timestamp <= end_ts_cmp
+            and m.event not in ("session_start", "session_end")
+        ]
+        extra_keys = []
+        for m in session_markers:
+            for k in m.extra:
+                if k not in extra_keys:
+                    extra_keys.append(k)
+        with open(markers_json, 'w') as f:
+            json.dump({
+                'session_start_unix': start_ts,
+                'session_id': session_id,
+                'markers': [
+                    {'time': round(rel(m.timestamp), 6), 'task_number': m.task_number,
+                     'event': m.event, **m.extra}
+                    for m in session_markers
+                ]
+            }, f, indent=2)
+        print(f"Task markers saved to {markers_json}")
+        with open(markers_csv, 'w') as f:
+            f.write("time,task_number,event" + ("," + ",".join(extra_keys) if extra_keys else "") + "\n")
+            for m in session_markers:
+                extra_vals = ",".join(str(m.extra.get(k, "")) for k in extra_keys)
+                row = f"{rel(m.timestamp):.6f},{m.task_number},{m.event}"
+                if extra_keys:
+                    row += "," + extra_vals
+                f.write(row + "\n")
+        print(f"Task markers saved to {markers_csv}")
+
+        # JSON summary
+        json_path = f"{base_filepath}.json"
+        eeg_slice   = [s for s in self.eeg_data     if start_ts <= s.timestamp <= end_ts_cmp]
+        hr_slice    = [s for s in self.hr_data       if start_ts <= s.timestamp <= end_ts_cmp]
+        gsr_slice   = [s for s in self.gsr_data      if start_ts <= s.timestamp <= end_ts_cmp]
+        ard_slice   = [e for e in self.arduino_data  if start_ts <= e.timestamp <= end_ts_cmp]
+        with open(json_path, 'w') as f:
+            json.dump({
+                'metadata': {
+                    'session_id': session_id,
+                    'session_start_unix': start_ts,
+                    'session_start_iso': datetime.fromtimestamp(start_ts).isoformat(),
+                    'muse_sampling_rate': self.muse_sampling_rate,
+                    'muse_channels': self.muse_channels,
+                    'gsr_sampling_rate': self.gsr_sampling_rate,
+                },
+                'eeg_data': [{'time': round(rel(s.timestamp), 6), 'channels': s.channels} for s in eeg_slice],
+                'hr_data':  [{'time': round(rel(s.timestamp), 6), 'heart_rate': s.heart_rate, 'rr_intervals': s.rr_intervals} for s in hr_slice],
+                'gsr_data': [{'time': round(rel(s.timestamp), 6), 'raw_audio': s.raw_audio, 'filtered_signal': s.filtered_signal, 'gsr_uS': s.gsr_uS} for s in gsr_slice],
+                'task_markers': [{'time': round(rel(m.timestamp), 6), 'task_number': m.task_number, 'event': m.event} for m in session_markers],
+                'arduino_data': [{'time': round(rel(e.timestamp), 6), 'event_type': e.event_type, 'data': e.data} for e in ard_slice],
+                'summary': {
+                    'total_eeg_samples': len(eeg_slice),
+                    'total_hr_samples': len(hr_slice),
+                    'total_gsr_samples': len(gsr_slice),
+                    'total_task_markers': len(session_markers),
+                    'total_arduino_events': len(ard_slice),
+                    'duration_seconds': round((end_ts - start_ts) if end_ts else 0, 2),
+                }
+            }, f, indent=2)
+        print(f"Data saved to {json_path}")
+
     def save_task_markers(self, base_filepath: str):
         """Save task markers to JSON and CSV files."""
         markers_json = f"{base_filepath}_markers.json"
@@ -365,9 +497,19 @@ class SynchronizedCollector:
         self._muse_failed   = False   # True when connection exhausted all retries
         self._polar_ready   = threading.Event()
         self._gsr_ready     = threading.Event()
-        self._start_recording = threading.Event()  # Signal to start actual recording
+
+        # _record_event replaces one-shot _start_recording — can be set/cleared
+        # repeatedly to pause/resume recording between sessions.
+        self._record_event    = threading.Event()
+        self._start_recording = self._record_event  # alias for backward-compat
+
+        # Per-device paused acknowledgement events (set by thread when idle)
+        self._muse_paused  = threading.Event()
+        self._polar_paused = threading.Event()
+        self._gsr_paused   = threading.Event()
 
         # Arduino bridge (None when use_arduino=False)
+        self._arduino_paused = threading.Event()
         self.arduino: Optional[ArduinoBridge] = (
             ArduinoBridge(
                 port=arduino_port,
@@ -375,10 +517,46 @@ class SynchronizedCollector:
                 data_store=self.data_store,
                 lock=self._lock,
                 stop_event=self._stop_event,
-                start_recording_event=self._start_recording,
+                start_recording_event=self._record_event,
+                paused_event=self._arduino_paused,
             )
             if use_arduino else None
         )
+
+    # ── Session lifecycle ─────────────────────────────────────────────────────
+
+    def begin_session(self, session_id: str) -> None:
+        """Start a new recording session. Emits session_start marker, unblocks threads."""
+        self._muse_paused.clear()
+        self._polar_paused.clear()
+        self._gsr_paused.clear()
+        self._arduino_paused.clear()
+        with self._lock:
+            self.data_store.add_task_marker(
+                time.time(), 0, "session_start", extra={"session_id": session_id}
+            )
+        self._record_event.set()
+
+    def end_session(self, session_id: str, timeout: float = 5.0) -> None:
+        """Pause recording. Waits for all threads to confirm idle before returning."""
+        self._record_event.clear()
+        if self.use_muse:
+            self._muse_paused.wait(timeout=timeout)
+        if self.use_polar:
+            self._polar_paused.wait(timeout=timeout)
+        if self.use_gsr:
+            self._gsr_paused.wait(timeout=timeout)
+        if self.use_arduino and self.arduino:
+            self._arduino_paused.wait(timeout=timeout)
+        with self._lock:
+            self.data_store.add_task_marker(
+                time.time(), 0, "session_end", extra={"session_id": session_id}
+            )
+
+    def stop_all_threads(self) -> None:
+        """Terminal stop. Sets _stop_event and unblocks any threads blocked on _record_event."""
+        self._stop_event.set()
+        self._record_event.set()  # unblock threads waiting for recording to start
 
     # ── Arduino delegation properties ────────────────────────────────────────
     # These let GUI code reference collector.arduino_connected / .arduino_error /
@@ -588,60 +766,50 @@ class SynchronizedCollector:
             print("[Muse] Ready, waiting for synchronized start...")
             self._muse_ready.set()
 
-            # Wait for start signal (or stop signal)
-            while not self._start_recording.is_set() and not self._stop_event.is_set():
-                # Drain any data that accumulates while waiting
-                self.muse.get_data()
-                time.sleep(0.01)
-
-            if self._stop_event.is_set():
-                return
-
-            # Clear buffer one more time right before recording starts
-            self.muse.get_data()
-
-            print("[Muse] Starting data collection...")
-            start_time = time.time()
-            sample_count = 0
-
+            # Outer loop — runs once per session slot; stays alive across all sessions
+            total_samples = 0
             while not self._stop_event.is_set():
-                # Check duration
-                elapsed = time.time() - start_time
-                if duration and elapsed >= duration:
+                # Between sessions: drain buffer and wait for record_event
+                while not self._record_event.is_set() and not self._stop_event.is_set():
+                    self.muse.get_data()  # prevent BrainFlow buffer overflow
+                    time.sleep(0.01)
+
+                if self._stop_event.is_set():
                     break
 
-                # Get new data from Muse — hardware timestamps come from the device
-                eeg_data, hw_timestamps = self.muse.get_data()
+                # Clear buffer one more time right before recording starts
+                self.muse.get_data()
+                print("[Muse] Starting data collection...")
+                sample_count = 0
 
-                if eeg_data is not None and eeg_data.shape[1] > 0:
-                    n_samples = eeg_data.shape[1]
+                # Inner recording loop — active while record_event is set
+                while self._record_event.is_set() and not self._stop_event.is_set():
+                    eeg_data, hw_timestamps = self.muse.get_data()
 
-                    for i in range(n_samples):
-                        # Use the hardware timestamp from the Muse 2's internal clock
-                        # (aligned to host clock by BrainFlow). This avoids OS scheduling
-                        # jitter from calling time.time() after batch arrival.
-                        sample_timestamp = float(hw_timestamps[i])
+                    if eeg_data is not None and eeg_data.shape[1] > 0:
+                        n_samples = eeg_data.shape[1]
+                        for i in range(n_samples):
+                            sample_timestamp = float(hw_timestamps[i])
+                            channel_values = {
+                                self.muse.channels[ch]: float(eeg_data[ch, i])
+                                for ch in range(self.muse.n_channels)
+                            }
+                            with self._lock:
+                                self.data_store.add_eeg_sample(sample_timestamp, channel_values)
+                            sample_count += 1
 
-                        # Create channel value dict
-                        channel_values = {
-                            self.muse.channels[ch]: float(eeg_data[ch, i])
-                            for ch in range(self.muse.n_channels)
-                        }
+                    time.sleep(0.01)
 
-                        # Thread-safe append
-                        with self._lock:
-                            self.data_store.add_eeg_sample(sample_timestamp, channel_values)
+                total_samples += sample_count
+                print(f"[Muse] Session paused. {sample_count} samples this session ({total_samples} total).")
+                self._muse_paused.set()
 
-                        sample_count += 1
-
-                # Small sleep to prevent busy-waiting
-                time.sleep(0.01)
-
-            print(f"[Muse] Collection complete. {sample_count} samples collected.")
+            print(f"[Muse] Collection complete. {total_samples} total samples.")
 
         except Exception as e:
             print(f"[Muse] Error: {e}")
-            self._muse_ready.set()  # Set ready even on error so we don't hang
+            self._muse_ready.set()   # Unblock GUI on error
+            self._muse_paused.set()  # Unblock end_session() on error
         finally:
             if self.muse:
                 try:
@@ -657,8 +825,8 @@ class SynchronizedCollector:
         Parses data and adds to synchronized store with timestamp.
         Only records data after _start_recording is set.
         """
-        # Only record if recording has started
-        if not self._start_recording.is_set():
+        # Only record if recording is active
+        if not self._record_event.is_set():
             return
 
         timestamp = time.time()
@@ -744,23 +912,23 @@ class SynchronizedCollector:
                 print("[Polar] Ready, waiting for synchronized start...")
                 self._polar_ready.set()
 
-                # Wait for start signal (or stop signal)
-                while not self._start_recording.is_set() and not self._stop_event.is_set():
-                    await asyncio.sleep(0.01)
-
-                if self._stop_event.is_set():
-                    await client.stop_notify(HEART_RATE_MEASUREMENT_UUID)
-                    return
-
-                print(f"[Polar] Starting data collection...")
-
-                # Wait for duration or stop signal
-                start_time = time.time()
+                # Outer loop — stays alive across all sessions
                 while not self._stop_event.is_set():
-                    elapsed = time.time() - start_time
-                    if duration and elapsed >= duration:
+                    # Between sessions: wait for record_event
+                    while not self._record_event.is_set() and not self._stop_event.is_set():
+                        await asyncio.sleep(0.01)
+
+                    if self._stop_event.is_set():
                         break
-                    await asyncio.sleep(0.1)
+
+                    print("[Polar] Starting data collection...")
+
+                    # Inner recording loop — callback does the actual recording
+                    while self._record_event.is_set() and not self._stop_event.is_set():
+                        await asyncio.sleep(0.1)
+
+                    print("[Polar] Session paused.")
+                    self._polar_paused.set()
 
                 # Stop notifications
                 await client.stop_notify(HEART_RATE_MEASUREMENT_UUID)
@@ -776,10 +944,11 @@ class SynchronizedCollector:
                 print(f"  RMSSD: {metrics['rmssd']:.1f} ms")
                 print(f"  pNN50: {metrics['pnn50']:.1f}%")
 
-            print(f"[Polar] Collection complete.")
+            print("[Polar] Collection complete.")
 
         except Exception as e:
             print(f"[Polar] Error: {e}")
+            self._polar_paused.set()  # Unblock end_session() on error
             self.polar_connected = False
 
     def _gsr_collection_thread(self, duration: Optional[float]):
@@ -810,40 +979,27 @@ class SynchronizedCollector:
                 if status:
                     print(f"[GSR] Audio status: {status}")
 
-                # Only record if recording has started
-                if not self._start_recording.is_set():
-                    # Still need to process to maintain filter state
-                    raw = indata[:, 0].copy()
-                    self.gsr._apply_filter(raw)
-                    return
-
-                # Process audio data
                 raw = indata[:, 0].copy()
+                # _apply_filter decimates and lowpass filters — always run to keep state
                 filtered = self.gsr._apply_filter(raw)
 
-                # Downsample and store
-                self.gsr._downsample_accumulator.extend(zip(raw, filtered))
+                # Only record if recording is active
+                if not self._record_event.is_set():
+                    return
+                if len(filtered) == 0:
+                    return
 
-                while len(self.gsr._downsample_accumulator) >= self.gsr.downsample_factor:
-                    chunk = self.gsr._downsample_accumulator[:self.gsr.downsample_factor]
-                    self.gsr._downsample_accumulator = self.gsr._downsample_accumulator[self.gsr.downsample_factor:]
+                raw_mean = float(np.mean(np.abs(raw)))
+                filt_ds = float(filtered[-1])
+                gsr_uS = self.gsr._convert_to_gsr(filt_ds)
+                timestamp = time.time()
 
-                    raw_vals = [c[0] for c in chunk]
-                    filt_vals = [c[1] for c in chunk]
-
-                    raw_ds = float(np.mean(raw_vals))
-                    filt_ds = float(np.mean(filt_vals))
-                    gsr_uS = self.gsr._convert_to_gsr(filt_ds)
-                    timestamp = time.time()
-
-                    # Thread-safe append to our data store
-                    with self._lock:
-                        self.data_store.add_gsr_sample(timestamp, raw_ds, filt_ds, gsr_uS)
+                with self._lock:
+                    self.data_store.add_gsr_sample(timestamp, raw_mean, filt_ds, gsr_uS)
 
             # Start the audio stream with our custom callback
             import sounddevice as sd
             self.gsr._init_filter()
-            self.gsr._downsample_accumulator = []
 
             self.gsr.stream = sd.InputStream(
                 callback=synchronized_callback,
@@ -859,36 +1015,32 @@ class SynchronizedCollector:
             print("[GSR] Ready, waiting for synchronized start...")
             self._gsr_ready.set()
 
-            # Wait for start signal
-            while not self._start_recording.is_set() and not self._stop_event.is_set():
-                time.sleep(0.01)
-
-            if self._stop_event.is_set():
-                self.gsr.stream.stop()
-                self.gsr.stream.close()
-                self.gsr.is_streaming = False
-                return
-
-            print("[GSR] Starting data collection...")
-            start_time = time.time()
-            last_print = start_time
-
+            # Outer loop — stays alive across all sessions
             while not self._stop_event.is_set():
-                elapsed = time.time() - start_time
-                if duration and elapsed >= duration:
+                # Between sessions: wait for record_event
+                while not self._record_event.is_set() and not self._stop_event.is_set():
+                    time.sleep(0.01)
+
+                if self._stop_event.is_set():
                     break
 
-                # Print status every 5 seconds
-                if time.time() - last_print >= 5.0:
-                    with self._lock:
-                        gsr_count = len(self.data_store.gsr_data)
-                        if gsr_count > 0:
-                            latest_gsr = self.data_store.gsr_data[-1].gsr_uS
-                            rel_time = self.data_store.get_relative_time(time.time())
-                            print(f"[GSR] t={rel_time:.1f}s | GSR: {latest_gsr:.4f} µS | Samples: {gsr_count}")
-                    last_print = time.time()
+                print("[GSR] Starting data collection...")
+                last_print = time.time()
 
-                time.sleep(0.1)
+                # Inner recording loop — callback does the actual recording
+                while self._record_event.is_set() and not self._stop_event.is_set():
+                    # Print status every 5 seconds
+                    if time.time() - last_print >= 5.0:
+                        with self._lock:
+                            gsr_count = len(self.data_store.gsr_data)
+                            if gsr_count > 0:
+                                latest_gsr = self.data_store.gsr_data[-1].gsr_uS
+                                print(f"[GSR] GSR: {latest_gsr:.4f} µS | Total samples: {gsr_count}")
+                        last_print = time.time()
+                    time.sleep(0.1)
+
+                print("[GSR] Session paused.")
+                self._gsr_paused.set()
 
             # Stop streaming
             self.gsr.stream.stop()
@@ -897,11 +1049,12 @@ class SynchronizedCollector:
 
             with self._lock:
                 sample_count = len(self.data_store.gsr_data)
-            print(f"[GSR] Collection complete. {sample_count} samples collected.")
+            print(f"[GSR] Collection complete. {sample_count} total samples.")
 
         except Exception as e:
             print(f"[GSR] Error: {e}")
-            self._gsr_ready.set()  # Set ready even on error to prevent hanging
+            self._gsr_ready.set()   # Unblock GUI on error
+            self._gsr_paused.set()  # Unblock end_session() on error
         finally:
             if self.gsr and self.gsr.is_streaming:
                 try:
@@ -1017,14 +1170,18 @@ def create_participant_folder(participant_id: str) -> Path:
 
 
 def _reset_data_store(collector: SynchronizedCollector) -> None:
-    """Reset collector state for a new session."""
+    """Reset collector state before the first session (called once at startup)."""
     collector.data_store = SynchronizedDataStore()
     collector._stop_event.clear()
     collector._muse_ready.clear()
     collector._muse_failed = False
     collector._polar_ready.clear()
     collector._gsr_ready.clear()
-    collector._start_recording.clear()
+    collector._record_event.clear()
+    collector._muse_paused.clear()
+    collector._polar_paused.clear()
+    collector._gsr_paused.clear()
+    collector._arduino_paused.clear()
     if collector.arduino is not None:
         collector.arduino._data_store = collector.data_store
 
@@ -1200,7 +1357,7 @@ def main():
                     collector.muse_connected = False
 
                 # Step 4a: EEG calibration — live signal check before baseline.
-                calib_muse = show_calibration_screen(gsr=collector.gsr if collector.use_gsr else None)
+                calib_muse = show_calibration_screen()
                 if calib_muse is None:
                     print("Experiment cancelled at EEG calibration.")
                     collector.disconnect_devices()
@@ -1212,6 +1369,7 @@ def main():
                     session_id=session_id,
                     data_dir='data',
                     muse=calib_muse,
+                    gsr=collector.gsr if collector.use_gsr else None,
                 ):
                     print("Experiment cancelled at baseline recording.")
                     collector.disconnect_devices()
@@ -1229,39 +1387,37 @@ def main():
                     out_dir='data',
                 )
 
-            # Run three device sessions
+            # Run three device sessions — threads start ONCE and run continuously.
             completed_sessions = []
 
-            # The Muse collection thread handles its own BLE settle delay internally.
-
-            # Pre-start threads for the first session.
+            # Initialise data store and start all threads (they will block until
+            # begin_session() is called inside show_experiment_screen).
             _reset_data_store(collector)
             session_threads = start_collection_threads(collector)
+
+            # First session only: wait for all devices to signal ready.
+            if not show_reconnect_screen(collector):
+                print("Experiment aborted at reconnect screen.")
+                collector.stop_all_threads()
+                collector.disconnect_devices()
+                return
 
             for session_idx, device_name in enumerate(DEVICES):
                 print(f"\n{'='*60}")
                 print(f"SESSION {session_idx + 1}/3: {device_name}")
                 print(f"{'='*60}")
 
-                # Per-session output path
                 device_slug = device_name.lower().replace(' ', '_')
+                session_id  = device_slug
                 output_path = str(
                     participant_folder / f"session_{session_timestamp}_{device_slug}"
                 )
-
-                # Wait for all devices to be fully ready before the countdown.
-                # This covers both session 1 (initial connect) and sessions 2/3
-                # (reconnect after swap). The screen auto-advances once all ready.
-                if not show_reconnect_screen(collector):
-                    print(f"Experiment aborted at reconnect screen for {device_name}.")
-                    collector._stop_event.set()
-                    collector.disconnect_devices()
-                    return
+                is_final = (session_idx == len(DEVICES) - 1)
 
                 # Countdown
                 if not show_countdown_screen():
                     print(f"Experiment cancelled at countdown for {device_name}.")
-                    collector._stop_event.set()
+                    collector.stop_all_threads()
                     collector.disconnect_devices()
                     return
 
@@ -1276,20 +1432,25 @@ def main():
                     session_mode=session_mode,
                     audio_out_device=collector.audio_out_device,
                 )
-                session_targets = haptic_targets_all.get(device_name, [0] * TASKS_PER_DEVICE)
+                session_targets = haptic_targets_all.get(device_name, [])
 
-                # Run the experiment — threads already started and ready
-                show_experiment_screen(
+                # Run the experiment session
+                session_stats = show_experiment_screen(
                     collector, output_path,
+                    session_id=session_id,
+                    is_final_session=is_final,
                     threads=session_threads,
                     haptics=haptics,
                     haptic_targets=session_targets,
                 )
 
-                # Red circle count (attention check for oddball task)
+                # Red circle count (scoped to this session's markers)
+                start_ts, end_ts = collector.data_store.get_session_slice(session_id)
                 actual_red_count = sum(
                     1 for m in collector.data_store.task_markers
                     if m.event == "oddball_onset"
+                    and m.timestamp >= (start_ts or 0)
+                    and m.timestamp <= (end_ts or float('inf'))
                 )
                 red_count = show_red_circle_count_screen(device_name, actual_red_count)
                 if red_count is None:
@@ -1326,27 +1487,23 @@ def main():
 
                 completed_sessions.append({
                     'device': device_name,
-                    'data_store': collector.data_store,  # snapshot before reset
                     'output_path': output_path,
                     'tlx_scores': tlx_scores,
                     'red_circle_count': red_count,
                     'actual_red_circle_count': actual_red_count,
+                    **(session_stats or {}),
                 })
 
                 # Device swap screen (not shown after the last session)
-                if session_idx < len(DEVICES) - 1:
+                if not is_final:
                     next_device = DEVICES[session_idx + 1]
                     if not show_device_swap_screen(next_device):
                         print("Experiment aborted at device swap.")
+                        collector.stop_all_threads()
                         collector.disconnect_devices()
                         break
-
-                    # User confirmed swap — reset state and start connecting the
-                    # next Muse session immediately. show_reconnect_screen at the
-                    # top of the next iteration will block until all are ready.
-                    _reset_data_store(collector)
-                    print(f"[Session] Starting device threads for {next_device}...")
-                    session_threads = start_collection_threads(collector)
+                    # Threads are already paused (end_session was called inside
+                    # show_experiment_screen). No reset or reconnect needed.
 
             # Step 8: Final completion screen
             show_completion_screen(completed_sessions, str(participant_folder))

@@ -23,10 +23,8 @@ from threading import Lock
 from typing import Optional
 
 
-# Fixed gain applied before the physics model.
-# Increase if µS values read too low; decrease if too high.
-GSR_CALIBRATION_A: float = 100.0
-
+GSR_CALIBRATION_A: float = 52.0
+GSR_CALIBRATION_B: float = 0.0
 
 class ESenseGSR:
     """Real-time GSR acquisition from eSense via audio input."""
@@ -75,6 +73,13 @@ class ESenseGSR:
         # Open-circuit carrier baseline (set by measure_baseline())
         self.amplitude_baseline = 0.0
 
+        # Rolling tonic baseline for phasic extraction (30s window at downsample_rate)
+        self._tonic_window_size = 30 * downsample_rate
+        self._tonic_buffer: list = []
+        self._tonic_baseline: float = 0.0
+        # Gain applied only to the phasic (deviation from tonic) component
+        self.phasic_gain: float = 50.0
+
         self.output_dir = output_dir
         self.buffer_size = buffer_size
         self.device = device
@@ -96,16 +101,34 @@ class ESenseGSR:
         self._downsample_accumulator = []
 
     def _init_filter(self):
-        """Initialize Butterworth lowpass filter with initial conditions."""
-        nyq = 0.5 * self.fs
-        normalized_cutoff = self.cutoff / nyq
+        """Initialize Butterworth lowpass filter with initial conditions.
+        Filter operates at the intermediate rate (fs / coarse_factor) rather
+        than at the full 44100 Hz rate, so normalized_cutoff is not tiny."""
+        # Coarse decimation: 44100 → ~1000 Hz before envelope filtering
+        self.coarse_factor = self.fs // 1000
+        self._coarse_buf: list = []
+        intermediate_fs = self.fs // self.coarse_factor
+        nyq = 0.5 * intermediate_fs
+        normalized_cutoff = min(self.cutoff / nyq, 0.99)
         self.sos = butter(self.filter_order, normalized_cutoff, btype='low', output='sos')
         self.zi = sosfilt_zi(self.sos)
 
     def _apply_filter(self, data: np.ndarray) -> np.ndarray:
-        """Rectify then lowpass filter to extract AM envelope."""
+        """Rectify, coarse-decimate, then lowpass filter to extract AM envelope."""
         rectified = np.abs(data)
-        filtered, self.zi = sosfilt(self.sos, rectified, zi=self.zi)
+        # Coarse decimate by averaging blocks → ~1000 Hz intermediate rate
+        self._coarse_buf.extend(rectified.tolist())
+        decimated = []
+        while len(self._coarse_buf) >= self.coarse_factor:
+            block = self._coarse_buf[:self.coarse_factor]
+            self._coarse_buf = self._coarse_buf[self.coarse_factor:]
+            decimated.append(float(np.mean(block)))
+        if not decimated:
+            # Return same-length zeros so the accumulator stays in sync
+            return np.zeros(len(data))
+        decimated_arr = np.array(decimated)
+        filtered, self.zi = sosfilt(self.sos, decimated_arr, zi=self.zi)
+        # Return last value repeated to match expected single-value output per chunk
         return filtered
 
     def _convert_to_gsr(self, amplitude: float) -> float:
@@ -122,50 +145,44 @@ class ESenseGSR:
         calibration_b: offset trim (default 0.0)
         """
         amp = amplitude - self.amplitude_baseline
-        if amp <= 0:
-            return 0.0
-        return max(0.0, amp * self.calibration_a * (1e6 / self.R_SOURCE) + self.calibration_b)
+        tonic = amp * self.calibration_a + self.calibration_b
+
+        # Update rolling tonic baseline
+        self._tonic_buffer.append(tonic)
+        if len(self._tonic_buffer) > self._tonic_window_size:
+            self._tonic_buffer.pop(0)
+        self._tonic_baseline = float(np.mean(self._tonic_buffer))
+
+        # Phasic = deviation from tonic, amplified and added back to tonic
+        phasic = (tonic - self._tonic_baseline) * self.phasic_gain
+        return max(0.0, self._tonic_baseline + phasic)
 
     def _audio_callback(self, indata, frames, time_info, status):
         """Process incoming audio data in real-time."""
         if status:
             print(f"Audio status: {status}")
 
-        # Extract mono channel
         raw = indata[:, 0].copy()
+        raw_mean = float(np.mean(np.abs(raw)))
 
-        # Apply lowpass filter
+        # _apply_filter decimates to ~1000 Hz and lowpass filters — returns array
         filtered = self._apply_filter(raw)
+        if len(filtered) == 0:
+            return
 
-        # Downsample and process
-        self._downsample_accumulator.extend(zip(raw, filtered))
+        timestamp = time.time()
+        if timestamp < self._warmup_until:
+            return
 
-        while len(self._downsample_accumulator) >= self.downsample_factor:
-            # Take chunk for downsampling
-            chunk = self._downsample_accumulator[:self.downsample_factor]
-            self._downsample_accumulator = self._downsample_accumulator[self.downsample_factor:]
+        # Use the last filtered value as the envelope sample for this callback
+        filt_ds = float(filtered[-1])
+        gsr_uS = self._convert_to_gsr(filt_ds)
 
-            # Use mean of chunk for downsampled value
-            raw_vals = [c[0] for c in chunk]
-            filt_vals = [c[1] for c in chunk]
-
-            timestamp = time.time()
-
-            # Skip samples during filter warm-up to avoid initial transient
-            if timestamp < self._warmup_until:
-                continue
-
-            raw_ds = np.mean(raw_vals)
-            filt_ds = float(np.mean(filt_vals))
-            gsr_uS = self._convert_to_gsr(filt_ds)
-
-            with self.buffer_lock:
-                self.buffer.append([timestamp, raw_ds, filt_ds, gsr_uS])
-                self.sample_count += 1
-
-                # Flush buffer to CSV when full
-                if len(self.buffer) >= self.buffer_size:
-                    self._flush_buffer()
+        with self.buffer_lock:
+            self.buffer.append([timestamp, raw_mean, filt_ds, gsr_uS])
+            self.sample_count += 1
+            if len(self.buffer) >= self.buffer_size:
+                self._flush_buffer()
 
     def _flush_buffer(self):
         """Write buffered data to CSV file."""
@@ -465,7 +482,8 @@ def plot_gsr_data(filepath: str, save_path: Optional[str] = None):
     ax1.set_ylabel('Raw Audio\nAmplitude')
     ax1.set_title('Raw Audio Signal (Microphone Input)')
     ax1.grid(True, alpha=0.3)
-    ax1.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+    ax1.margins(y=0.1)
+    ax1.autoscale(axis='y', tight=False)
 
     # Panel 2: Filtered signal
     ax2 = axes[1]
@@ -473,7 +491,8 @@ def plot_gsr_data(filepath: str, save_path: Optional[str] = None):
     ax2.set_ylabel('Filtered Signal\nAmplitude')
     ax2.set_title('Lowpass Filtered Signal (5 Hz cutoff)')
     ax2.grid(True, alpha=0.3)
-    ax2.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+    ax2.margins(y=0.1)
+    ax2.autoscale(axis='y', tight=False)
 
     # Panel 3: GSR
     ax3 = axes[2]
@@ -614,147 +633,6 @@ def plot_gsr_analysis(filepath: str, window_size: float = 5.0, save_path: Option
     return fig
 
 
-def run_two_point_calibration(
-    gsr,
-    settle_time: float = 3.0,
-    measure_time: float = 5.0,
-    config_path: str = "gsr_calibration.json"
-):
-    """
-    Interactive two-point linear calibration for eSense GSR.
-
-    Connect eSense clips to two known resistances in sequence. The function
-    measures the audio amplitude at each reference and computes a, b such that:
-        µS = a * amplitude + b
-
-    Typical resistor values:
-        200 kΩ  →  5.0 µS
-        500 kΩ  →  2.0 µS
-        1 MΩ    →  1.0 µS
-        2 MΩ    →  0.5 µS
-
-    Args:
-        gsr: ESenseGSR instance (must not be streaming)
-        settle_time: Seconds to wait for signal to stabilise after connecting reference
-        measure_time: Seconds to average for each reference point
-        config_path: JSON file to save calibration coefficients
-    """
-    import json
-
-    print("\n" + "=" * 60)
-    print("TWO-POINT GSR CALIBRATION")
-    print("=" * 60)
-    print("You will need two precision resistors to simulate known skin")
-    print("conductance. Suggested values:")
-    print("  Ref 1: 200 kΩ  →  5.0 µS")
-    print("  Ref 2: 2 MΩ    →  0.5 µS")
-    print("Connect the eSense finger clips across the resistor leads.")
-    print("=" * 60)
-
-    points = []  # list of (amplitude, conductance_uS) tuples
-
-    for ref_num in range(1, 3):
-        resistance_str = input(f"\nRef {ref_num}: Enter resistance in kΩ (e.g. 200): ").strip()
-        try:
-            resistance_kohm = float(resistance_str)
-        except ValueError:
-            print("Invalid input. Exiting calibration.")
-            return None
-
-        conductance_uS = 1e6 / (resistance_kohm * 1e3)  # G = 1/R in siemens → µS
-        print(f"  → Conductance: {conductance_uS:.4f} µS")
-
-        input(f"  Connect clips to {resistance_kohm:.0f} kΩ resistor, then press Enter...")
-
-        # Start streaming and collect samples over settle + measure window
-        gsr.start(filename=f"cal_ref{ref_num}.csv")
-
-        print(f"  Settling for {settle_time:.0f}s...", end="", flush=True)
-        time.sleep(settle_time)
-        print(" done.")
-
-        print(f"  Measuring for {measure_time:.0f}s...", end="", flush=True)
-        samples = []
-        measure_start = time.time()
-        while time.time() - measure_start < measure_time:
-            val = gsr.get_latest_value()
-            if val is not None:
-                # With default a=1, b=0 this is raw amplitude — exactly what we need
-                samples.append(val)
-            time.sleep(0.05)
-
-        gsr.stop()
-
-        if not samples:
-            print("\nNo samples collected. Exiting calibration.")
-            return None
-
-        # Reset filter state for next reference
-        gsr._init_filter()
-        gsr.buffer = []
-        gsr._downsample_accumulator = []
-
-        mean_amplitude = float(np.mean(samples))
-        std_amplitude = float(np.std(samples))
-        print(f" done.")
-        print(f"  Mean amplitude: {mean_amplitude:.4e} ± {std_amplitude:.4e}")
-        points.append((mean_amplitude, conductance_uS))
-
-    # Solve for a, b: µS = a * amplitude + b using two-point formula
-    amp1, cond1 = points[0]
-    amp2, cond2 = points[1]
-
-    if abs(amp1 - amp2) < 1e-12:
-        print("\nERROR: Both reference amplitudes are identical — cannot calibrate.")
-        print("Ensure the eSense clips are making good contact with each resistor.")
-        return None
-
-    a = (cond1 - cond2) / (amp1 - amp2)
-    b = cond1 - a * amp1
-
-    print("\n" + "=" * 60)
-    print("CALIBRATION RESULT")
-    print("=" * 60)
-    print(f"  Slope  a = {a:.6e}  µS / amplitude")
-    print(f"  Offset b = {b:.6e}  µS")
-    print(f"  Formula: µS = {a:.4e} × amplitude + {b:.4e}")
-    print()
-    print("Verification:")
-    for amp, cond in points:
-        predicted = a * amp + b
-        print(f"  Amplitude {amp:.4e} → predicted {predicted:.4f} µS  (reference: {cond:.4f} µS)")
-
-    # Save coefficients to JSON
-    cal = {"calibration_a": a, "calibration_b": b, "reference_points": points}
-    with open(config_path, "w") as f:
-        json.dump(cal, f, indent=2)
-
-    print(f"\nCalibration saved to: {config_path}")
-    print(f"To use: python esense.py --load-cal")
-    print(f"Or:     python esense.py --cal-a {a:.6e} --cal-b {b:.6e}")
-    print("=" * 60)
-
-    return a, b
-
-
-def load_calibration(config_path: str = "gsr_calibration.json"):
-    """
-    Load saved calibration coefficients from JSON file.
-
-    Returns:
-        (a, b) tuple, or (1.0, 0.0) if no calibration file found.
-    """
-    import json
-    if not os.path.exists(config_path):
-        print(f"No calibration file found at {config_path}. Using default (a=1.0, b=0.0).")
-        return 1.0, 0.0
-    with open(config_path) as f:
-        cal = json.load(f)
-    a = cal["calibration_a"]
-    b = cal["calibration_b"]
-    print(f"Loaded calibration from {config_path}: a={a:.4e}, b={b:.4e}")
-    return a, b
-
 
 def main():
     """Main entry point for GSR acquisition."""
@@ -765,15 +643,11 @@ def main():
     parser.add_argument("--device", type=int, default=None, help="Audio device index")
     parser.add_argument("--duration", type=float, default=None, help="Recording duration (seconds)")
     parser.add_argument("--output", type=str, default=None, help="Output CSV filename")
-    parser.add_argument("--cal-a", type=float, default=10.0,
+    parser.add_argument("--cal-a", type=float, default=GSR_CALIBRATION_A,
                         help="Amplitude gain trim before physics model (default 10; increase if µS values too low)")
-    parser.add_argument("--cal-b", type=float, default=0.0,
+    parser.add_argument("--cal-b", type=float, default=GSR_CALIBRATION_B,
                         help="Amplitude offset trim before physics model")
     parser.add_argument("--downsample", type=int, default=50, help="Downsample rate (Hz)")
-    parser.add_argument("--calibrate", "--calibrate-two-point", action="store_true",
-                        help="Run interactive two-point calibration using known resistors")
-    parser.add_argument("--load-cal", action="store_true",
-                        help="Load saved calibration from gsr_calibration.json")
     parser.add_argument("--plot", type=str, default=None, help="Plot GSR data from CSV file")
     parser.add_argument("--plot-analysis", type=str, default=None, help="Plot detailed GSR analysis from CSV file")
     parser.add_argument("--save-plot", type=str, default=None, help="Save plot to file (use with --plot or --plot-analysis)")
@@ -796,10 +670,6 @@ def main():
         plot_gsr_analysis(args.plot_analysis, save_path=args.save_plot)
         return
 
-    # Load calibration from file if requested (overrides --cal-a / --cal-b)
-    if args.load_cal:
-        args.cal_a, args.cal_b = load_calibration()
-
     if args.simulate:
         gsr = SimulatedGSR(downsample_rate=args.downsample, output_dir="output")
     else:
@@ -812,10 +682,6 @@ def main():
 
     if args.list_devices:
         gsr.list_devices()
-        return
-
-    if args.calibrate:
-        run_two_point_calibration(gsr)
         return
 
     if args.load_baseline:
@@ -856,7 +722,6 @@ def main():
                 plot_gsr_analysis(gsr.csv_path, save_path=analysis_save_path)
             except Exception as e:
                 print(f"Warning: Could not generate plots: {e}")
-
 
 if __name__ == "__main__":
     main()

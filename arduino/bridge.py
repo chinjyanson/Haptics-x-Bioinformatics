@@ -60,7 +60,8 @@ class ArduinoBridge:
         data_store,                             # SynchronizedDataStore
         lock: threading.Lock,                   # shared collector._lock
         stop_event: threading.Event,            # shared collector._stop_event
-        start_recording_event: threading.Event, # shared collector._start_recording
+        start_recording_event: threading.Event, # shared collector._record_event
+        paused_event: threading.Event,          # collector._arduino_paused
     ) -> None:
         self.port = port
         self.baud = baud
@@ -68,6 +69,7 @@ class ArduinoBridge:
         self._lock = lock
         self._stop_event = stop_event
         self._start_recording = start_recording_event
+        self.paused_event = paused_event
 
         self._serial: Optional[serial.Serial] = None
         self._serial_lock = threading.Lock()
@@ -153,8 +155,9 @@ class ArduinoBridge:
         """
         Thread target for Arduino bidirectional communication.
 
-        Reads JSON lines from the encoder/button and logs them to _data_store.
-        Sends {"cmd":"start"} on recording start and {"cmd":"stop"} on shutdown.
+        Opens serial port ONCE and keeps it open for the full experiment.
+        Pauses between sessions by draining the buffer, resumes on _start_recording.
+        Sends {"cmd":"start"} on each session start and {"cmd":"stop"} only at shutdown.
         """
         try:
             if not self.port:
@@ -175,56 +178,61 @@ class ArduinoBridge:
             print("[Arduino] Ready, waiting for synchronized start...")
             self.ready.set()
 
-            # Drain pre-recording events so buffer doesn't fill
-            while not self._start_recording.is_set() and not self._stop_event.is_set():
-                with self._serial_lock:
-                    if self._serial.in_waiting:
-                        self._serial.readline()
-                time.sleep(0.01)
+            total_events = 0
 
-            if self._stop_event.is_set():
-                return
-
-            self.send_command({"cmd": "start", "task": 1})
-            print("[Arduino] Starting data collection...")
-
-            start_time = time.time()
-            event_count = 0
-
+            # Outer loop — runs once per session slot; serial stays open throughout
             while not self._stop_event.is_set():
-                if duration and (time.time() - start_time) >= duration:
+                # Between sessions: drain incoming bytes to prevent buffer overflow
+                while not self._start_recording.is_set() and not self._stop_event.is_set():
+                    with self._serial_lock:
+                        if self._serial.in_waiting:
+                            self._serial.read(self._serial.in_waiting)
+                    time.sleep(0.05)
+
+                if self._stop_event.is_set():
                     break
 
-                with self._serial_lock:
-                    raw = self._serial.readline()
+                self.send_command({"cmd": "start", "task": 1})
+                print("[Arduino] Starting data collection...")
+                event_count = 0
 
-                if not raw:
-                    continue
+                # Inner recording loop
+                while self._start_recording.is_set() and not self._stop_event.is_set():
+                    with self._serial_lock:
+                        raw = self._serial.readline()
 
-                timestamp = time.time()
-                line_str = raw.decode('utf-8', errors='replace').strip()
-                if not line_str:
-                    continue
+                    if not raw:
+                        continue
 
-                try:
-                    msg = json.loads(line_str)
-                except json.JSONDecodeError:
-                    print(f"[Arduino] Non-JSON line: {line_str!r}")
-                    continue
+                    timestamp = time.time()
+                    line_str = raw.decode('utf-8', errors='replace').strip()
+                    if not line_str:
+                        continue
 
-                event_type = msg.get("type", "unknown")
-                data = {k: v for k, v in msg.items() if k != "type"}
+                    try:
+                        msg = json.loads(line_str)
+                    except json.JSONDecodeError:
+                        print(f"[Arduino] Non-JSON line: {line_str!r}")
+                        continue
 
-                with self._lock:
-                    self._data_store.add_arduino_event(timestamp, event_type, data)
-                event_count += 1
+                    event_type = msg.get("type", "unknown")
+                    data = {k: v for k, v in msg.items() if k != "type"}
 
-            print(f"[Arduino] Collection complete. {event_count} events recorded.")
+                    with self._lock:
+                        self._data_store.add_arduino_event(timestamp, event_type, data)
+                    event_count += 1
+
+                total_events += event_count
+                print(f"[Arduino] Session paused. {event_count} events this session ({total_events} total).")
+                self.paused_event.set()
+
+            print(f"[Arduino] Collection complete. {total_events} total events.")
 
         except Exception as e:
             print(f"[Arduino] Error: {e}")
             self.error = str(e)
-            self.ready.set()  # Unblock GUI on error
+            self.ready.set()        # Unblock GUI on error
+            self.paused_event.set() # Unblock end_session() on error
 
         finally:
             self.send_command({"cmd": "stop"})

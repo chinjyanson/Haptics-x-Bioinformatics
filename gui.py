@@ -451,26 +451,32 @@ def show_countdown_screen() -> bool:
 
 
 def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
+                           session_id: str = "",
+                           is_final_session: bool = False,
                            threads=None, haptics: 'Optional[HapticsController]' = None,
-                           haptic_targets: Optional[List[int]] = None) -> None:
+                           haptic_targets: Optional[List[int]] = None) -> Dict:
     """
     Show experiment running screen with stop button. Runs until user stops.
 
     Args:
-        collector:      The synchronized data collector.
-        output_path:    Base path to save data to.
-        threads:        Optional (muse_thread, polar_thread, gsr_thread, arduino_thread)
-                        if already started before this call. If None, threads are
-                        started here (legacy behaviour).
-        haptics:        Optional HapticsController for audio/vibration feedback.
-                        If None, no feedback is given.
-        haptic_targets: List of target tick positions, one per task. If None or
-                        shorter than TASKS_PER_DEVICE, missing entries default to 0.
+        collector:          The synchronized data collector.
+        output_path:        Base path to save data to.
+        session_id:         Identifier for this session (used for markers and save).
+        is_final_session:   If True, call stop_all_threads() at end; else end_session().
+        threads:            Optional (muse_thread, polar_thread, gsr_thread, arduino_thread)
+                            if already started before this call. If None, threads are
+                            started here (legacy behaviour).
+        haptics:            Optional HapticsController for audio/vibration feedback.
+        haptic_targets:     List of target tick positions, one per task.
     """
     import FreeSimpleGUI as sg
-    from main import TASKS_PER_DEVICE, start_collection_threads
+    from main import start_collection_threads
 
     sg.theme('LightBlue2')
+
+    # Derive task count from the targets list
+    _targets: List[int] = list(haptic_targets) if haptic_targets else []
+    num_tasks = len(_targets)
 
     # ── Oddball stimulus constants ─────────────────────────────────────────
     _OB_SOA_MS    = 600   # stimulus onset asynchrony (ms)
@@ -509,10 +515,10 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
                  sg.Text('-- µS', key='-LATEST_GSR-', font=('Helvetica', 11, 'bold'))],
             ], font=('Helvetica', 12))],
             [sg.Text('Current Task:', font=('Helvetica', 11)),
-             sg.Text(f'1 / {TASKS_PER_DEVICE}', key='-TASK_NUM-', font=('Helvetica', 11, 'bold'))],
+             sg.Text(f'1 / {num_tasks}', key='-TASK_NUM-', font=('Helvetica', 11, 'bold'))],
             [sg.Text('Press Right Arrow to end current task and move to next.', font=('Helvetica', 10))],
             [sg.Text('')],
-            [sg.Text(f'Session ends automatically after task {TASKS_PER_DEVICE}.', font=('Helvetica', 10))],
+            [sg.Text(f'Session ends automatically after task {num_tasks}.', font=('Helvetica', 10))],
             [sg.Text('')],
             [sg.Button('STOP EXPERIMENT', size=(20, 2), font=('Helvetica', 14, 'bold'),
                        button_color=('white', 'red'), key='-STOP-', disabled=True)],
@@ -536,11 +542,6 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
     window.bind("<Right>", "-NEXT_TASK-")
 
     current_task = 1
-
-    # Normalise haptic_targets to a full-length list (pad with 0 if needed)
-    _targets: List[int] = list(haptic_targets) if haptic_targets else []
-    while len(_targets) < TASKS_PER_DEVICE:
-        _targets.append(0)
 
     # Track last arduino_data index so we only feed new encoder events to haptics
     _last_arduino_idx: int = 0
@@ -597,15 +598,15 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
                 window.close()
                 return
 
-    # All devices ready - set session_start and signal to start recording
+    # All devices ready — begin recording for this session
     window['-STATUS-'].update('Starting synchronized recording...')
     window.refresh()
 
-    # Set the session start time RIGHT NOW - this is time=0
+    # Set legacy session_start field (used by get_relative_time for display)
     collector.data_store.session_start = time.time()
 
-    # Signal all threads to start recording simultaneously
-    collector._start_recording.set()
+    # Emit session_start marker and unblock all collection threads
+    collector.begin_session(session_id)
 
     window['-STATUS-'].update('Data is being recorded...')
     window['-STOP-'].update(disabled=False)
@@ -673,9 +674,9 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
                 )
             print(f"[Task] Ended task {current_task}  encoder_error={enc_error:+d}")
 
-            if current_task >= TASKS_PER_DEVICE:
+            if current_task >= num_tasks:
                 # All tasks done — end the session automatically
-                print(f"[Task] All {TASKS_PER_DEVICE} tasks complete. Ending session.")
+                print(f"[Task] All {num_tasks} tasks complete. Ending session.")
                 break
 
             current_task += 1
@@ -685,7 +686,7 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
                 print(f"[Haptics] Task {current_task} target = {_targets[current_task - 1]} ticks.")
             elem = window['-TASK_NUM-']
             if elem is not None:
-                elem.update(value=f'{current_task} / {TASKS_PER_DEVICE}')
+                elem.update(value=f'{current_task} / {num_tasks}')
 
         if event == '-STOP-':
             # Manual early stop with confirmation
@@ -753,37 +754,51 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
     if haptics is not None:
         haptics.stop()
 
-    # Stop collection
-    collector._stop_event.set()
-    window['-STOP-'].update('Stopping devices...', disabled=True)
+    window['-STOP-'].update('Saving session...', disabled=True)
     window.refresh()
 
-    # Wait for threads to finish — Muse BrainFlow release can be slow, give it up to 15s
-    if muse_thread is not None:
-        muse_thread.join(timeout=15)
-        if muse_thread.is_alive():
-            print("[Muse] WARNING: thread did not exit cleanly within timeout.")
+    if is_final_session:
+        # Terminal stop — shut down all threads and wait for them to exit
+        collector.stop_all_threads()
 
-    if polar_thread is not None:
-        polar_thread.join(timeout=10)
-    if gsr_thread is not None:
-        gsr_thread.join(timeout=10)
-    if arduino_thread is not None:
-        arduino_thread.join(timeout=5)
-        if arduino_thread.is_alive():
-            print("[Arduino] WARNING: thread did not exit cleanly within timeout.")
+        if muse_thread is not None:
+            muse_thread.join(timeout=15)
+            if muse_thread.is_alive():
+                print("[Muse] WARNING: thread did not exit cleanly within timeout.")
+        if polar_thread is not None:
+            polar_thread.join(timeout=10)
+        if gsr_thread is not None:
+            gsr_thread.join(timeout=10)
+        if arduino_thread is not None:
+            arduino_thread.join(timeout=5)
+            if arduino_thread.is_alive():
+                print("[Arduino] WARNING: thread did not exit cleanly within timeout.")
 
-    # Give the Bluetooth stack a moment to fully release the BrainFlow session
-    # before any subsequent prepare_session() call on the next device round.
-    time.sleep(2.0)
+        # Give BLE stack time to fully release before any subsequent use
+        time.sleep(2.0)
+    else:
+        # Pause recording; threads stay alive for the next session
+        collector.end_session(session_id, timeout=5.0)
 
-    window['-STOP-'].update('Saving data...', disabled=True)
-    window.refresh()
+    # Capture session stats for the completion screen before saving
+    start_ts, end_ts = collector.data_store.get_session_slice(session_id)
+    if start_ts is None:
+        start_ts = collector.data_store.session_start
+    session_stats = {
+        'duration_s': (end_ts - start_ts) if end_ts else (time.time() - start_ts),
+        'eeg_count':  sum(1 for s in collector.data_store.eeg_data
+                         if s.timestamp >= start_ts and (end_ts is None or s.timestamp <= end_ts)),
+        'hr_count':   sum(1 for s in collector.data_store.hr_data
+                         if s.timestamp >= start_ts and (end_ts is None or s.timestamp <= end_ts)),
+        'gsr_count':  sum(1 for s in collector.data_store.gsr_data
+                         if s.timestamp >= start_ts and (end_ts is None or s.timestamp <= end_ts)),
+    }
 
-    # Save data
-    collector.save_data(output_path)
+    # Save data for this session only (sliced by session_start/session_end markers)
+    collector.data_store.save_session_data(output_path, session_id)
 
     window.close()
+    return session_stats
 
 
 def show_red_circle_count_screen(device_name: str, actual_count: int) -> Optional[int]:
@@ -958,11 +973,12 @@ def show_completion_screen(sessions: List[Dict], output_base: str) -> None:
     Show experiment completion summary for all three device sessions.
 
     Args:
-        sessions: list of dicts with keys 'device', 'collector', 'output_path', 'tlx_scores'
+        sessions: list of dicts with keys 'device', 'output_path', 'tlx_scores',
+                  and optionally 'eeg_count', 'hr_count', 'gsr_count', 'duration_s'
+                  (populated by show_experiment_screen for display purposes).
         output_base: base output folder path shown to user
     """
     import FreeSimpleGUI as sg
-    from main import SynchronizedDataStore
 
     sg.theme('LightBlue2')
 
@@ -972,19 +988,16 @@ def show_completion_screen(sessions: List[Dict], output_base: str) -> None:
     session_rows = []
     for s in sessions:
         device = s['device']
-        data_store: SynchronizedDataStore = s['data_store']
         tlx: Optional[Dict[str, int]] = s['tlx_scores']
 
-        last_ts = (data_store.eeg_data[-1].timestamp if data_store.eeg_data
-                   else data_store.session_start)
-        total_duration = data_store.get_relative_time(last_ts)
+        total_duration = s.get('duration_s', 0)
         hours = int(total_duration // 3600)
         mins = int((total_duration % 3600) // 60)
         secs = int(total_duration % 60)
 
-        eeg_count = len(data_store.eeg_data)
-        hr_count = len(data_store.hr_data)
-        gsr_count = len(data_store.gsr_data)
+        eeg_count = s.get('eeg_count', 0)
+        hr_count = s.get('hr_count', 0)
+        gsr_count = s.get('gsr_count', 0)
 
         tlx_lines = []
         if tlx:
@@ -1029,13 +1042,16 @@ def show_completion_screen(sessions: List[Dict], output_base: str) -> None:
     window.close()
 
 
-def show_baseline_screen(participant_id: str, session_id: str, data_dir: str = 'data', muse=None) -> bool:
+def show_baseline_screen(participant_id: str, session_id: str, data_dir: str = 'data', muse=None, gsr=None) -> bool:
     """
     Guide the participant through the baseline EEG recording.
 
     Shows instruction + live progress bar for each phase:
       Phase 1 — Eyes Open   (120 s)
       Phase 2 — Eyes Closed  (60 s)
+
+    If gsr is provided, measures a GSR open-circuit baseline before the EEG
+    phases begin and saves it to data/<participant_id>/gsr_baseline.json.
 
     Opens a single Muse 2 connection shared across both phases.
     Saves the two raw CSVs to data/<participant_id>/.
@@ -1160,8 +1176,28 @@ def show_baseline_screen(participant_id: str, session_id: str, data_dir: str = '
         print(f'[baseline] {len(df_holder[0])} samples recorded.')
         return True
 
+    # ── GSR baseline measurement (before EEG phases) ─────────────────────────
+    out_dir = os.path.join(data_dir, participant_id)
+    if gsr is not None:
+        gsr_baseline_path = os.path.join(out_dir, 'gsr_baseline.json')
+        sg.popup_quick_message(
+            'Remove eSense finger clips from skin.\n'
+            'Measuring GSR baseline (4 seconds)…',
+            title='GSR Baseline', font=('Helvetica', 12),
+            auto_close_duration=4)
+        time.sleep(1)  # give user time to remove clips
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            gsr.measure_baseline(duration=4.0, save_path=gsr_baseline_path)
+            sg.popup_quick_message(
+                f'GSR baseline set: {gsr.amplitude_baseline:.5f}\n'
+                'You may now reattach the finger clips.',
+                title='GSR Baseline Done', font=('Helvetica', 12),
+                auto_close_duration=3)
+        except Exception as e:
+            print(f'[GSR] Baseline measurement failed: {e}')
+
     # ── Run both phases ───────────────────────────────────────────────────────
-    out_dir      = os.path.join(data_dir, participant_id)
     eo_csv       = os.path.join(out_dir, f'{session_id}_baseline_eyes_open.csv')
     ec_csv       = os.path.join(out_dir, f'{session_id}_baseline_eyes_closed.csv')
 
@@ -1209,16 +1245,13 @@ def show_baseline_screen(participant_id: str, session_id: str, data_dir: str = '
     return True
 
 
-def show_calibration_screen(gsr=None):
+def show_calibration_screen():
     """
     Show a live EEG calibration screen before baseline recording.
 
     Connects to the Muse 2, displays a real-time scrolling plot of all 4 EEG
     channels (TP9, AF7, AF8, TP10) so the experimenter can verify electrode
     contact quality.
-
-    If gsr is provided, runs a GSR baseline measurement (clips disconnected)
-    after the user clicks 'Proceed to Baseline'.
 
     Returns the live MuseBrainFlowProcessor if the user proceeds (caller must
     stop it), or None if aborted or connection failed.
@@ -1327,24 +1360,6 @@ def show_calibration_screen(gsr=None):
                 break
 
             if event == '-PROCEED-':
-                # ── GSR baseline measurement (if GSR is enabled) ──────────
-                if gsr is not None:
-                    import time as _t
-                    sg.popup_quick_message(
-                        'Remove eSense finger clips from skin.\n'
-                        'Measuring GSR baseline (4 seconds)…',
-                        title='GSR Calibration', font=('Helvetica', 12),
-                        auto_close_duration=3)
-                    _t.sleep(1)  # give user time to remove clips
-                    try:
-                        gsr.measure_baseline(duration=4.0)
-                        sg.popup_quick_message(
-                            f'GSR baseline set: {gsr.amplitude_baseline:.5f}\n'
-                            'You may now reattach the finger clips.',
-                            title='GSR Baseline Done', font=('Helvetica', 12),
-                            auto_close_duration=3)
-                    except Exception as e:
-                        print(f'[GSR] Baseline measurement failed: {e}')
                 result = True
                 break
 
