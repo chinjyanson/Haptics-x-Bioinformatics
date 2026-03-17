@@ -108,6 +108,10 @@ def interpolate_dropouts(df, bad_mask, max_gap_secs=0.5):
 def notch_filter(sig, fs=SAMPLE_RATE, freq=NOTCH_FREQ, Q=NOTCH_Q):
     """Apply zero-phase 2nd-order IIR notch filter."""
     b, a = signal.iirnotch(freq, Q=Q, fs=fs)
+    padlen = 3 * (max(len(a), len(b)) - 1)
+    if len(sig) <= padlen:
+        print(f"[denoising] Signal too short for notch filter ({len(sig)} samples), skipping.")
+        return sig
     return signal.filtfilt(b, a, sig)
 
 
@@ -118,6 +122,11 @@ def wavelet_denoise(sig, wavelet='db4', level=6):
     Soft-threshold wavelet denoising on detail coefficients levels 1-3.
     Approximation and lower detail levels are left unmodified.
     """
+    # pywt requires len > 0; also needs enough samples for the decomposition level
+    min_len = 2 ** level
+    if len(sig) < min_len:
+        print(f"[denoising] Signal too short for wavelet denoising ({len(sig)} samples), skipping.")
+        return sig
     coeffs = pywt.wavedec(sig, wavelet=wavelet, level=level)
     # Robust noise estimate from finest detail (level 1, index -1)
     finest_detail = coeffs[-1]
@@ -155,6 +164,9 @@ def emd_drift_remove(sig, n_imfs=EMD_DRIFT_IMFS):
 
 def bandpass_fir(sig, fs=SAMPLE_RATE, low=ERP_HIGHPASS, high=ERP_LOWPASS):
     """Zero-phase FIR bandpass filter using firwin + filtfilt."""
+    if len(sig) < 30:
+        print(f"[denoising] Signal too short for bandpass ({len(sig)} samples), skipping.")
+        return sig
     # Order: 3 * fs / low_cutoff, but capped so filtfilt padlen < signal length
     # filtfilt padlen = 3 * (order), so max order = len(sig) // 3 - 1
     ideal_order = int(3 * fs / low)
@@ -173,6 +185,9 @@ def bandpass_fir(sig, fs=SAMPLE_RATE, low=ERP_HIGHPASS, high=ERP_LOWPASS):
 
 def savitzky_golay(sig, window=SG_WINDOW, polyorder=SG_POLYORDER):
     """Smooth signal preserving ERP peak morphology."""
+    if len(sig) < window:
+        print(f"[denoising] Signal too short for Savitzky-Golay ({len(sig)} samples), skipping.")
+        return sig
     return signal.savgol_filter(sig, window_length=window, polyorder=polyorder)
 
 

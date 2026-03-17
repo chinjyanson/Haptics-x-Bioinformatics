@@ -155,10 +155,13 @@ void loop() {
         encoderDelta  = 0;
         interrupts();
 
+        // Divide by 4: quadrature ISR fires on all edges (4x per detent)
+        // delta = delta / 4;
+
         if (delta != 0) {
             // Update absolute position
             encoderPosition += delta;
-            
+
             StaticJsonDocument<64> doc;
             doc["type"]     = "encoder";
             doc["delta"]    = delta;

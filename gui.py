@@ -379,22 +379,25 @@ def show_reconnect_screen(collector: 'SynchronizedCollector') -> bool:
                                title='Confirm Abort', font=('Helvetica', 11)) == 'Yes':
                 break
 
-        muse_ready    = (not collector.use_muse)    or collector._muse_ready.is_set()
+        muse_failed   = collector.use_muse and getattr(collector, '_muse_failed', False)
+        muse_ready    = (not collector.use_muse)    or (collector._muse_ready.is_set() and not muse_failed)
         polar_ready   = (not collector.use_polar)   or collector._polar_ready.is_set()
         gsr_ready     = (not collector.use_gsr)     or collector._gsr_ready.is_set()
         arduino_ready = (not collector.use_arduino) or collector._arduino_ready.is_set()
 
-        for key, ready, enabled in [
-            ('-MUSE_S-',    muse_ready,    collector.use_muse),
-            ('-POLAR_S-',   polar_ready,   collector.use_polar),
-            ('-GSR_S-',     gsr_ready,     collector.use_gsr),
-            ('-ARDUINO_S-', arduino_ready, collector.use_arduino),
+        for key, ready, failed, enabled in [
+            ('-MUSE_S-',    muse_ready,  muse_failed,  collector.use_muse),
+            ('-POLAR_S-',   polar_ready, False,         collector.use_polar),
+            ('-GSR_S-',     gsr_ready,   False,         collector.use_gsr),
+            ('-ARDUINO_S-', arduino_ready, False,       collector.use_arduino),
         ]:
             if not enabled:
                 continue  # leave label as 'Disabled'
             elem = window[key]
             if elem is not None:
-                if ready:
+                if failed:
+                    elem.update(value='FAILED - restart', text_color='red')
+                elif ready:
                     elem.update(value='Ready', text_color='green')
                 else:
                     elem.update(value='Connecting...', text_color='orange')
@@ -648,7 +651,9 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
                 _last_arduino_idx += len(new_events)
             for ev in new_events:
                 if ev.event_type == "encoder":
-                    haptics.update_encoder(ev.data.get("delta", 0))
+                    delta = ev.data.get("delta", 0)
+                    haptics.update_encoder(delta)
+                    print(f"[Haptics] encoder delta={delta:+d}  pos={haptics.current_position:+d}  L={haptics._left_gain:.2f}  R={haptics._right_gain:.2f}")
 
         if event == "-NEXT_TASK-":
             # Record error before advancing
@@ -779,6 +784,60 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
     collector.save_data(output_path)
 
     window.close()
+
+
+def show_red_circle_count_screen(device_name: str, actual_count: int) -> Optional[int]:
+    """
+    Ask the participant how many red circles they counted during the oddball task.
+    Also displays the actual number shown (actual_count) after submission.
+    Returns the integer count, or None if skipped.
+    """
+    import FreeSimpleGUI as sg
+
+    sg.theme('LightBlue2')
+
+    layout = [
+        [sg.Text('Oddball Task Check', font=('Helvetica', 18, 'bold'),
+                 justification='center', expand_x=True)],
+        [sg.Text('')],
+        [sg.Text(f'How many RED circles did you count\nduring the {device_name} session?',
+                 font=('Helvetica', 13), justification='center', expand_x=True)],
+        [sg.Text('')],
+        [sg.Text('Enter a number:', font=('Helvetica', 11)),
+         sg.Input(key='-COUNT-', size=(8, 1), font=('Helvetica', 13), justification='center')],
+        [sg.Text('', key='-ERROR-', text_color='red', font=('Helvetica', 10))],
+        [sg.Text('')],
+        [sg.Text(f'Actual red circles shown: {actual_count}', key='-ACTUAL-',
+                 font=('Helvetica', 11), text_color='gray', visible=False)],
+        [sg.Text('')],
+        [sg.Button('Submit', size=(15, 1), font=('Helvetica', 12), key='-SUBMIT-'),
+         sg.Button('Skip', size=(15, 1), font=('Helvetica', 12))]
+    ]
+
+    window = sg.Window(f'Red Circle Count — {device_name}', layout,
+                       element_justification='center', finalize=True,
+                       size=(480, 340), disable_close=True)
+
+    count = None
+    while True:
+        event, values = window.read()
+        if event == 'Skip':
+            break
+        if event == '-SUBMIT-':
+            raw = values['-COUNT-'].strip()
+            if raw.isdigit():
+                count = int(raw)
+                # Reveal actual count and wait for user to dismiss
+                window['-ACTUAL-'].update(visible=True)
+                window['-SUBMIT-'].update(text='Close')
+                window['-ERROR-'].update('')
+            else:
+                window['-ERROR-'].update('Please enter a valid whole number.')
+        if event == 'Close':
+            break
+
+    window.close()
+    return count
 
 
 def show_nasa_tlx_screen(device_name: str) -> Optional[Dict[str, int]]:
@@ -968,6 +1027,375 @@ def show_completion_screen(sessions: List[Dict], output_base: str) -> None:
             break
 
     window.close()
+
+
+def show_baseline_screen(participant_id: str, session_id: str, data_dir: str = 'data', muse=None) -> bool:
+    """
+    Guide the participant through the baseline EEG recording.
+
+    Shows instruction + live progress bar for each phase:
+      Phase 1 — Eyes Open   (120 s)
+      Phase 2 — Eyes Closed  (60 s)
+
+    Opens a single Muse 2 connection shared across both phases.
+    Saves the two raw CSVs to data/<participant_id>/.
+    Returns True on success, False if aborted.
+    """
+    import os
+    import FreeSimpleGUI as sg
+    import baseline as _bl
+
+    EYES_OPEN_S   = _bl.EYES_OPEN_DURATION_S
+    EYES_CLOSED_S = _bl.EYES_CLOSED_DURATION_S
+
+    sg.theme('LightBlue2')
+
+    # ── Connect to Muse (reuse calibration session if provided) ──────────────
+    if muse is None:
+        try:
+            from muse import MuseBrainFlowProcessor
+            muse = MuseBrainFlowProcessor()
+        except Exception as e:
+            sg.popup_error(f'Could not connect to Muse 2:\n{e}',
+                           title='Connection Error', font=('Helvetica', 11))
+            return False
+
+    # ── Inner helper: one recording phase ─────────────────────────────────────
+    def _run_phase(phase_label, instruction_lines, duration_s, out_csv):
+        """
+        Show instructions, 3-2-1 countdown, then record for duration_s seconds.
+        Saves the resulting DataFrame to out_csv.
+        Returns True on success, False if aborted.
+        """
+        inst_rows = [[sg.Text(line, font=('Helvetica', 12),
+                              justification='center', expand_x=True)]
+                     for line in instruction_lines]
+
+        layout = [
+            [sg.Text('Baseline Recording', font=('Helvetica', 20, 'bold'),
+                     justification='center', expand_x=True)],
+            [sg.Text('')],
+            [sg.Text(phase_label, font=('Helvetica', 15, 'bold'),
+                     justification='center', expand_x=True, text_color='#2255aa')],
+            [sg.Text('')],
+            *inst_rows,
+            [sg.Text('')],
+            [sg.Text('Recording in:', key='-LABEL-', font=('Helvetica', 12),
+                     justification='center', expand_x=True)],
+            [sg.Text('3', key='-COUNTDOWN-', font=('Helvetica', 60, 'bold'),
+                     justification='center', expand_x=True, text_color='#cc3300')],
+            [sg.Text('')],
+            [sg.ProgressBar(duration_s, orientation='h', size=(40, 22),
+                            key='-PROGRESS-', bar_color=('#2255aa', 'lightgray'))],
+            [sg.Text('', key='-TIME_LEFT-', font=('Helvetica', 11),
+                     justification='center', expand_x=True)],
+            [sg.Text('')],
+            [sg.Button('Abort', size=(12, 1), font=('Helvetica', 12),
+                       button_color=('white', 'red'), key='-ABORT-')],
+        ]
+
+        win = sg.Window(f'BCI Experiment \u2013 Baseline',
+                        layout, element_justification='center',
+                        finalize=True, size=(520, 500), disable_close=True)
+
+        # 3-2-1 countdown
+        for n in range(3, 0, -1):
+            win['-COUNTDOWN-'].update(str(n))
+            win.refresh()
+            deadline = time.time() + 1.0
+            while time.time() < deadline:
+                event, _ = win.read(timeout=50)
+                if event == '-ABORT-':
+                    if sg.popup_yes_no('Abort baseline recording?',
+                                       title='Confirm Abort',
+                                       font=('Helvetica', 11)) == 'Yes':
+                        win.close()
+                        return False
+
+        win['-COUNTDOWN-'].update('')
+        win['-LABEL-'].update('Recording...')
+        win.refresh()
+
+        # Start recording in background thread
+        df_holder  = [None]
+        done_event = threading.Event()
+
+        def _worker():
+            df_holder[0] = _bl._record_phase(muse, duration_s, phase_label)
+            done_event.set()
+
+        threading.Thread(target=_worker, daemon=True).start()
+        phase_start = time.time()
+
+        # Live progress loop
+        aborted = False
+        while not done_event.is_set():
+            event, _ = win.read(timeout=200)
+            if event == '-ABORT-':
+                if sg.popup_yes_no('Abort baseline recording?\n'
+                                   'Data collected so far will be discarded.',
+                                   title='Confirm Abort',
+                                   font=('Helvetica', 11)) == 'Yes':
+                    aborted = True
+                    break
+
+            elapsed   = min(time.time() - phase_start, duration_s)
+            time_left = max(0, duration_s - elapsed)
+            win['-PROGRESS-'].update(int(elapsed))
+            win['-TIME_LEFT-'].update(f'{int(time_left)}s remaining')
+
+        win['-PROGRESS-'].update(duration_s)
+        win['-TIME_LEFT-'].update('Done.')
+        win.refresh()
+        time.sleep(0.4)
+        win.close()
+
+        if aborted or df_holder[0] is None:
+            return False
+
+        # Save CSV
+        os.makedirs(os.path.join(data_dir, participant_id), exist_ok=True)
+        df_holder[0].to_csv(out_csv, index=False)
+        print(f'[baseline] Saved: {out_csv}')
+        print(f'[baseline] {len(df_holder[0])} samples recorded.')
+        return True
+
+    # ── Run both phases ───────────────────────────────────────────────────────
+    out_dir      = os.path.join(data_dir, participant_id)
+    eo_csv       = os.path.join(out_dir, f'{session_id}_baseline_eyes_open.csv')
+    ec_csv       = os.path.join(out_dir, f'{session_id}_baseline_eyes_closed.csv')
+
+    try:
+        ok = _run_phase(
+            phase_label='Phase 1 \u2014 Eyes Open Rest',
+            instruction_lines=[
+                'Please relax and look straight ahead.',
+                'Do not blink excessively or move your head.',
+                'Remain as still as possible for the full duration.',
+            ],
+            duration_s=EYES_OPEN_S,
+            out_csv=eo_csv,
+        )
+        if not ok:
+            return False
+
+        ok = _run_phase(
+            phase_label='Phase 2 \u2014 Eyes Closed Rest',
+            instruction_lines=[
+                'Please close your eyes and remain completely still.',
+                'Breathe normally and try to relax.',
+            ],
+            duration_s=EYES_CLOSED_S,
+            out_csv=ec_csv,
+        )
+        if not ok:
+            return False
+
+    finally:
+        try:
+            muse.stop()
+        except Exception:
+            pass
+        # Allow BrainFlow's internal BLE teardown to complete before the caller
+        # attempts a new prepare_session().
+        time.sleep(5)
+
+    # ── Completion notice ─────────────────────────────────────────────────────
+    sg.popup('Baseline recording complete!\n\n'
+             'Processing will now begin in the background.\n'
+             'The experiment will start shortly.',
+             title='Baseline Complete', font=('Helvetica', 12),
+             auto_close=True, auto_close_duration=4)
+    return True
+
+
+def show_calibration_screen():
+    """
+    Show a live EEG calibration screen before baseline recording.
+
+    Connects to the Muse 2, displays a real-time scrolling plot of all 4 EEG
+    channels (TP9, AF7, AF8, TP10) so the experimenter can verify electrode
+    contact quality.  The user clicks 'Proceed to Baseline' when satisfied, or
+    'Abort' to cancel.
+
+    Returns the live MuseBrainFlowProcessor if the user proceeds (caller must
+    stop it), or None if aborted or connection failed.  Keeping the session
+    open avoids a BrainFlow BLE teardown/reconnect cycle between calibration
+    and baseline.
+    """
+    import FreeSimpleGUI as sg
+    import numpy as np
+    import matplotlib
+    matplotlib.use('Agg')  # off-screen renderer — avoids Tk/Qt conflicts
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    import io
+
+    CHANNELS      = ['TP9', 'AF7', 'AF8', 'TP10']
+    WINDOW_S      = 5        # seconds of EEG shown at once
+    SAMPLING_RATE = 256      # Hz (Muse 2 default)
+    WIN_SAMPLES   = WINDOW_S * SAMPLING_RATE
+    REFRESH_MS    = 100      # GUI poll / redraw interval (10 Hz)
+    CANVAS_W, CANVAS_H = 800, 500
+
+    sg.theme('LightBlue2')
+
+    # ── Connect to Muse ───────────────────────────────────────────────────────
+    try:
+        from muse import MuseBrainFlowProcessor
+        muse = MuseBrainFlowProcessor()
+    except Exception as e:
+        sg.popup_error(f'Could not connect to Muse 2:\n{e}',
+                       title='Connection Error', font=('Helvetica', 11))
+        return False
+
+    # ── Rolling buffer (4 channels × WIN_SAMPLES) ────────────────────────────
+    buf = np.full((4, WIN_SAMPLES), np.nan)
+
+    # ── Build figure once; update data in place ───────────────────────────────
+    fig = plt.Figure(figsize=(CANVAS_W / 100, CANVAS_H / 100), dpi=100,
+                     facecolor='#f0f4ff')
+    gs  = gridspec.GridSpec(4, 1, figure=fig, hspace=0.55)
+    axes   = [fig.add_subplot(gs[i]) for i in range(4)]
+    lines  = []
+    t_axis = np.linspace(-WINDOW_S, 0, WIN_SAMPLES)
+
+    COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+    for ax, ch, col in zip(axes, CHANNELS, COLORS):
+        (ln,) = ax.plot(t_axis, np.zeros(WIN_SAMPLES), color=col, lw=0.8)
+        ax.set_ylabel(ch, fontsize=8, rotation=0, labelpad=28)
+        ax.set_xlim(-WINDOW_S, 0)
+        ax.set_ylim(-200, 200)
+        ax.axhline(0, color='gray', lw=0.5, ls='--')
+        ax.tick_params(labelsize=7)
+        ax.grid(True, alpha=0.3)
+        lines.append(ln)
+
+    axes[-1].set_xlabel('Time (s)', fontsize=8)
+    fig.suptitle('Live EEG — Check Electrode Contact', fontsize=11,
+                 fontweight='bold', color='#2255aa')
+
+    def _render_frame() -> bytes:
+        """Render the figure to a PNG byte-string for sg.Image."""
+        canvas_agg = FigureCanvasAgg(fig)
+        canvas_agg.draw()
+        buf_io = io.BytesIO()
+        fig.savefig(buf_io, format='png', bbox_inches='tight', dpi=100)
+        buf_io.seek(0)
+        return buf_io.read()
+
+    # Initial render
+    initial_img = _render_frame()
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+    layout = [
+        [sg.Text('EEG Calibration', font=('Helvetica', 20, 'bold'),
+                 justification='center', expand_x=True)],
+        [sg.Text(
+            'Verify that all electrodes show a clean signal before proceeding.\n'
+            'Adjust headband fit if any channel shows flat or noisy data.',
+            font=('Helvetica', 11), justification='center', expand_x=True)],
+        [sg.Text('')],
+        [sg.Image(data=initial_img, key='-EEG_PLOT-',
+                  size=(CANVAS_W, CANVAS_H))],
+        [sg.Text('')],
+        [sg.Text('Signal quality:  ', font=('Helvetica', 11)),
+         sg.Text('Waiting for data…', key='-QUALITY-',
+                 font=('Helvetica', 11, 'bold'), text_color='gray')],
+        [sg.Text('')],
+        [sg.Button('Proceed to Baseline', size=(20, 1),
+                   font=('Helvetica', 12), button_color=('white', '#2255aa'),
+                   key='-PROCEED-'),
+         sg.Button('Abort', size=(12, 1), font=('Helvetica', 12),
+                   button_color=('white', 'red'), key='-ABORT-')],
+    ]
+
+    window = sg.Window('BCI Experiment – EEG Calibration', layout,
+                       element_justification='center',
+                       finalize=True, resizable=False)
+
+    result = False
+    sample_count = 0
+
+    try:
+        while True:
+            event, _ = window.read(timeout=REFRESH_MS)
+
+            if event in (sg.WIN_CLOSED, '-ABORT-'):
+                result = False
+                break
+
+            if event == '-PROCEED-':
+                result = True
+                break
+
+            # ── Pull new samples from Muse ────────────────────────────────
+            eeg, _ = muse.get_data()
+            if eeg is not None and eeg.shape[1] > 0:
+                n = eeg.shape[1]
+                sample_count += n
+                # Roll the buffer left and append new samples
+                buf = np.roll(buf, -n, axis=1)
+                buf[:, -n:] = eeg[:, :n]
+
+                # Apply 50 Hz notch filter to the full buffer for display
+                valid_cols = np.where(~np.isnan(buf[0]))[0]
+                if len(valid_cols) >= SAMPLING_RATE:
+                    display_buf = muse._apply_notch(buf)
+                else:
+                    display_buf = buf
+
+                # Update plot lines
+                for i, ln in enumerate(lines):
+                    channel_data = display_buf[i]
+                    ln.set_ydata(channel_data)
+                    # Auto-scale y axis based on recent valid data
+                    valid = channel_data[~np.isnan(channel_data)]
+                    if len(valid) > 10:
+                        vmin, vmax = np.percentile(valid, [2, 98])
+                        margin = max(20, (vmax - vmin) * 0.2)
+                        axes[i].set_ylim(vmin - margin, vmax + margin)
+
+                # Compute a simple signal quality metric: RMS of last 256 samples
+                recent = display_buf[:, -SAMPLING_RATE:]
+                valid_mask = ~np.isnan(recent)
+                rms_vals = []
+                for ch_idx in range(4):
+                    ch_data = recent[ch_idx, valid_mask[ch_idx]]
+                    if len(ch_data) > 10:
+                        rms_vals.append(float(np.sqrt(np.mean(ch_data ** 2))))
+
+                if rms_vals:
+                    avg_rms = np.mean(rms_vals)
+                    if avg_rms < 5:
+                        quality_text  = 'Flat / disconnected'
+                        quality_color = 'red'
+                    elif avg_rms < 30:
+                        quality_text  = 'Good'
+                        quality_color = 'green'
+                    else:
+                        quality_text  = 'Noisy — adjust headband'
+                        quality_color = 'orange'
+                    window['-QUALITY-'].update(quality_text,
+                                               text_color=quality_color)
+
+                # Re-render and push to the GUI image element
+                png_bytes = _render_frame()
+                window['-EEG_PLOT-'].update(data=png_bytes)
+
+    finally:
+        window.close()
+        if not result:
+            # Aborted — stop the session now
+            try:
+                muse.stop()
+            except Exception:
+                pass
+
+    # On success return the live muse object so the caller can hand it
+    # directly to show_baseline_screen() without a reconnect.
+    return muse if result else None
 
 
 def show_error_popup(message: str) -> None:

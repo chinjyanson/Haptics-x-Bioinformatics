@@ -33,12 +33,16 @@ USE_POLAR   = False
 USE_GSR     = False
 USE_ARDUINO = True
 
+# ── Baseline recording flag — set to False to skip baseline at session start ──
+RUN_BASELINE = True
+
 from haptics import HapticsController, load_haptic_targets
+import baseline
 from gui import (
     show_participant_screen, show_connection_screen, show_consent_screen,
     show_reconnect_screen, show_countdown_screen, show_experiment_screen,
-    show_nasa_tlx_screen, show_device_swap_screen, show_completion_screen,
-    show_error_popup,
+    show_red_circle_count_screen, show_nasa_tlx_screen, show_device_swap_screen, show_completion_screen,
+    show_error_popup, show_baseline_screen, show_calibration_screen,
 )
 
 @dataclass
@@ -367,6 +371,7 @@ class SynchronizedCollector:
 
         # Synchronization flags for simultaneous start
         self._muse_ready    = threading.Event()
+        self._muse_failed   = False   # True when connection exhausted all retries
         self._polar_ready   = threading.Event()
         self._gsr_ready     = threading.Event()
         self._start_recording = threading.Event()  # Signal to start actual recording
@@ -533,14 +538,57 @@ class SynchronizedCollector:
         try:
             # Only create new connection if not already connected
             if not self.muse_connected or self.muse is None:
-                print("[Muse] Initializing connection...")
-                self.muse = MuseBrainFlowProcessor(
-                    buffer_duration=self.buffer_duration,
-                    serial_port=self.muse_serial_port,
-                    mac_address=self.muse_mac_address
-                )
-                self.muse_connected = True
-                self.data_store.muse_sampling_rate = self.muse.sampling_rate
+                # Retry loop — BrainFlow's BLE stack can take 10-15s to fully
+                # release after a previous session (e.g. post-baseline). We wait
+                # BEFORE each attempt so the stack has time to settle.
+                max_attempts  = 6
+                initial_delay = 15.0  # seconds before first attempt
+                retry_delay   = 8.0   # seconds between subsequent attempts
+                last_err = None
+
+                print(f"[Muse] Waiting {initial_delay:.0f}s for BLE stack to settle...")
+                for i in range(int(initial_delay)):
+                    if self._stop_event.is_set():
+                        return
+                    time.sleep(1)
+
+                for attempt in range(1, max_attempts + 1):
+                    if self._stop_event.is_set():
+                        return
+                    try:
+                        print(f"[Muse] Connecting (attempt {attempt}/{max_attempts})...")
+                        self.muse = MuseBrainFlowProcessor(
+                            buffer_duration=self.buffer_duration,
+                            serial_port=self.muse_serial_port,
+                            mac_address=self.muse_mac_address
+                        )
+                        # Verify the stream is alive before declaring success
+                        time.sleep(1.0)
+                        self.muse.get_data()
+                        self.muse_connected = True
+                        self.data_store.muse_sampling_rate = self.muse.sampling_rate
+                        last_err = None
+                        print(f"[Muse] Connection verified on attempt {attempt}.")
+                        break
+                    except Exception as e:
+                        last_err = e
+                        print(f"[Muse] Connection attempt {attempt} failed: {e}")
+                        # Clean up any partial board state before retrying
+                        if self.muse is not None:
+                            try:
+                                self.muse.stop()
+                            except Exception:
+                                pass
+                            self.muse = None
+                        if attempt < max_attempts:
+                            print(f"[Muse] Retrying in {retry_delay}s...")
+                            for i in range(int(retry_delay)):
+                                if self._stop_event.is_set():
+                                    return
+                                time.sleep(1)
+                if last_err is not None:
+                    self._muse_failed = True
+                    raise last_err
             else:
                 print("[Muse] Using existing connection...")
 
@@ -986,11 +1034,12 @@ def _reset_data_store(collector: SynchronizedCollector) -> None:
     collector.data_store = SynchronizedDataStore()
     collector._stop_event.clear()
     collector._muse_ready.clear()
+    collector._muse_failed = False
     collector._polar_ready.clear()
     collector._gsr_ready.clear()
     collector._start_recording.clear()
     if collector.arduino is not None:
-        collector.arduino.data_store = collector.data_store
+        collector.arduino._data_store = collector.data_store
 
 
 def start_collection_threads(collector: SynchronizedCollector):
@@ -1204,8 +1253,53 @@ def main():
                 collector.disconnect_devices()
                 return
 
+            # Step 4: Baseline recording (skipped if RUN_BASELINE = False).
+            session_id = f"session_{session_timestamp}"
+            if RUN_BASELINE:
+                # Release the existing Muse session so the calibration/baseline
+                # screens can open their own fresh connections.
+                if collector.muse is not None:
+                    try:
+                        collector.muse.stop()
+                    except Exception:
+                        pass
+                    collector.muse = None
+                    collector.muse_connected = False
+
+                # Step 4a: EEG calibration — live signal check before baseline.
+                calib_muse = show_calibration_screen()
+                if calib_muse is None:
+                    print("Experiment cancelled at EEG calibration.")
+                    collector.disconnect_devices()
+                    return
+
+                # Pass the live muse session into baseline to avoid reconnect.
+                if not show_baseline_screen(
+                    participant_id=participant_id,
+                    session_id=session_id,
+                    data_dir='data',
+                    muse=calib_muse,
+                ):
+                    print("Experiment cancelled at baseline recording.")
+                    collector.disconnect_devices()
+                    return
+
+                baseline.preprocess_baseline(
+                    participant_id=participant_id,
+                    session_id=session_id,
+                    data_dir='data',
+                    out_dir='data',
+                )
+                baseline.extract_baseline_features(
+                    participant_id=participant_id,
+                    session_id=session_id,
+                    out_dir='data',
+                )
+
             # Run three device sessions
             completed_sessions = []
+
+            # The Muse collection thread handles its own BLE settle delay internally.
 
             # Pre-start threads for the first session.
             _reset_data_store(collector)
@@ -1259,28 +1353,51 @@ def main():
                     haptic_targets=session_targets,
                 )
 
+                # Red circle count (attention check for oddball task)
+                actual_red_count = sum(
+                    1 for m in collector.data_store.task_markers
+                    if m.event == "oddball_onset"
+                )
+                red_count = show_red_circle_count_screen(device_name, actual_red_count)
+                if red_count is None:
+                    print(f"Red circle count skipped for {device_name}.")
+
                 # NASA TLX for this device
                 tlx_scores = show_nasa_tlx_screen(device_name)
                 if tlx_scores is None:
                     print(f"NASA TLX skipped for {device_name}.")
 
-                # Save TLX scores alongside sensor data
+                # Save TLX scores (and red circle count) alongside sensor data
                 if tlx_scores:
                     tlx_path = f"{output_path}_nasa_tlx.json"
                     with open(tlx_path, 'w') as f:
                         json.dump({
                             'device': device_name,
                             'participant_id': participant_id,
+                            'red_circle_count': red_count,
+                            'actual_red_circle_count': actual_red_count,
                             'scores': tlx_scores,
                             'average': sum(tlx_scores.values()) / len(tlx_scores)
                         }, f, indent=2)
                     print(f"NASA TLX scores saved to {tlx_path}")
+                elif red_count is not None:
+                    count_path = f"{output_path}_red_circle_count.json"
+                    with open(count_path, 'w') as f:
+                        json.dump({
+                            'device': device_name,
+                            'participant_id': participant_id,
+                            'red_circle_count': red_count,
+                            'actual_red_circle_count': actual_red_count,
+                        }, f, indent=2)
+                    print(f"Red circle count saved to {count_path}")
 
                 completed_sessions.append({
                     'device': device_name,
                     'data_store': collector.data_store,  # snapshot before reset
                     'output_path': output_path,
                     'tlx_scores': tlx_scores,
+                    'red_circle_count': red_count,
+                    'actual_red_circle_count': actual_red_count,
                 })
 
                 # Device swap screen (not shown after the last session)
