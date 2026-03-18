@@ -7,7 +7,7 @@ during experiment sessions, guided by rotary encoder position vs. target.
 Session modes
 -------------
   "auditory"      — stereo-panned 440 Hz sine tone via USB-C audio output
-                    left channel louder → turn CCW; right → turn CW
+                    left channel louder → turn CW (away from sound); right → turn CCW (away from sound)
   "vibrations"    — motor 1 = CCW cue, motor 2 = CW cue (PWM intensity ∝ error)
   "shape_changing" — encoder tracking + task-error markers only;
                     servo motor integration is a future stub
@@ -161,12 +161,12 @@ class HapticsController:
                 self._right_gain = 0.0
             return
         volume = min(abs(error) / HAPTIC_MAX_ERROR, 1.0)
-        # error < 0 → need to go CW  → left channel only
-        # error > 0 → need to go CCW → right channel only
+        # error < 0 → need to go CW  → right channel (turn away from left sound)
+        # error > 0 → need to go CCW → left channel (turn away from right sound)
         if error < 0:
-            left, right = volume, 0.0
-        else:
             left, right = 0.0, volume
+        else:
+            left, right = volume, 0.0
         with self._audio_lock:
             self._left_gain  = left
             self._right_gain = right
