@@ -13,10 +13,8 @@ Usage:
 import sys
 import os
 import json
-import math
 import warnings
 import glob as _glob
-from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -47,11 +45,7 @@ TASK_EPOCH_POST_MS = 2000
 MORLET_FREQS  = np.linspace(1, 45, 100)
 MORLET_CYCLES = 6
 
-DFA_MIN_SCALE       = 16
-DFA_MAX_SCALE_RATIO = 0.1
 
-PERMEN_ORDER = 3
-PERMEN_TAU   = 1
 
 MULTITAPER_NW = 4
 
@@ -76,6 +70,32 @@ CHANNEL_PAIRS = [
 ]
 
 _ALL_WITH_POOL = ALL_CHANNELS + ['TP_pool', 'AF_pool']
+
+DEVICE_SLUGS = ['auditory', 'vibrations', 'shape_changing']
+DEVICE_PRETTY = {
+    'auditory':       'Auditory',
+    'vibrations':     'Vibrations',
+    'shape_changing': 'Shape Changing',
+}
+DEVICE_COLORS = {
+    'auditory':       'steelblue',
+    'vibrations':     'coral',
+    'shape_changing': 'mediumseagreen',
+}
+
+
+def _infer_device_slug(basename):
+    """Infer device slug from a session basename (handles shape_changing underscore)."""
+    for slug in DEVICE_SLUGS:
+        if basename.endswith(f'_{slug}'):
+            return slug
+    return None
+
+
+def _devices_present(session_results):
+    """Return list of (slug, pretty_label, color, result) in canonical device order."""
+    return [(s, DEVICE_PRETTY[s], DEVICE_COLORS[s], session_results[s])
+            for s in DEVICE_SLUGS if s in session_results]
 
 
 # ── A0: Data Loading and Channel Pooling ─────────────────────────────────────
@@ -335,135 +355,39 @@ def _ch_idx(ch):
     return _ALL_WITH_POOL.index(ch)
 
 
-def plot_erp(odd_epochs, std_epochs, out_prefix=''):
-    if not odd_epochs or not std_epochs:
-        print("[analysis] WARNING: Skipping ERP plot (no epochs).")
-        return
 
-    time_ms = odd_epochs[0]['time_ms']
-    odd_erp, odd_sem = average_epochs(odd_epochs)
-    std_erp, std_sem = average_epochs(std_epochs)
-    diff_erp = odd_erp - std_erp
-
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    panel_specs = [
-        ('TP_pool', 'P300 channel (TP_pool)', 250, 600, 'pos', axes[0]),
-        ('AF_pool', 'N200 channel (AF_pool)', 150, 300, 'neg', axes[1]),
-    ]
-    for ch, title, ps, pe, pol, ax in panel_specs:
-        ci  = _ch_idx(ch)
-        odd = odd_erp[:, ci]
-        std = std_erp[:, ci]
-        dif = diff_erp[:, ci]
-        ax.axvline(0, color='k', lw=0.8, linestyle='--')
-        ax.plot(time_ms, odd, color='steelblue', lw=1.5, label='Oddball')
-        ax.fill_between(time_ms, odd - odd_sem[:, ci], odd + odd_sem[:, ci],
-                        alpha=0.2, color='steelblue')
-        ax.plot(time_ms, std, color='coral', lw=1.5, label='Standard')
-        ax.fill_between(time_ms, std - std_sem[:, ci], std + std_sem[:, ci],
-                        alpha=0.2, color='coral')
-        ax.plot(time_ms, dif, color='darkgreen', lw=1.2, linestyle='--', label='Difference')
-        pt, pa = find_peak(odd, time_ms, ps, pe, polarity=pol)
-        label = 'P300' if pol == 'pos' else 'N200'
-        ax.annotate(f'{label}\n{pt:.0f}ms', xy=(pt, pa),
-                    xytext=(pt + 60, pa + (3 if pol == 'pos' else -3)),
-                    arrowprops=dict(arrowstyle='->', color='navy'), fontsize=8)
-        ax.invert_yaxis()
-        ax.set_xlabel('Time (ms)')
-        ax.set_ylabel('Amplitude (µV)')
-        ax.set_title(title)
-        ax.legend(fontsize=8)
-        ax.set_xlim(-EPOCH_PRE_MS, EPOCH_POST_MS)
-
-    ax3 = axes[2]
-    for ch, color in [('TP_pool', 'steelblue'), ('AF_pool', 'coral')]:
-        ci = _ch_idx(ch)
-        ax3.plot(time_ms, diff_erp[:, ci], color=color, lw=1.5, label=ch)
-    ax3.axvline(0, color='k', lw=0.8, linestyle='--')
-    ax3.axhline(0, color='gray', lw=0.5)
-    ax3.invert_yaxis()
-    ax3.set_xlabel('Time (ms)')
-    ax3.set_ylabel('Amplitude (µV)')
-    ax3.set_title('Difference Waveform (Oddball − Standard)')
-    ax3.legend(fontsize=8)
-    ax3.set_xlim(-EPOCH_PRE_MS, EPOCH_POST_MS)
-
-    plt.tight_layout()
-    fname = f"{out_prefix}plot1_erp_grand_average.png"
-    plt.savefig(fname, dpi=150)
-    plt.close()
-    print(f"[analysis] Saved {fname}")
-
-
-def plot_epoch_heatmap(odd_epochs, out_prefix=''):
-    if not odd_epochs:
-        return
-    ci      = _ch_idx('TP_pool')
-    time_ms = odd_epochs[0]['time_ms']
-    stack   = np.stack([ep['data'][:, ci] for ep in odd_epochs], axis=0)
-    fig, ax = plt.subplots(figsize=(10, 6))
-    vmax = np.percentile(np.abs(stack), 95)
-    im   = ax.imshow(stack, aspect='auto', origin='lower',
-                     extent=[time_ms[0], time_ms[-1], 0, len(odd_epochs)],
-                     cmap='RdBu_r', vmin=-vmax, vmax=vmax)
-    ax.axvline(0, color='k', lw=1, linestyle='--')
-    plt.colorbar(im, ax=ax, label='Amplitude (µV)')
-    ax.set_xlabel('Time (ms)')
-    ax.set_ylabel('Trial')
-    ax.set_title('Single-trial Oddball Epochs — TP_pool')
-    plt.tight_layout()
-    fname = f"{out_prefix}plot2_epoch_heatmap.png"
-    plt.savefig(fname, dpi=150)
-    plt.close()
-    print(f"[analysis] Saved {fname}")
-
-
-def plot_rejection_summary(counts, out_prefix=''):
-    labels   = ['bad_seg', 'overlap', 'amplitude', 'kurtosis']
-    odd_vals = [counts.get('odd_bad_seg', 0), counts.get('odd_overlap', 0),
-                counts.get('odd_amplitude', 0), counts.get('odd_kurtosis', 0)]
-    std_vals = [counts.get('std_bad_seg', 0), counts.get('std_overlap', 0),
-                counts.get('std_amplitude', 0), counts.get('std_kurtosis', 0)]
-    x = np.arange(len(labels))
-    w = 0.35
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.bar(x - w/2, odd_vals, w, label='Oddball',  color='steelblue')
-    ax.bar(x + w/2, std_vals, w, label='Standard', color='coral')
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels)
-    ax.set_ylabel('Epochs rejected')
-    ax.set_title('Epoch Rejection Summary')
-    ax.legend()
-    plt.tight_layout()
-    fname = f"{out_prefix}plot3_rejection_summary.png"
-    plt.savefig(fname, dpi=150)
-    plt.close()
-    print(f"[analysis] Saved {fname}")
 
 
 def plot_task_onset_erp(task_epochs, out_prefix=''):
     if not task_epochs:
         print("[analysis] WARNING: Skipping task-onset ERP (no epochs).")
         return
-    time_ms  = task_epochs[0]['time_ms']
+    time_ms    = task_epochs[0]['time_ms']
     grand, sem = average_epochs(task_epochs)
-    ci       = _ch_idx('AF_pool')
-    erp      = grand[:, ci]
-    n200_t, n200_a = find_peak(erp, time_ms, 150, 350, polarity='neg')
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.axvline(0, color='k', lw=0.8, linestyle='--', label='Task onset')
-    ax.plot(time_ms, erp, color='steelblue', lw=1.5, label='AF_pool')
-    ax.fill_between(time_ms, erp - sem[:, ci], erp + sem[:, ci],
-                    alpha=0.2, color='steelblue')
-    ax.annotate(f'N200\n{n200_t:.0f}ms\n{n200_a:.1f}µV', xy=(n200_t, n200_a),
-                xytext=(n200_t + 100, n200_a - 3),
-                arrowprops=dict(arrowstyle='->', color='tomato'), fontsize=8)
-    ax.invert_yaxis()
-    ax.set_xlabel('Time (ms)')
-    ax.set_ylabel('Amplitude (µV)')
-    ax.set_title('Task-Onset ERP — AF_pool')
-    ax.legend(fontsize=8)
+    channels = [
+        ('TP_pool', 'steelblue',  250, 600, 'pos', 'P300'),
+        ('AF_pool', 'darkorange', 150, 350, 'neg', 'N200'),
+    ]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=False)
+    for ax, (ch, color, t0, t1, pol, label) in zip(axes, channels):
+        ci  = _ch_idx(ch)
+        erp = grand[:, ci]
+        t_pk, a_pk = find_peak(erp, time_ms, t0, t1, polarity=pol)
+        ax.axvline(0, color='k', lw=0.8, linestyle='--', label='Task onset')
+        ax.plot(time_ms, erp, color=color, lw=1.5, label=ch)
+        ax.fill_between(time_ms, erp - sem[:, ci], erp + sem[:, ci],
+                        alpha=0.2, color=color)
+        ax.annotate(f'{label}\n{t_pk:.0f}ms\n{a_pk:.1f}µV', xy=(t_pk, a_pk),
+                    xytext=(t_pk + 100, a_pk + (3 if pol == 'neg' else -3)),
+                    arrowprops=dict(arrowstyle='->', color='tomato'), fontsize=8)
+        ax.invert_yaxis()
+        ax.set_xlabel('Time (ms)')
+        ax.set_ylabel('Amplitude (µV)')
+        ax.set_title(f'Task-Onset ERP — {ch}')
+        ax.legend(fontsize=8)
+
     plt.tight_layout()
     fname = f"{out_prefix}plot_task_onset_erp.png"
     plt.savefig(fname, dpi=150)
@@ -471,55 +395,11 @@ def plot_task_onset_erp(task_epochs, out_prefix=''):
     print(f"[analysis] Saved {fname}")
 
 
-def plot_p300_by_condition(odd_epochs, task_intervals, out_prefix=''):
-    if not odd_epochs:
-        print("[analysis] WARNING: Skipping P300 by condition (no epochs).")
-        return {}
-    time_ms = odd_epochs[0]['time_ms']
-    ci      = _ch_idx('TP_pool')
-    mask    = (time_ms >= 250) & (time_ms <= 600)
-    results = {}
-    for ep in odd_epochs:
-        cond     = get_condition_at_time(ep['trigger_time'], task_intervals)
-        win      = ep['data'][mask, ci]
-        results.setdefault(cond, {'mean': [], 'peak': []})
-        results[cond]['mean'].append(float(win.mean()))
-        results[cond]['peak'].append(float(win.max()))
-
-    if not results:
-        return {}
-    conditions = sorted(results.keys())
-    means_m = [np.mean(results[c]['mean']) for c in conditions]
-    sems_m  = [np.std(results[c]['mean']) / np.sqrt(len(results[c]['mean'])) for c in conditions]
-    means_p = [np.mean(results[c]['peak']) for c in conditions]
-    x = np.arange(len(conditions))
-    w = 0.35
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.bar(x - w/2, means_m, w, yerr=sems_m, capsize=4,
-           label='Mean 250–600ms', color='steelblue', alpha=0.8)
-    ax.bar(x + w/2, means_p, w, label='Peak amp', color='coral', alpha=0.8)
-    rng = np.random.default_rng(0)
-    for i, c in enumerate(conditions):
-        yv = results[c]['mean']
-        ax.scatter(rng.uniform(x[i] - w/2 - 0.05, x[i] - w/2 + 0.05, len(yv)),
-                   yv, color='navy', s=12, alpha=0.6, zorder=3)
-    ax.set_xticks(x)
-    ax.set_xticklabels(conditions, rotation=15, ha='right')
-    ax.set_ylabel('Amplitude (µV)')
-    ax.set_title('P300 Amplitude by Condition (TP_pool)')
-    ax.axhline(0, color='k', lw=0.5)
-    ax.legend(fontsize=8)
-    plt.tight_layout()
-    fname = f"{out_prefix}plot8_p300_by_condition.png"
-    plt.savefig(fname, dpi=150)
-    plt.close()
-    print(f"[analysis] Saved {fname}")
-    return {c: np.mean(results[c]['mean']) for c in conditions}
 
 
-# ── A3: ERSP / ITPC ──────────────────────────────────────────────────────────
+# ── A4: ERD/ERS ──────────────────────────────────────────────────────────────
 
-def morlet_wavelet_transform(sig, fs, freqs, n_cycles=MORLET_CYCLES):
+def morlet_wavelet_transform(sig, fs, freqs, n_cycles=MORLET_CYCLES):  # used by _compare_tfr_diff
     """Returns complex analytic signal: shape (n_freqs, n_times)."""
     n       = len(sig)
     sig_fft = np.fft.fft(sig, n=n)
@@ -539,6 +419,8 @@ def morlet_wavelet_transform(sig, fs, freqs, n_cycles=MORLET_CYCLES):
         result[fi, :] = np.fft.ifft(sig_fft * wav_fft)
 
     return result
+
+
 
 
 def compute_ersp(epochs_data, fs, freqs, time_ms,
@@ -604,21 +486,24 @@ def plot_ersp_itpc(ersp, itpc, freqs, time_ms, epochs_data,
     print(f"[analysis] Saved {fname}")
 
 
-def run_ersp_itpc_analysis(odd_epochs, std_epochs, out_prefix=''):
-    if not odd_epochs:
-        print("[analysis] WARNING: Skipping ERSP/ITPC (no epochs).")
-        return
+def run_ersp_itpc_analysis(task_onset_epochs, out_prefix=''):
+    """Compute and plot ERSP/ITPC pooled across all task-onset epochs."""
+    if not task_onset_epochs:
+        print("[analysis] WARNING: Skipping ERSP/ITPC (no task-onset epochs).")
+        return {}
     print("\n[analysis] --- ERSP / ITPC ---")
-    time_ms = odd_epochs[0]['time_ms']
+    time_ms = task_onset_epochs[0]['time_ms']
+    ersp_itpc_cache = {}
+
     for ch in ['TP_pool', 'AF_pool']:
         ci = _ch_idx(ch)
-        for label, epochs in [('oddball', odd_epochs), ('standard', std_epochs)]:
-            if not epochs:
-                continue
-            data = np.stack([ep['data'][:, ci] for ep in epochs], axis=0)
-            ersp, fq, tm = compute_ersp(data, SAMPLE_RATE, MORLET_FREQS, time_ms)
-            itpc, fq, tm = compute_itpc(data, SAMPLE_RATE, MORLET_FREQS, time_ms)
-            plot_ersp_itpc(ersp, itpc, fq, tm, data, ch, label, out_prefix)
+        data = np.stack([ep['data'][:, ci] for ep in task_onset_epochs], axis=0)
+        ersp, fq, tm = compute_ersp(data, SAMPLE_RATE, MORLET_FREQS, time_ms)
+        itpc, fq, tm = compute_itpc(data, SAMPLE_RATE, MORLET_FREQS, time_ms)
+        plot_ersp_itpc(ersp, itpc, fq, tm, data, ch, 'all_tasks', out_prefix)
+        ersp_itpc_cache[(ch, 'all_tasks')] = {'ersp': ersp, 'itpc': itpc,
+                                               'freqs': fq, 'time_ms': tm}
+    return ersp_itpc_cache
 
 
 # ── A4: ERD/ERS ──────────────────────────────────────────────────────────────
@@ -709,6 +594,7 @@ def run_erd_ers_analysis(task_epochs, baseline_features, out_prefix=''):
     print("\n[analysis] --- ERD/ERS ---")
     erd_data, time_axis = compute_erd_ers(task_epochs, SAMPLE_RATE, baseline_features)
     plot_erd_ers(erd_data, time_axis, out_prefix)
+    return erd_data, time_axis
 
 
 # ── A5: PSD Analysis ─────────────────────────────────────────────────────────
@@ -767,21 +653,6 @@ def compute_theta_alpha_ratio(band_df):
     return bd
 
 
-def compute_faa(band_df):
-    rows = []
-    for cond in band_df['condition'].unique():
-        cd  = band_df[band_df['condition'] == cond]
-        af7 = cd[cd['channel'] == 'AF7']
-        af8 = cd[cd['channel'] == 'AF8']
-        if af7.empty or af8.empty:
-            rows.append({'condition': cond, 'FAA': np.nan})
-            continue
-        a7 = af7['Alpha_abs'].values[0]
-        a8 = af8['Alpha_abs'].values[0]
-        rows.append({'condition': cond,
-                     'FAA': np.log(a8) - np.log(a7) if (a7 > 0 and a8 > 0) else np.nan})
-    return pd.DataFrame(rows)
-
 
 def run_psd_analysis(condition_segments, baseline_features, out_prefix=''):
     print("\n[analysis] --- PSD Analysis (multitaper) ---")
@@ -818,7 +689,6 @@ def run_psd_analysis(condition_segments, baseline_features, out_prefix=''):
 
     band_df = extract_band_power(psds, baseline_features)
     band_df = compute_theta_alpha_ratio(band_df)
-    faa_df  = compute_faa(band_df)
 
     csv_path = f"{out_prefix}band_power_summary.csv"
     band_df.to_csv(csv_path, index=False)
@@ -827,8 +697,7 @@ def run_psd_analysis(condition_segments, baseline_features, out_prefix=''):
     _plot_psd(psds, out_prefix)
     _plot_band_power(band_df, out_prefix)
     _plot_theta_alpha(band_df, out_prefix)
-    _plot_faa(faa_df, out_prefix)
-    return psds, band_df, faa_df
+    return psds, band_df
 
 
 def _plot_psd(psds, out_prefix):
@@ -919,23 +788,6 @@ def _plot_theta_alpha(band_df, out_prefix):
     print(f"[analysis] Saved {fname}")
 
 
-def _plot_faa(faa_df, out_prefix):
-    if faa_df.empty:
-        return
-    fig, ax = plt.subplots(figsize=(8, 5))
-    x = np.arange(len(faa_df))
-    ax.bar(x, faa_df['FAA'].fillna(0).tolist(), color='mediumpurple', alpha=0.8)
-    ax.axhline(0, color='k', lw=0.8, linestyle='--')
-    ax.set_xticks(x)
-    ax.set_xticklabels(faa_df['condition'].tolist(), rotation=15, ha='right')
-    ax.set_ylabel('FAA (log AF8α − log AF7α)')
-    ax.set_title('Frontal Alpha Asymmetry by Condition')
-    plt.tight_layout()
-    fname = f"{out_prefix}plot9_faa.png"
-    plt.savefig(fname, dpi=150)
-    plt.close()
-    print(f"[analysis] Saved {fname}")
-
 
 def plot_spectrogram(psd_df, task_intervals, out_prefix=''):
     for ch in ALL_CHANNELS:
@@ -979,288 +831,27 @@ def plot_spectrogram(psd_df, task_intervals, out_prefix=''):
         print(f"[analysis] Saved {fname}")
 
 
-# ── A6: Connectivity ─────────────────────────────────────────────────────────
-
-def _bandpass_butter(sig, fs, lo, hi, order=4):
-    nyq  = fs / 2.0
-    low  = max(lo / nyq, 1e-4)
-    high = min(hi / nyq, 0.999)
-    if low >= high:
-        return sig
-    b, a = scipy_signal.butter(order, [low, high], btype='band')
-    return scipy_signal.filtfilt(b, a, sig)
-
-
-def compute_plv(sig1, sig2, fs, band):
-    lo, hi = band
-    s1 = _bandpass_butter(sig1, fs, lo, hi)
-    s2 = _bandpass_butter(sig2, fs, lo, hi)
-    ph1 = np.angle(scipy_signal.hilbert(s1))
-    ph2 = np.angle(scipy_signal.hilbert(s2))
-    return float(np.abs(np.mean(np.exp(1j * (ph1 - ph2)))))
-
-
-def compute_coherence_band(sig1, sig2, fs, band):
-    lo, hi  = band
-    nperseg = min(int(4 * fs), len(sig1))
-    f, Cxy  = scipy_signal.coherence(sig1, sig2, fs=fs, nperseg=nperseg)
-    mask    = (f >= lo) & (f <= hi)
-    return float(Cxy[mask].mean()) if mask.sum() > 0 else 0.0
-
-
-def compute_connectivity_matrix(condition_segments, fs):
-    conn = {}
-    for cond, seg in condition_segments.items():
-        if 'bad_segment' in seg.columns:
-            seg = seg[seg['bad_segment'] == False]
-        conn[cond] = {}
-        for ch1, ch2 in CHANNEL_PAIRS:
-            if ch1 not in seg.columns or ch2 not in seg.columns:
-                continue
-            s1 = seg[ch1].values.astype(float)
-            s2 = seg[ch2].values.astype(float)
-            pair = f"{ch1}-{ch2}"
-            conn[cond][pair] = {}
-            for band_name in ['Theta', 'Alpha', 'Beta']:
-                band = BANDS[band_name]
-                if len(s1) < int(4 * fs):
-                    conn[cond][pair][band_name] = {'plv': np.nan, 'coherence': np.nan}
-                    continue
-                conn[cond][pair][band_name] = {
-                    'plv':       compute_plv(s1, s2, fs, band),
-                    'coherence': compute_coherence_band(s1, s2, fs, band),
-                }
-    return conn
-
-
-def plot_connectivity_matrix(conn_data, out_prefix=''):
-    if not conn_data:
-        return
-    conditions = list(conn_data.keys())
-    ch_order   = ALL_CHANNELS
-    for band_name in ['Theta', 'Alpha', 'Beta']:
-        n_cond = len(conditions)
-        fig, axes = plt.subplots(1, n_cond, figsize=(4 * n_cond, 4))
-        if n_cond == 1:
-            axes = [axes]
-        all_vals = [conn_data[c].get(f"{c1}-{c2}", {}).get(band_name, {}).get('plv', np.nan)
-                    for c in conditions for c1 in ch_order for c2 in ch_order]
-        vmax = max((v for v in all_vals if not np.isnan(v)), default=1.0)
-        for ax, cond in zip(axes, conditions):
-            mat = np.zeros((4, 4))
-            for i, ch1 in enumerate(ch_order):
-                for j, ch2 in enumerate(ch_order):
-                    v = conn_data[cond].get(f"{ch1}-{ch2}", {}).get(band_name, {}).get('plv', 0)
-                    if np.isnan(v):
-                        v = 0
-                    mat[i, j] = mat[j, i] = v
-            im = ax.imshow(mat, cmap='hot', vmin=0, vmax=vmax)
-            ax.set_xticks(range(4))
-            ax.set_yticks(range(4))
-            ax.set_xticklabels(ch_order, fontsize=8, rotation=45)
-            ax.set_yticklabels(ch_order, fontsize=8)
-            ax.set_title(cond)
-            for i in range(4):
-                for j in range(4):
-                    ax.text(j, i, f'{mat[i,j]:.2f}', ha='center', va='center', fontsize=7)
-            plt.colorbar(im, ax=ax, fraction=0.04)
-        fig.suptitle(f'PLV Connectivity — {band_name}', fontsize=12)
-        plt.tight_layout()
-        fname = f"{out_prefix}plot_connectivity_{band_name}.png"
-        plt.savefig(fname, dpi=150)
-        plt.close()
-        print(f"[analysis] Saved {fname}")
-
-
-def plot_connectivity_by_condition(conn_data, out_prefix=''):
-    if not conn_data:
-        return
-    conditions = list(conn_data.keys())
-    ft_pairs   = ['AF7-TP9', 'AF8-TP10']
-    x = np.arange(len(conditions))
-    w = 0.35
-    fig, ax = plt.subplots(figsize=(9, 5))
-    for pi, pair in enumerate(['AF7-TP9', 'AF8-TP10']):
-        vals = [conn_data.get(c, {}).get(pair, {}).get('Theta', {}).get('plv', 0)
-                for c in conditions]
-        vals = [0 if np.isnan(v) else v for v in vals]
-        ax.bar(x + pi * w, vals, w, label=pair,
-               color=['steelblue', 'coral'][pi], alpha=0.8)
-    ax.set_xticks(x + w / 2)
-    ax.set_xticklabels(conditions, rotation=15, ha='right')
-    ax.set_ylabel('Theta PLV')
-    ax.set_title('Frontotemporal Theta PLV by Condition')
-    ax.legend()
-    plt.tight_layout()
-    fname = f"{out_prefix}plot_frontotemporal_plv.png"
-    plt.savefig(fname, dpi=150)
-    plt.close()
-    print(f"[analysis] Saved {fname}")
-
-
-def run_connectivity_analysis(condition_segments, out_prefix=''):
-    print("\n[analysis] --- Connectivity ---")
-    if not condition_segments:
-        print("[analysis] WARNING: Skipping connectivity (no segments).")
-        return {}
-    conn = compute_connectivity_matrix(condition_segments, SAMPLE_RATE)
-    plot_connectivity_matrix(conn, out_prefix)
-    plot_connectivity_by_condition(conn, out_prefix)
-    return conn
-
 
 # ── A7: Complexity ────────────────────────────────────────────────────────────
 
-def permutation_entropy(sig, m=PERMEN_ORDER, tau=PERMEN_TAU):
-    sig = np.asarray(sig, dtype=float)
-    n   = len(sig)
-    n_p = n - (m - 1) * tau
-    if n_p <= 0:
-        return np.nan
-    patterns = [tuple(np.argsort(sig[i: i + m * tau: tau])) for i in range(n_p)]
-    counts   = Counter(patterns)
-    total    = float(sum(counts.values()))
-    probs    = np.array([v / total for v in counts.values()])
-    me       = np.log(float(math.factorial(m)))
-    if me == 0:
-        return np.nan
-    pe = -float(np.sum(probs * np.log(probs))) / me
-    return float(np.clip(pe, 0.0, 1.0))
-
-
-def higuchi_fd(sig, kmax=10):
-    sig = np.asarray(sig, dtype=float)
-    n   = len(sig)
-    lk  = []
-    ks  = []
-    for k in range(1, kmax + 1):
-        lmk = []
-        for m in range(1, k + 1):
-            idxs = np.arange(m - 1, n, k)
-            if len(idxs) < 2:
-                continue
-            s    = sig[idxs]
-            l    = np.sum(np.abs(np.diff(s))) * (n - 1) / (k * (len(idxs) - 1) * k)
-            lmk.append(l)
-        if lmk:
-            lk.append(np.mean(lmk))
-            ks.append(k)
-    if len(ks) < 2:
-        return np.nan
-    coeffs = np.polyfit(np.log(ks), np.log(np.array(lk) + 1e-12), 1)
-    return float(-coeffs[0])
-
-
-def dfa(sig, min_scale=DFA_MIN_SCALE, max_scale_ratio=DFA_MAX_SCALE_RATIO):
-    sig = np.asarray(sig, dtype=float)
-    n   = len(sig)
-    assert n > 1000, f"DFA requires >1000 samples, got {n}"
-    y      = np.cumsum(sig - np.mean(sig))
-    max_sc = max(int(n * max_scale_ratio), min_scale + 1)
-    scales = np.unique(np.logspace(np.log10(min_scale), np.log10(max_sc), 20).astype(int))
-    flucs  = []
-    valid  = []
-    for s in scales:
-        n_blk = n // s
-        if n_blk < 2:
-            continue
-        rms_list = []
-        for b in range(n_blk):
-            seg  = y[b * s:(b + 1) * s]
-            coef = np.polyfit(np.arange(s, dtype=float), seg, 1)
-            rms_list.append(np.sqrt(np.mean((seg - np.polyval(coef, np.arange(s))) ** 2)))
-        flucs.append(np.mean(rms_list))
-        valid.append(s)
-    if len(valid) < 2:
-        return np.nan, np.array(valid), np.array(flucs)
-    coef = np.polyfit(np.log10(valid), np.log10(np.array(flucs) + 1e-12), 1)
-    return float(coef[0]), np.array(valid), np.array(flucs)
-
-
-def compute_complexity(condition_segments, baseline_features=None):
-    rows = []
-    for cond, seg in condition_segments.items():
-        if 'bad_segment' in seg.columns:
-            seg = seg[seg['bad_segment'] == False]
-        for ch in ALL_CHANNELS:
-            if ch not in seg.columns:
-                continue
-            sig  = seg[ch].values.astype(float)
-            pe   = permutation_entropy(sig)
-            hfd  = higuchi_fd(sig)
-            dfa_a = np.nan
-            if len(sig) > 1000:
-                dfa_a, _, _ = dfa(sig)
-
-            pe_norm = dfa_norm = np.nan
-            if baseline_features is not None:
-                bl_ch  = baseline_features.get('channels', {}).get(ch, {})
-                bl_pe  = bl_ch.get('permen_baseline')
-                bl_dfa = bl_ch.get('dfa_baseline')
-                if bl_pe and bl_pe > 0 and not np.isnan(pe):
-                    pe_norm = pe / bl_pe
-                if bl_dfa and bl_dfa > 0 and not np.isnan(dfa_a):
-                    dfa_norm = dfa_a / bl_dfa
-
-            rows.append({'condition': cond, 'channel': ch,
-                         'permen': pe, 'hfd': hfd, 'dfa_alpha': dfa_a,
-                         'permen_norm': pe_norm, 'dfa_norm': dfa_norm})
-    return pd.DataFrame(rows)
-
-
-def plot_complexity(complexity_df, out_prefix=''):
-    if complexity_df.empty:
-        return
-    conditions = complexity_df['condition'].unique().tolist()
-    channels   = [ch for ch in ALL_CHANNELS if ch in complexity_df['channel'].unique()]
-    x      = np.arange(len(conditions))
-    w      = 0.8 / max(len(channels), 1)
-    colors = plt.cm.tab10(np.linspace(0, 1, len(channels)))
-    for metric, ylabel, sfx in [
-        ('permen',    'Permutation Entropy',      'permen'),
-        ('hfd',       'Higuchi Fractal Dimension', 'hfd'),
-        ('dfa_alpha', 'DFA Scaling Exponent',      'dfa'),
-    ]:
-        fig, ax = plt.subplots(figsize=(9, 5))
-        for i, ch in enumerate(channels):
-            ch_df = complexity_df[complexity_df['channel'] == ch]
-            vals  = [ch_df[ch_df['condition'] == c][metric].mean() for c in conditions]
-            ax.bar(x + i * w, vals, w, label=ch, color=colors[i], alpha=0.85)
-        ax.set_xticks(x + w * (len(channels) - 1) / 2)
-        ax.set_xticklabels(conditions, rotation=15, ha='right')
-        ax.set_ylabel(ylabel)
-        ax.set_title(f'{ylabel} by Condition')
-        ax.legend(fontsize=8)
-        plt.tight_layout()
-        fname = f"{out_prefix}plot_complexity_{sfx}.png"
-        plt.savefig(fname, dpi=150)
-        plt.close()
-        print(f"[analysis] Saved {fname}")
-
-
-def run_complexity_analysis(condition_segments, baseline_features, out_prefix=''):
-    print("\n[analysis] --- Complexity ---")
-    if not condition_segments:
-        print("[analysis] WARNING: Skipping complexity (no segments).")
-        return pd.DataFrame()
-    cx_df = compute_complexity(condition_segments, baseline_features)
-    plot_complexity(cx_df, out_prefix)
-    return cx_df
 
 
 # ── A8: Multiscale Entropy ────────────────────────────────────────────────────
 
 def sample_entropy(sig, m, r):
+    """Vectorised sample entropy — O(n·m) instead of O(n²)."""
     sig = np.asarray(sig, dtype=float)
     n   = len(sig)
 
     def _count(length):
+        # Build template matrix via strided view: shape (n-length, length)
+        shape   = (n - length, length)
+        strides = (sig.strides[0], sig.strides[0])
+        templates = np.lib.stride_tricks.as_strided(sig, shape=shape, strides=strides)
         count = 0
-        for i in range(n - length):
-            tmpl = sig[i:i + length]
-            for j in range(i + 1, n - length):
-                if np.max(np.abs(sig[j:j + length] - tmpl)) < r:
-                    count += 1
+        for i in range(len(templates) - 1):
+            diffs = np.max(np.abs(templates[i + 1:] - templates[i]), axis=1)
+            count += int(np.sum(diffs < r))
         return count
 
     B = _count(m)
@@ -1270,8 +861,11 @@ def sample_entropy(sig, m, r):
     return float(-np.log(A / B))
 
 
-def multiscale_entropy(sig, m=2, r_factor=0.2, max_scale=20):
+def multiscale_entropy(sig, m=2, r_factor=0.2, max_scale=20, max_samples=2000):
     sig = np.asarray(sig, dtype=float)
+    # Cap length to keep sample_entropy tractable (O(n^2) template matching)
+    if len(sig) > max_samples:
+        sig = sig[:max_samples]
     r   = r_factor * float(np.std(sig))
     mse = []
     for scale in range(1, max_scale + 1):
@@ -1288,9 +882,10 @@ def run_mse_analysis(condition_segments, out_prefix=''):
     print("\n[analysis] --- MSE ---")
     if not condition_segments:
         print("[analysis] WARNING: Skipping MSE (no segments).")
-        return
+        return {}
     max_scale = 20
     scales    = np.arange(1, max_scale + 1)
+    mse_cache = {}
     for ch in ['TP_pool', 'AF_pool']:
         mse_by_cond = {}
         for cond, seg in condition_segments.items():
@@ -1300,6 +895,7 @@ def run_mse_analysis(condition_segments, out_prefix=''):
                 continue
             sig = seg[ch].values.astype(float)
             mse_by_cond[cond] = multiscale_entropy(sig, max_scale=max_scale)
+        mse_cache[ch] = mse_by_cond
         if not mse_by_cond:
             continue
         fig, ax = plt.subplots(figsize=(9, 5))
@@ -1315,6 +911,7 @@ def run_mse_analysis(condition_segments, out_prefix=''):
         plt.savefig(fname, dpi=150)
         plt.close()
         print(f"[analysis] Saved {fname}")
+    return mse_cache
 
 
 # ── A9: Cross-Analysis ────────────────────────────────────────────────────────
@@ -1359,113 +956,9 @@ def plot_theta_alpha_trajectory(condition_segments, out_prefix=''):
     print(f"[analysis] Saved {fname}")
 
 
-def compute_trial_correlations(odd_epochs, time_ms):
-    if not odd_epochs or time_ms is None:
-        return pd.DataFrame()
-    ci_tp    = _ch_idx('TP_pool')
-    ci_af    = _ch_idx('AF_pool')
-    p300_m   = (time_ms >= 250) & (time_ms <= 600)
-    n200_m   = (time_ms >= 150) & (time_ms <= 300)
-    pre_m    = time_ms < 0
-    records  = []
-    for ep in odd_epochs:
-        d = ep['data']
-        pre_sig = d[pre_m, ci_tp]
-        if len(pre_sig) > 4:
-            f, psd = scipy_signal.welch(pre_sig, fs=SAMPLE_RATE,
-                                         nperseg=min(len(pre_sig), 64))
-            al_m = (f >= BANDS['Alpha'][0]) & (f <= BANDS['Alpha'][1])
-            th_m = (f >= BANDS['Theta'][0]) & (f <= BANDS['Theta'][1])
-            alpha_pre = float(integrate.trapezoid(psd[al_m], f[al_m])) if al_m.sum() > 1 else np.nan
-            theta_pre = float(integrate.trapezoid(psd[th_m], f[th_m])) if th_m.sum() > 1 else np.nan
-        else:
-            alpha_pre = theta_pre = np.nan
-        records.append({'P300_amp':  float(d[p300_m, ci_tp].mean()),
-                        'N200_amp':  float(d[n200_m, ci_af].mean()),
-                        'Alpha_pre': alpha_pre,
-                        'Theta_pre': theta_pre})
-    return pd.DataFrame(records).dropna()
-
-
-def plot_trial_correlations(corr_df_input, out_prefix=''):
-    if corr_df_input.empty:
-        print("[analysis] WARNING: Skipping trial correlations (no data).")
-        return
-    cols  = corr_df_input.columns.tolist()
-    n     = len(cols)
-    corr  = corr_df_input.corr()
-    pvals = pd.DataFrame(np.ones((n, n)), index=cols, columns=cols)
-    for i, c1 in enumerate(cols):
-        for j, c2 in enumerate(cols):
-            if i != j and len(corr_df_input) >= 3:
-                _, p = stats.pearsonr(corr_df_input[c1], corr_df_input[c2])
-                pvals.loc[c1, c2] = p
-    fig, ax = plt.subplots(figsize=(7, 6))
-    im = ax.imshow(corr.values, cmap='RdBu_r', vmin=-1, vmax=1)
-    ax.set_xticks(range(n))
-    ax.set_yticks(range(n))
-    ax.set_xticklabels(cols, rotation=45, ha='right', fontsize=9)
-    ax.set_yticklabels(cols, fontsize=9)
-    for i in range(n):
-        for j in range(n):
-            txt = f'{corr.values[i,j]:.2f}'
-            if i != j and pvals.values[i, j] < 0.05:
-                txt += '*'
-            ax.text(j, i, txt, ha='center', va='center', fontsize=8)
-    plt.colorbar(im, ax=ax, label='Pearson r')
-    ax.set_title('Single-Trial Correlation Matrix')
-    plt.tight_layout()
-    fname = f"{out_prefix}plot_trial_correlations.png"
-    plt.savefig(fname, dpi=150)
-    plt.close()
-    print(f"[analysis] Saved {fname}")
-
-
-def plot_complexity_vs_p300(odd_epochs, complexity_df, time_ms, task_intervals, out_prefix=''):
-    if not odd_epochs or complexity_df.empty or time_ms is None:
-        print("[analysis] WARNING: Skipping complexity vs P300 (insufficient data).")
-        return
-    ci     = _ch_idx('TP_pool')
-    p300_m = (time_ms >= 250) & (time_ms <= 600)
-    p300_by_cond = {}
-    for ep in odd_epochs:
-        cond = get_condition_at_time(ep['trigger_time'], task_intervals)
-        p300_by_cond.setdefault(cond, []).append(float(ep['data'][p300_m, ci].mean()))
-    pe_by_cond = {}
-    for cond in p300_by_cond:
-        sub = complexity_df[complexity_df['condition'] == cond]['permen']
-        pe_by_cond[cond] = float(sub.mean()) if not sub.empty else np.nan
-    conditions = [c for c in p300_by_cond if not np.isnan(pe_by_cond.get(c, np.nan))]
-    if len(conditions) < 2:
-        print("[analysis] WARNING: Not enough conditions for complexity vs P300 scatter.")
-        return
-    x = [pe_by_cond[c] for c in conditions]
-    y = [np.mean(p300_by_cond[c]) for c in conditions]
-    r, p = stats.pearsonr(x, y)
-    m, b = np.polyfit(x, y, 1)
-    fig, ax = plt.subplots(figsize=(7, 5))
-    ax.scatter(x, y, color='steelblue', s=60, zorder=3)
-    for c, xi, yi in zip(conditions, x, y):
-        ax.annotate(c, (xi, yi), textcoords='offset points', xytext=(5, 3), fontsize=8)
-    xr = np.linspace(min(x), max(x), 100)
-    ax.plot(xr, m * xr + b, color='gray', linestyle='--', lw=1)
-    ax.set_xlabel('Mean PermEn')
-    ax.set_ylabel('Mean P300 Amplitude (µV, TP_pool)')
-    ax.set_title(f'Complexity vs P300   r={r:.3f}, p={p:.4f}')
-    plt.tight_layout()
-    fname = f"{out_prefix}plot_complexity_vs_p300.png"
-    plt.savefig(fname, dpi=150)
-    plt.close()
-    print(f"[analysis] Saved {fname}")
-
-
-def run_cross_analysis(odd_epochs, time_ms, task_intervals,
-                       condition_segments, complexity_df, out_prefix=''):
+def run_cross_analysis(condition_segments, out_prefix=''):
     print("\n[analysis] --- Cross-Analysis ---")
     plot_theta_alpha_trajectory(condition_segments, out_prefix)
-    corr_df = compute_trial_correlations(odd_epochs, time_ms)
-    plot_trial_correlations(corr_df, out_prefix)
-    plot_complexity_vs_p300(odd_epochs, complexity_df, time_ms, task_intervals, out_prefix)
 
 
 # ── A10: Statistics ───────────────────────────────────────────────────────────
@@ -1478,27 +971,9 @@ def _cohens_d(a, b):
     return float((np.mean(a) - np.mean(b)) / pooled) if pooled != 0 else np.nan
 
 
-def run_statistics(odd_epochs, std_epochs, band_df, time_ms,
-                   complexity_df, conn_data, out_prefix=''):
+def run_statistics(band_df, out_prefix=''):
     print("\n[analysis] --- Statistical Tests ---")
     rows = []
-
-    # A10a: ERP t-tests with Cohen's d
-    if odd_epochs and std_epochs and time_ms is not None:
-        for ch, t_lo, t_hi, label in [('TP_pool', 250, 600, 'P300'),
-                                       ('AF_pool', 150, 300, 'N200')]:
-            ci   = _ch_idx(ch)
-            mask = (time_ms >= t_lo) & (time_ms <= t_hi)
-            odd_a = [float(ep['data'][mask, ci].mean()) for ep in odd_epochs]
-            std_a = [float(ep['data'][mask, ci].mean()) for ep in std_epochs]
-            if len(odd_a) >= 2 and len(std_a) >= 2:
-                t, p = stats.ttest_ind(odd_a, std_a)
-                d    = _cohens_d(odd_a, std_a)
-                print(f"[stats] {label} t-test {ch}: t={t:.3f}, p={p:.4f}, d={d:.3f}")
-                rows.append({'test': f'{label}_ttest', 'channel_or_pair': ch,
-                             'band_or_component': label, 'statistic': t,
-                             'p_value': p, 'p_corrected': p,
-                             'effect_size': d, 'n_epochs': len(odd_a)})
 
     # A10b: Band power ANOVA with Bonferroni
     if not band_df.empty:
@@ -1527,51 +1002,7 @@ def run_statistics(odd_epochs, std_epochs, band_df, time_ms,
                              'effect_size': np.nan,
                              'n_epochs': sum(len(g) for g in groups)})
 
-    # A10c: Complexity Kruskal-Wallis
-    if not complexity_df.empty:
-        conditions = complexity_df['condition'].unique().tolist()
-        for metric in ['permen', 'hfd', 'dfa_alpha']:
-            for ch in complexity_df['channel'].unique():
-                groups = [complexity_df[(complexity_df['condition'] == c) &
-                                        (complexity_df['channel'] == ch)][metric].dropna().tolist()
-                          for c in conditions]
-                groups = [g for g in groups if len(g) > 0]
-                if len(groups) < 2:
-                    continue
-                try:
-                    stat, p = stats.kruskal(*groups)
-                    rows.append({'test': 'kruskal', 'channel_or_pair': ch,
-                                 'band_or_component': metric, 'statistic': stat,
-                                 'p_value': p, 'p_corrected': p,
-                                 'effect_size': np.nan,
-                                 'n_epochs': sum(len(g) for g in groups)})
-                    if p < 0.05 and len(groups) == 2:
-                        u, pu = stats.mannwhitneyu(groups[0], groups[1], alternative='two-sided')
-                        print(f"[stats] {metric} {ch} KW p={p:.4f} → MWU p={pu:.4f}")
-                except Exception:
-                    pass
 
-    # A10d: Connectivity Kruskal-Wallis
-    if conn_data:
-        conditions = list(conn_data.keys())
-        for ch1, ch2 in CHANNEL_PAIRS:
-            pair = f"{ch1}-{ch2}"
-            for band in ['Theta', 'Alpha', 'Beta']:
-                groups = [[conn_data[c].get(pair, {}).get(band, {}).get('plv', np.nan)]
-                          for c in conditions]
-                groups = [[v for v in g if not np.isnan(v)] for g in groups]
-                groups = [g for g in groups if len(g) > 0]
-                if len(groups) < 2:
-                    continue
-                try:
-                    stat, p = stats.kruskal(*groups)
-                    rows.append({'test': 'kruskal_plv', 'channel_or_pair': pair,
-                                 'band_or_component': band, 'statistic': stat,
-                                 'p_value': p, 'p_corrected': p,
-                                 'effect_size': np.nan,
-                                 'n_epochs': sum(len(g) for g in groups)})
-                except Exception:
-                    pass
 
     if rows:
         stats_df = pd.DataFrame(rows)
@@ -1584,43 +1015,13 @@ def run_statistics(odd_epochs, std_epochs, band_df, time_ms,
 
 # ── A11: Output Summary ───────────────────────────────────────────────────────
 
-def save_session_summary(odd_epochs, std_epochs, time_ms, band_df,
-                         complexity_df, conn_data, task_intervals,
+def save_session_summary(band_df, task_onset_epochs,
                          baseline_features, out_prefix=''):
     summary = {
-        'p300_amplitude_by_condition':           {},
-        'p300_latency_by_condition':             {},
-        'n200_amplitude_by_condition':           {},
-        'theta_alpha_ratio_by_condition':        {},
-        'dfa_alpha_by_condition':                {},
-        'permen_by_condition':                   {},
-        'frontotemporal_plv_theta_by_condition': {},
-        'n_oddball_epochs_accepted':             len(odd_epochs) if odd_epochs else 0,
-        'n_standard_epochs_accepted':            len(std_epochs) if std_epochs else 0,
-        'iaf_hz':                                baseline_features.get('IAF_hz') if baseline_features else None,
+        'theta_alpha_ratio_by_condition': {},
+        'n_task_onset_epochs_accepted':   len(task_onset_epochs) if task_onset_epochs else 0,
+        'iaf_hz':                         baseline_features.get('IAF_hz') if baseline_features else None,
     }
-
-    if odd_epochs and time_ms is not None:
-        ci_tp  = _ch_idx('TP_pool')
-        ci_af  = _ch_idx('AF_pool')
-        p300_m = (time_ms >= 250) & (time_ms <= 600)
-        n200_m = (time_ms >= 150) & (time_ms <= 300)
-        by_cond = {}
-        for ep in odd_epochs:
-            cond = get_condition_at_time(ep['trigger_time'], task_intervals)
-            by_cond.setdefault(cond, {'p300': [], 'n200': []})
-            by_cond[cond]['p300'].append(float(ep['data'][p300_m, ci_tp].mean()))
-            by_cond[cond]['n200'].append(float(ep['data'][n200_m, ci_af].mean()))
-        for cond, vals in by_cond.items():
-            summary['p300_amplitude_by_condition'][cond] = float(np.mean(vals['p300']))
-            summary['n200_amplitude_by_condition'][cond] = float(np.mean(vals['n200']))
-            # Latency: index of max in p300 window of grand average
-            grand_p300 = np.mean([ep['data'][p300_m, ci_tp]
-                                   for ep in odd_epochs
-                                   if get_condition_at_time(ep['trigger_time'], task_intervals) == cond],
-                                  axis=0)
-            lat_ms = float(time_ms[p300_m][np.argmax(grand_p300)]) if len(grand_p300) > 0 else np.nan
-            summary['p300_latency_by_condition'][cond] = lat_ms
 
     if not band_df.empty:
         for _, row in band_df.iterrows():
@@ -1629,18 +1030,6 @@ def save_session_summary(odd_epochs, std_epochs, time_ms, band_df,
             if not np.isnan(float(ta if ta is not None else np.nan)):
                 summary['theta_alpha_ratio_by_condition'][cond] = float(ta)
 
-    if not complexity_df.empty:
-        for cond in complexity_df['condition'].unique():
-            sub_pe  = complexity_df[complexity_df['condition'] == cond]['permen']
-            sub_dfa = complexity_df[complexity_df['condition'] == cond]['dfa_alpha']
-            summary['permen_by_condition'][cond]    = float(sub_pe.mean())  if not sub_pe.empty  else None
-            summary['dfa_alpha_by_condition'][cond] = float(sub_dfa.mean()) if not sub_dfa.empty else None
-
-    if conn_data:
-        for cond in conn_data:
-            v = conn_data[cond].get('AF7-TP9', {}).get('Theta', {}).get('plv', np.nan)
-            summary['frontotemporal_plv_theta_by_condition'][cond] = \
-                float(v) if not np.isnan(v) else None
 
     def _sanitise(obj):
         if isinstance(obj, dict):
@@ -1743,70 +1132,42 @@ def analyse_session(erp_path, psd_path, events_path,
     psd_df = add_pooled_channels(psd_df)
 
     # Stage 1: Parse events
-    oddball_triggers, standard_triggers, task_intervals, task_starts = parse_events(events_df)
+    _, _, task_intervals, task_starts = parse_events(events_df)
 
     # Stage 2: Epoching
     print("\n[analysis] --- Epoching ---")
-    all_triggers = oddball_triggers + standard_triggers
-    odd_raw, *odd_rej = extract_epochs(erp_df, oddball_triggers, all_triggers=all_triggers)
-    std_raw, *std_rej = extract_epochs(erp_df, standard_triggers, all_triggers=all_triggers)
-    odd_epochs = baseline_correct(odd_raw)
-    std_epochs = baseline_correct(std_raw)
-
-    if len(odd_epochs) < MIN_EPOCHS:
-        print(f"[analysis] WARNING: Only {len(odd_epochs)} clean oddball epochs "
-              f"(min {MIN_EPOCHS}). ERP SNR may be poor.")
-
     task_onset_epochs  = extract_task_onset_epochs(erp_df, task_starts, task_intervals)
     condition_segments = extract_condition_segments(psd_df, task_intervals)
     condition_segments = {k: add_pooled_channels(v) for k, v in condition_segments.items()}
 
-    rejection_counts = dict(
-        odd_bad_seg=odd_rej[0], odd_overlap=odd_rej[1],
-        odd_amplitude=odd_rej[2], odd_kurtosis=odd_rej[3],
-        std_bad_seg=std_rej[0], std_overlap=std_rej[1],
-        std_amplitude=std_rej[2], std_kurtosis=std_rej[3],
-    )
-    time_ms = odd_epochs[0]['time_ms'] if odd_epochs else None
+    if not task_onset_epochs:
+        print("[analysis] WARNING: No task-onset epochs found.")
 
     # Stage 3: ERP
     print("\n[analysis] --- ERP Analysis ---")
-    plot_erp(odd_epochs, std_epochs, out_prefix)
-    plot_epoch_heatmap(odd_epochs, out_prefix)
-    plot_rejection_summary(rejection_counts, out_prefix)
     plot_task_onset_erp(task_onset_epochs, out_prefix)
-    plot_p300_by_condition(odd_epochs, task_intervals, out_prefix)
 
     # Stage 4: ERSP + ITPC
-    run_ersp_itpc_analysis(odd_epochs, std_epochs, out_prefix)
+    ersp_itpc_cache = run_ersp_itpc_analysis(task_onset_epochs, out_prefix)
 
     # Stage 5: ERD/ERS
-    run_erd_ers_analysis(task_onset_epochs, baseline_features, out_prefix)
+    erd_data, erd_time_axis = run_erd_ers_analysis(task_onset_epochs, baseline_features, out_prefix)
 
     # Stage 6: PSD
-    psds, band_df, faa_df = run_psd_analysis(condition_segments, baseline_features, out_prefix)
+    psds, band_df = run_psd_analysis(condition_segments, baseline_features, out_prefix)
     plot_spectrogram(psd_df, task_intervals, out_prefix)
 
-    # Stage 7: Connectivity
-    conn_data = run_connectivity_analysis(condition_segments, out_prefix)
-
-    # Stage 8: Complexity
-    complexity_df = run_complexity_analysis(condition_segments, baseline_features, out_prefix)
-
     # Stage 9: MSE
-    run_mse_analysis(condition_segments, out_prefix)
+    mse_cache = run_mse_analysis(condition_segments, out_prefix)
 
     # Stage 10: Cross-analysis
-    run_cross_analysis(odd_epochs, time_ms, task_intervals,
-                       condition_segments, complexity_df, out_prefix)
+    run_cross_analysis(condition_segments, out_prefix)
 
     # Stage 11: Statistics
-    run_statistics(odd_epochs, std_epochs, band_df, time_ms,
-                   complexity_df, conn_data, out_prefix)
+    run_statistics(band_df, out_prefix)
 
     # Stage 12: Summary
-    save_session_summary(odd_epochs, std_epochs, time_ms, band_df,
-                         complexity_df, conn_data, task_intervals,
+    save_session_summary(band_df, task_onset_epochs,
                          baseline_features, out_prefix)
 
     # Stage 13: GSR analysis
@@ -1815,6 +1176,14 @@ def analyse_session(erp_path, psd_path, events_path,
     run_gsr_analysis(gsr_path, events_path, out_prefix)
 
     print("\n[analysis] Session complete.")
+    return {
+        'task_onset_epochs': task_onset_epochs,
+        'band_df':           band_df,
+        'ersp_itpc':         ersp_itpc_cache if ersp_itpc_cache else {},
+        'erd_data':          erd_data,
+        'erd_time_axis':     erd_time_axis,
+        'mse_data':          mse_cache if mse_cache else {},
+    }
 
 
 # ── GSR plotting ──────────────────────────────────────────────────────────────
@@ -1980,6 +1349,319 @@ def plot_gsr_analysis(filepath: str, window_size: float = 5.0, save_path: str | 
     return fig
 
 
+# ── Cross-Device Comparison ───────────────────────────────────────────────────
+
+def _compare_erp(devs, out_prefix):
+    """Grand-average task-onset ERP waveform overlay across devices."""
+    ci = _ch_idx('TP_pool')
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for slug, label, color, res in devs:
+        task_epochs = res.get('task_onset_epochs', [])
+        if not task_epochs:
+            continue
+        time_ms = task_epochs[0].get('time_ms')
+        if time_ms is None:
+            continue
+        stack = np.stack([ep['data'][:, ci] for ep in task_epochs])
+        grand = stack.mean(axis=0)
+        sem   = stack.std(axis=0) / np.sqrt(len(task_epochs))
+        ax.plot(time_ms, grand, color=color, lw=1.5, label=label)
+        ax.fill_between(time_ms, grand - sem, grand + sem, alpha=0.15, color=color)
+    ax.axvline(0, color='k', lw=0.8, linestyle='--')
+    ax.invert_yaxis()
+    ax.set_xlabel('Time (ms)')
+    ax.set_ylabel('Amplitude (µV)')
+    ax.set_title('Grand-Average Task-Onset ERP — TP_pool')
+    ax.legend(fontsize=9)
+    plt.tight_layout()
+    fname = f"{out_prefix}compare_erp.png"
+    plt.savefig(fname, dpi=150)
+    plt.close()
+    print(f"[analysis] Saved {fname}")
+
+
+def _compare_band_power(devs, out_prefix):
+    """Grouped band-power bar chart per channel across devices."""
+    band_names = list(BANDS.keys())
+    x = np.arange(len(band_names))
+    for ch in ['TP_pool', 'AF_pool']:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        n = len(devs)
+        w = 0.8 / max(n, 1)
+        for i, (slug, label, color, res) in enumerate(devs):
+            bdf = res.get('band_df')
+            if bdf is None or bdf.empty:
+                continue
+            ch_df = bdf[bdf['channel'] == ch]
+            if ch_df.empty:
+                continue
+            vals = [ch_df[f'{b}_rel'].mean() for b in band_names]
+            ax.bar(x + i * w, vals, w, label=label, color=color, alpha=0.85)
+        ax.set_xticks(x + w * (n - 1) / 2)
+        ax.set_xticklabels(band_names)
+        ax.set_ylabel('Relative Power')
+        ax.set_title(f'Band Power — {ch} — Cross-Device')
+        ax.legend(fontsize=9)
+        plt.tight_layout()
+        fname = f"{out_prefix}compare_band_power_{ch}.png"
+        plt.savefig(fname, dpi=150)
+        plt.close()
+        print(f"[analysis] Saved {fname}")
+
+
+def _compare_ersp_itpc(devs, out_prefix):
+    """Side-by-side ERSP/ITPC pcolormesh grid across devices (all tasks pooled)."""
+    n = len(devs)
+    if n == 0:
+        return
+    for ch in ['TP_pool', 'AF_pool']:
+        fig, axes = plt.subplots(2, n, figsize=(6 * n, 8),
+                                 sharey=True, squeeze=False)
+        last_im_ersp = last_im_itpc = None
+        for col, (slug, label, color, res) in enumerate(devs):
+            cache = res.get('ersp_itpc', {}).get((ch, 'all_tasks'))
+            axes[0, col].set_title(label, fontsize=10)
+            if cache is None:
+                axes[0, col].set_visible(False)
+                axes[1, col].set_visible(False)
+                continue
+            last_im_ersp = axes[0, col].pcolormesh(
+                cache['time_ms'], cache['freqs'], cache['ersp'],
+                cmap='RdBu_r', vmin=-3, vmax=3, shading='auto')
+            axes[0, col].axvline(0, color='k', lw=0.8, linestyle='--')
+            last_im_itpc = axes[1, col].pcolormesh(
+                cache['time_ms'], cache['freqs'], cache['itpc'],
+                cmap='hot', vmin=0, vmax=0.5, shading='auto')
+            axes[1, col].axvline(0, color='k', lw=0.8, linestyle='--')
+            axes[1, col].set_xlabel('Time (ms)', fontsize=9)
+        axes[0, 0].set_ylabel('Frequency (Hz)')
+        axes[1, 0].set_ylabel('Frequency (Hz)')
+        if last_im_ersp is not None:
+            fig.colorbar(last_im_ersp, ax=axes[0, :].tolist(), label='ERSP (dB)')
+        if last_im_itpc is not None:
+            fig.colorbar(last_im_itpc, ax=axes[1, :].tolist(), label='ITPC')
+        fig.suptitle(f'ERSP (top) / ITPC (bottom) — {ch} — All Tasks Pooled', fontsize=12)
+        plt.tight_layout()
+        fname = f"{out_prefix}compare_ersp_itpc_{ch}.png"
+        plt.savefig(fname, dpi=150)
+        plt.close()
+        print(f"[analysis] Saved {fname}")
+
+
+def _compare_erd(devs, out_prefix):
+    """ERD/ERS trajectory per band across devices."""
+    for band in ['Theta', 'Alpha', 'Beta']:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        for slug, label, color, res in devs:
+            erd_data   = res.get('erd_data', {})
+            time_axis  = res.get('erd_time_axis', np.array([]))
+            band_data  = erd_data.get(band)
+            if band_data is None or len(band_data) == 0 or len(time_axis) == 0:
+                continue
+            arr = np.array(band_data)
+            if arr.ndim == 1:
+                arr = arr[np.newaxis, :]
+            mean = np.nanmean(arr, axis=0)
+            sem  = np.nanstd(arr, axis=0) / np.sqrt(arr.shape[0])
+            ax.plot(time_axis, mean, color=color, lw=1.5, label=label)
+            ax.fill_between(time_axis, mean - sem, mean + sem, alpha=0.15, color=color)
+        ax.axvline(0, color='k', lw=0.8, linestyle='--', label='Task onset')
+        ax.axhline(0, color='grey', lw=0.5)
+        ax.set_xlabel('Time (ms)')
+        ax.set_ylabel('ERD/ERS (%)')
+        ax.set_title(f'{band} ERD/ERS — Cross-Device')
+        ax.legend(fontsize=9)
+        plt.tight_layout()
+        fname = f"{out_prefix}compare_erd_{band}.png"
+        plt.savefig(fname, dpi=150)
+        plt.close()
+        print(f"[analysis] Saved {fname}")
+
+
+
+
+
+def _compare_mse(devs, out_prefix):
+    """Multiscale entropy curves across devices per channel."""
+    max_scale = 20
+    scales = np.arange(1, max_scale + 1)
+    for ch in ['TP_pool', 'AF_pool']:
+        fig, ax = plt.subplots(figsize=(9, 5))
+        for slug, label, color, res in devs:
+            cond_dict = res.get('mse_data', {}).get(ch, {})
+            if not cond_dict:
+                continue
+            arrays = [v for v in cond_dict.values()
+                      if v is not None and len(v) == max_scale]
+            if not arrays:
+                continue
+            mean_mse = np.nanmean(np.stack(arrays, axis=0), axis=0)
+            ax.plot(scales, mean_mse, color=color, lw=1.5, label=label)
+        ax.set_xlabel('Scale')
+        ax.set_ylabel('Sample Entropy')
+        ax.set_title(f'Multiscale Entropy — {ch} — Cross-Device')
+        ax.legend(fontsize=9)
+        plt.tight_layout()
+        fname = f"{out_prefix}compare_mse_{ch}.png"
+        plt.savefig(fname, dpi=150)
+        plt.close()
+        print(f"[analysis] Saved {fname}")
+
+
+
+def _compare_theta_alpha(devs, out_prefix):
+    """Theta/Alpha ratio bar chart across devices."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+    vals, errs, labels, colors = [], [], [], []
+    for slug, label, color, res in devs:
+        bdf = res.get('band_df')
+        if bdf is not None and not bdf.empty:
+            ch_df = bdf[bdf['channel'] == 'TP_pool']
+            v = ch_df['theta_alpha_ratio'].dropna() if 'theta_alpha_ratio' in ch_df.columns else pd.Series(dtype=float)
+            vals.append(v.mean() if len(v) else np.nan)
+            errs.append(v.std() if len(v) > 1 else 0)
+        else:
+            vals.append(np.nan); errs.append(0)
+        labels.append(label)
+        colors.append(color)
+    x = np.arange(len(labels))
+    ax.bar(x, vals, yerr=errs, capsize=5, color=colors, alpha=0.85)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel('Theta / Alpha Ratio')
+    ax.set_title('Theta/Alpha Ratio — Cross-Device')
+    plt.tight_layout()
+    fname = f"{out_prefix}compare_theta_alpha.png"
+    plt.savefig(fname, dpi=150)
+    plt.close()
+    print(f"[analysis] Saved {fname}")
+
+
+def _compare_tfr_diff(devs, out_prefix):
+    """
+    For each pair of devices, plot the difference in mean Morlet TFR power
+    (device A - device B) for each condition shared between them, with one
+    subplot per raw EEG channel (TP9, AF7, AF8, TP10).
+
+    Output: compare_tfr_diff_{slugA}_vs_{slugB}_{condition}.png
+    """
+    import itertools
+
+    def _mean_power(epochs, ch_idx, freqs, fs):
+        """Mean Morlet power across epochs: shape (n_freqs, n_times)."""
+        if not epochs:
+            return None
+        power_sum = None
+        for ep in epochs:
+            sig = ep['data'][:, ch_idx].astype(float)
+            tf  = morlet_wavelet_transform(sig, fs, freqs)
+            p   = np.abs(tf) ** 2
+            power_sum = p if power_sum is None else power_sum + p
+        return power_sum / len(epochs)
+
+    freqs = MORLET_FREQS
+
+    for (slugA, labelA, _, resA), (slugB, labelB, _, resB) in itertools.combinations(devs, 2):
+        # Find conditions present in both sessions (by task condition)
+        task_epochsA = resA.get('task_onset_epochs', [])
+        task_epochsB = resB.get('task_onset_epochs', [])
+        if not task_epochsA or not task_epochsB:
+            continue
+
+        time_ms = task_epochsA[0].get('time_ms') if task_epochsA else None
+        if time_ms is None:
+            time_ms = task_epochsB[0].get('time_ms') if task_epochsB else None
+        if time_ms is None:
+            continue
+
+        time_s = time_ms / 1000.0
+
+        # Group task-onset epochs by condition for each device
+        def _by_cond(epochs):
+            groups = {}
+            for ep in epochs:
+                cond = ep.get('condition', 'all')
+                groups.setdefault(str(cond), []).append(ep)
+            return groups
+
+        groupsA = _by_cond(task_epochsA)
+        groupsB = _by_cond(task_epochsB)
+        shared_conds = sorted(set(groupsA) & set(groupsB))
+
+        if not shared_conds:
+            # Fall back: use all epochs pooled together
+            shared_conds = ['all']
+            groupsA = {'all': task_epochsA}
+            groupsB = {'all': task_epochsB}
+
+        for cond in shared_conds:
+            fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True, sharey=True)
+            axes_flat = axes.flatten()
+
+            vmax = 0.0
+            power_diffs = {}
+            for ci, ch in enumerate(ALL_CHANNELS):
+                ch_idx = _ch_idx(ch)
+                pA = _mean_power(groupsA[cond], ch_idx, freqs, SAMPLE_RATE)
+                pB = _mean_power(groupsB[cond], ch_idx, freqs, SAMPLE_RATE)
+                if pA is None or pB is None:
+                    power_diffs[ch] = None
+                    continue
+                diff = pA - pB
+                power_diffs[ch] = diff
+                vmax = max(vmax, float(np.abs(diff).max()))
+
+            if vmax == 0:
+                plt.close()
+                continue
+
+            for ci, ch in enumerate(ALL_CHANNELS):
+                ax   = axes_flat[ci]
+                diff = power_diffs.get(ch)
+                if diff is None:
+                    ax.set_visible(False)
+                    continue
+                im = ax.pcolormesh(time_s, freqs, diff,
+                                   cmap='RdBu_r', vmin=-vmax, vmax=vmax,
+                                   shading='auto')
+                ax.axvline(0, color='k', lw=0.8, linestyle='--')
+                ax.set_title(ch, fontsize=10)
+                ax.set_ylabel('Frequency (Hz)', fontsize=8)
+                ax.set_xlabel('Time from Event (s)', fontsize=8)
+                plt.colorbar(im, ax=ax, label='Power')
+
+            safe_cond = str(cond).replace(' ', '_')
+            fig.suptitle(
+                f'Difference in Time-Frequency spectrum between '
+                f'{labelA} and {labelB} - event \'{safe_cond}\'',
+                fontsize=12)
+            plt.tight_layout()
+            fname = f"{out_prefix}compare_tfr_diff_{slugA}_vs_{slugB}_{safe_cond}.png"
+            plt.savefig(fname, dpi=150)
+            plt.close()
+            print(f"[analysis] Saved {fname}")
+
+
+def compare_devices(session_results, out_prefix):
+    """Produce cross-device comparison plots for all available devices."""
+    devs = _devices_present(session_results)
+    if not devs:
+        print("[analysis] No recognisable device slugs — skipping cross-device comparison.")
+        return
+    if len(devs) < 3:
+        print(f"[analysis] WARNING: Only {len(devs)}/3 devices found "
+              f"({[d[0] for d in devs]}). Plots will include available devices only.")
+    print(f"\n[analysis] === Cross-Device Comparison ({len(devs)} devices) ===")
+    _compare_erp(devs, out_prefix)
+    _compare_band_power(devs, out_prefix)
+    _compare_ersp_itpc(devs, out_prefix)
+    _compare_erd(devs, out_prefix)
+    _compare_mse(devs, out_prefix)
+    _compare_theta_alpha(devs, out_prefix)
+    _compare_tfr_diff(devs, out_prefix)
+    print(f"[analysis] Cross-device comparison plots saved with prefix {out_prefix}compare_*")
+
+
 def main(participant_id, data_dir='data', out_dir='output'):
     participant_out_dir  = os.path.join(out_dir,  participant_id)
     participant_data_dir = os.path.join(data_dir, participant_id)
@@ -1996,6 +1678,8 @@ def main(participant_id, data_dir='data', out_dir='output'):
 
     os.makedirs(participant_out_dir, exist_ok=True)
     print(f"[analysis] Found {len(erp_files)} session(s) for '{participant_id}'")
+
+    device_results = {}
 
     for erp_path in erp_files:
         erp_dir  = os.path.dirname(erp_path)
@@ -2024,7 +1708,14 @@ def main(participant_id, data_dir='data', out_dir='output'):
             continue
 
         print(f"\n[analysis] === Session: {basename} ===")
-        analyse_session(erp_path, psd_path, events_path, bl_path, out_prefix)
+        result = analyse_session(erp_path, psd_path, events_path, bl_path, out_prefix)
+
+        slug = _infer_device_slug(basename)
+        if slug is not None and result is not None:
+            device_results[slug] = result
+
+    participant_prefix = os.path.join(participant_out_dir, f'{participant_id}_')
+    compare_devices(device_results, participant_prefix)
 
     print(f"\n[analysis] All sessions complete. Outputs in {participant_out_dir}/")
 

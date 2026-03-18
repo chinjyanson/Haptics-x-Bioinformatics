@@ -27,12 +27,12 @@ from arduino.bridge import ArduinoBridge, TimestampedArduinoEvent, ARDUINO_DEFAU
 
 # ── Device enable flags — set to False to run without a device ────────────────
 USE_MUSE    = True
-USE_POLAR   = False
-USE_GSR     = False
+USE_POLAR   = True
+USE_GSR     = True
 USE_ARDUINO = True
 
 # ── Baseline recording flag — set to False to skip baseline at session start ──
-RUN_BASELINE = False
+RUN_BASELINE = True
 
 from haptics import HapticsController, load_haptic_targets
 import baseline
@@ -496,6 +496,8 @@ class SynchronizedCollector:
         self._muse_ready    = threading.Event()
         self._muse_failed   = False   # True when connection exhausted all retries
         self._polar_ready   = threading.Event()
+        self._polar_failed  = False   # True when connection exhausted all retries
+        self._polar_retry_status: str = ''  # e.g. 'Retrying (2/5)...'
         self._gsr_ready     = threading.Event()
 
         # _record_event replaces one-shot _start_recording — can be set/cleared
@@ -880,74 +882,102 @@ class SynchronizedCollector:
         Args:
             duration: Collection duration in seconds, or None for indefinite
         """
-        try:
-            # Only find device if not already found during connection screen
-            if self.polar is None or self.polar.device is None:
-                print("[Polar] Initializing connection...")
-                self.polar = PolarH10(device_name=self.polar_device_name)
-                await self.polar.find_device()
+        MAX_CONNECT_RETRIES = 5
+        RETRY_DELAY_S       = 5.0
 
-                if not self.polar.device:
-                    raise Exception("Polar device not found")
-            else:
-                print("[Polar] Using existing device...")
-                # Clear any old data from connection phase
-                self.polar.heart_rates.clear()
-                self.polar.rr_intervals.clear()
+        # ── Initial connection with retry ─────────────────────────────────
+        from bleak import BleakClient
+        connected = False
+        for attempt in range(1, MAX_CONNECT_RETRIES + 1):
+            if self._stop_event.is_set():
+                return
+            try:
+                # Only scan for the device if we don't already have one
+                if self.polar is None or self.polar.device is None:
+                    print(f"[Polar] Scanning for device (attempt {attempt}/{MAX_CONNECT_RETRIES})...")
+                    self.polar = PolarH10(device_name=self.polar_device_name)
+                    await self.polar.find_device()
+                    if not self.polar.device:
+                        raise Exception("Polar device not found during scan")
+                else:
+                    print(f"[Polar] Using existing device (attempt {attempt}/{MAX_CONNECT_RETRIES})...")
+                    self.polar.heart_rates.clear()
+                    self.polar.rr_intervals.clear()
 
-            print(f"[Polar] Connecting to {self.polar.device.name}...")
+                print(f"[Polar] Connecting to {self.polar.device.name}...")
+                self._polar_retry_status = f'Retrying ({attempt}/{MAX_CONNECT_RETRIES})...' if attempt > 1 else 'Connecting...'
 
-            from bleak import BleakClient
-            async with BleakClient(self.polar.device.address) as client:
-                self.polar_connected = True
-                print(f"[Polar] Connected: {client.is_connected}")
+                async with BleakClient(self.polar.device.address) as client:
+                    if not client.is_connected:
+                        raise Exception("BleakClient connected but is_connected=False")
 
-                # Subscribe to heart rate notifications with our callback
-                await client.start_notify(
-                    HEART_RATE_MEASUREMENT_UUID,
-                    self._polar_hr_callback
-                )
+                    self.polar_connected = True
+                    print(f"[Polar] Connected: {client.is_connected}")
+                    self._polar_retry_status = ''
 
-                # Signal that Polar is ready
-                print("[Polar] Ready, waiting for synchronized start...")
-                self._polar_ready.set()
+                    # Subscribe to heart rate notifications with our callback
+                    await client.start_notify(
+                        HEART_RATE_MEASUREMENT_UUID,
+                        self._polar_hr_callback
+                    )
 
-                # Outer loop — stays alive across all sessions
-                while not self._stop_event.is_set():
-                    # Between sessions: wait for record_event
-                    while not self._record_event.is_set() and not self._stop_event.is_set():
-                        await asyncio.sleep(0.01)
+                    # Signal that Polar is ready
+                    print("[Polar] Ready, waiting for synchronized start...")
+                    self._polar_ready.set()
+                    connected = True
 
-                    if self._stop_event.is_set():
-                        break
+                    # Outer loop — stays alive across all sessions
+                    while not self._stop_event.is_set():
+                        # Between sessions: wait for record_event
+                        while not self._record_event.is_set() and not self._stop_event.is_set():
+                            await asyncio.sleep(0.01)
 
-                    print("[Polar] Starting data collection...")
+                        if self._stop_event.is_set():
+                            break
 
-                    # Inner recording loop — callback does the actual recording
-                    while self._record_event.is_set() and not self._stop_event.is_set():
-                        await asyncio.sleep(0.1)
+                        print("[Polar] Starting data collection...")
 
-                    print("[Polar] Session paused.")
-                    self._polar_paused.set()
+                        # Inner recording loop — callback does the actual recording
+                        while self._record_event.is_set() and not self._stop_event.is_set():
+                            await asyncio.sleep(0.1)
 
-                # Stop notifications
-                await client.stop_notify(HEART_RATE_MEASUREMENT_UUID)
+                        print("[Polar] Session paused.")
+                        self._polar_paused.set()
 
-            self.polar_connected = False
+                    # Stop notifications
+                    await client.stop_notify(HEART_RATE_MEASUREMENT_UUID)
 
-            # Calculate HRV metrics
-            metrics = self.polar.calculate_hrv_metrics()
-            if metrics:
-                print("\n[Polar] HRV Metrics:")
-                print(f"  Mean HR: {metrics['mean_hr']:.1f} bpm")
-                print(f"  SDNN: {metrics['sdnn']:.1f} ms")
-                print(f"  RMSSD: {metrics['rmssd']:.1f} ms")
-                print(f"  pNN50: {metrics['pnn50']:.1f}%")
+                self.polar_connected = False
 
-            print("[Polar] Collection complete.")
+                # Calculate HRV metrics
+                metrics = self.polar.calculate_hrv_metrics()
+                if metrics:
+                    print("\n[Polar] HRV Metrics:")
+                    print(f"  Mean HR: {metrics['mean_hr']:.1f} bpm")
+                    print(f"  SDNN: {metrics['sdnn']:.1f} ms")
+                    print(f"  RMSSD: {metrics['rmssd']:.1f} ms")
+                    print(f"  pNN50: {metrics['pnn50']:.1f}%")
 
-        except Exception as e:
-            print(f"[Polar] Error: {e}")
+                print("[Polar] Collection complete.")
+                connected = True
+                break  # success — exit retry loop
+
+            except Exception as e:
+                self.polar_connected = False
+                self.polar_error = str(e)
+                print(f"[Polar] Connection attempt {attempt}/{MAX_CONNECT_RETRIES} failed: {e}")
+                # Reset device so next attempt re-scans
+                self.polar = None
+
+                if attempt < MAX_CONNECT_RETRIES and not self._stop_event.is_set():
+                    self._polar_retry_status = f'Retrying ({attempt + 1}/{MAX_CONNECT_RETRIES})...'
+                    print(f"[Polar] Retrying in {RETRY_DELAY_S:.0f}s...")
+                    await asyncio.sleep(RETRY_DELAY_S)
+
+        if not connected:
+            print(f"[Polar] Failed to connect after {MAX_CONNECT_RETRIES} attempts.")
+            self._polar_failed = True
+            self._polar_retry_status = 'FAILED'
             self._polar_paused.set()  # Unblock end_session() on error
             self.polar_connected = False
 

@@ -137,6 +137,7 @@ def wavelet_denoise(sig, wavelet='db4', level=6):
     coeffs_thresh = list(coeffs)
     for i in range(1, 4):  # levels 1-3 from finest
         coeffs_thresh[-i] = pywt.threshold(coeffs[-i], value=threshold, mode='soft')
+        # coeffs_thresh[-i] = pywt.threshold(coeffs[-i], value=threshold, mode='hard')
 
     return pywt.waverec(coeffs_thresh, wavelet=wavelet)[:len(sig)]
 
@@ -153,7 +154,7 @@ def emd_drift_remove(sig, n_imfs=EMD_DRIFT_IMFS):
         if imfs.shape[1] < n_imfs + 1:
             print(f"[denoising] EMD produced {imfs.shape[1]} IMFs (< {n_imfs+1}), skipping drift removal.")
             return sig
-        cleaned = imfs[:, n_imfs:].sum(axis=1)
+        cleaned = imfs[:, :-n_imfs].sum(axis=1)
         return cleaned
     except Exception as e:
         print(f"[denoising] EMD failed: {e}, skipping drift removal.")

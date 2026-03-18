@@ -379,17 +379,20 @@ def show_reconnect_screen(collector: 'SynchronizedCollector') -> bool:
                                title='Confirm Abort', font=('Helvetica', 11)) == 'Yes':
                 break
 
-        muse_failed   = collector.use_muse and getattr(collector, '_muse_failed', False)
-        muse_ready    = (not collector.use_muse)    or (collector._muse_ready.is_set() and not muse_failed)
-        polar_ready   = (not collector.use_polar)   or collector._polar_ready.is_set()
+        muse_failed   = collector.use_muse  and getattr(collector, '_muse_failed',  False)
+        polar_failed  = collector.use_polar and getattr(collector, '_polar_failed', False)
+        muse_ready    = (not collector.use_muse)    or (collector._muse_ready.is_set()  and not muse_failed)
+        polar_ready   = (not collector.use_polar)   or (collector._polar_ready.is_set() and not polar_failed)
         gsr_ready     = (not collector.use_gsr)     or collector._gsr_ready.is_set()
         arduino_ready = (not collector.use_arduino) or collector._arduino_ready.is_set()
 
-        for key, ready, failed, enabled in [
-            ('-MUSE_S-',    muse_ready,  muse_failed,  collector.use_muse),
-            ('-POLAR_S-',   polar_ready, False,         collector.use_polar),
-            ('-GSR_S-',     gsr_ready,   False,         collector.use_gsr),
-            ('-ARDUINO_S-', arduino_ready, False,       collector.use_arduino),
+        polar_retry = getattr(collector, '_polar_retry_status', '')
+
+        for key, ready, failed, enabled, retry_msg in [
+            ('-MUSE_S-',    muse_ready,    muse_failed,   collector.use_muse,    ''),
+            ('-POLAR_S-',   polar_ready,   polar_failed,  collector.use_polar,   polar_retry),
+            ('-GSR_S-',     gsr_ready,     False,         collector.use_gsr,     ''),
+            ('-ARDUINO_S-', arduino_ready, False,         collector.use_arduino, ''),
         ]:
             if not enabled:
                 continue  # leave label as 'Disabled'
@@ -399,11 +402,21 @@ def show_reconnect_screen(collector: 'SynchronizedCollector') -> bool:
                     elem.update(value='FAILED - restart', text_color='red')
                 elif ready:
                     elem.update(value='Ready', text_color='green')
+                elif retry_msg:
+                    elem.update(value=retry_msg, text_color='darkorange')
                 else:
                     elem.update(value='Connecting...', text_color='orange')
 
         if muse_ready and polar_ready and gsr_ready and arduino_ready:
             result = True
+            break
+
+        # Auto-abort if Polar exhausted all retries
+        if polar_failed:
+            sg.popup_error(
+                'Polar H10 failed to connect after all retry attempts.\n'
+                'Please check the device and restart the experiment.',
+                title='Polar Connection Failed', font=('Helvetica', 11))
             break
 
     window.close()
