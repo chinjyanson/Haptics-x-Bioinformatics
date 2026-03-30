@@ -536,7 +536,7 @@ def _compute_mean_p300(data: dict, device: str) -> float:
         ss = data[pid][device]["session_summary"]
         if ss is None:
             continue
-        p300 = ss.get("p300_amplitude_by_condition", {})
+        p300 = ss.get("task_onset_erp_peak_by_condition", {})
         task_vals = [v for v in p300.values() if v is not None]
         if task_vals:
             vals.append(np.mean(task_vals))
@@ -789,58 +789,41 @@ def plot_nasa_tlx(data: dict, out_dir: str):
 
 
 # ---------------------------------------------------------------------------
-# Plot H: P300 amplitude & latency
+# Plot H: Task-onset ERP peak amplitude (TP_pool, 250–600 ms)
 # ---------------------------------------------------------------------------
 
 def plot_p300_grand(data: dict, out_dir: str):
-    """Two-panel bar chart: mean P300 amplitude and latency per device."""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
-    fig.suptitle("P300 Grand Average per Device", fontsize=13, fontweight="bold")
+    """Bar chart: mean task-onset ERP peak amplitude (TP_pool, 250–600 ms) per device."""
+    fig, ax = plt.subplots(figsize=(7, 5))
+    fig.suptitle("Task-Onset ERP Peak Amplitude per Device\n(TP_pool, 250–600 ms)",
+                 fontsize=12, fontweight="bold")
 
+    x = np.arange(len(DEVICES))
+    means, sems, all_pts = [], [], []
     for device in DEVICES:
-        amp_vals = []
-        lat_vals = []
+        vals = []
         for pid in data:
             ss = data[pid][device]["session_summary"]
             if ss is None:
                 continue
-            amps = [v for v in ss.get("p300_amplitude_by_condition", {}).values() if v is not None]
-            lats = [v for v in ss.get("p300_latency_by_condition",   {}).values() if v is not None]
-            if amps:
-                amp_vals.append(np.mean(amps))
-            if lats:
-                lat_vals.append(np.mean(lats))
+            task_vals = [v for v in ss.get("task_onset_erp_peak_by_condition", {}).values()
+                         if v is not None]
+            if task_vals:
+                vals.append(np.mean(task_vals))
+        means.append(safe_mean(vals))
+        sems.append(safe_sem(vals))
+        all_pts.append(vals)
 
-    devs = DEVICES
-    for ax, label, vals_key, ylabel in [
-        (ax1, "P300 Amplitude (µV)", "amplitude", "Amplitude (µV)"),
-        (ax2, "P300 Latency (ms)",   "latency",   "Latency (ms)"),
-    ]:
-        device_vals = {}
-        for device in devs:
-            raw = []
-            for pid in data:
-                ss = data[pid][device]["session_summary"]
-                if ss is None:
-                    continue
-                key = f"p300_{vals_key}_by_condition"
-                task_vals = [v for v in ss.get(key, {}).values() if v is not None]
-                if task_vals:
-                    raw.append(np.mean(task_vals))
-            device_vals[device] = (safe_mean(raw), safe_sem(raw))
-
-        x = np.arange(len(devs))
-        means = [device_vals[d][0] for d in devs]
-        sems  = [device_vals[d][1] for d in devs]
-        ax.bar(x, means, yerr=sems, capsize=5,
-               color=[DEVICE_COLORS[d] for d in devs],
-               error_kw={"elinewidth": 1.5})
-        ax.set_xticks(x)
-        ax.set_xticklabels([DEVICE_LABELS[d] for d in devs])
-        ax.set_ylabel(ylabel)
-        ax.set_title(label)
-        if vals_key == "amplitude":
-            ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+    ax.bar(x, means, yerr=sems, capsize=5,
+           color=[DEVICE_COLORS[d] for d in DEVICES],
+           error_kw={"elinewidth": 1.5}, zorder=2)
+    for i, pts in enumerate(all_pts):
+        jitter = np.random.uniform(-0.08, 0.08, len(pts))
+        ax.scatter(i + jitter, pts, color="black", s=25, zorder=3, alpha=0.8)
+    ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+    ax.set_xticks(x)
+    ax.set_xticklabels([DEVICE_LABELS[d] for d in DEVICES])
+    ax.set_ylabel("Mean Amplitude (µV)")
 
     plt.tight_layout()
     out_path = os.path.join(out_dir, "plot_p300_grand.png")
@@ -978,50 +961,6 @@ def plot_theta_alpha_grand(data: dict, out_dir: str):
 
 
 # ---------------------------------------------------------------------------
-# Plot L: Signal complexity (PermEn + DFA)
-# ---------------------------------------------------------------------------
-
-def plot_complexity_grand(data: dict, out_dir: str):
-    """Two-panel bar chart: PermEn and DFA per device."""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
-    fig.suptitle("Signal Complexity Grand Average per Device", fontsize=13, fontweight="bold")
-
-    metrics = [
-        (ax1, "permen_by_condition",   "Permutation Entropy (PermEn)", "PermEn"),
-        (ax2, "dfa_alpha_by_condition", "DFA Exponent (α)",             "DFA α"),
-    ]
-    for ax, key, title, ylabel in metrics:
-        x = np.arange(len(DEVICES))
-        means, sems, all_pts = [], [], []
-        for device in DEVICES:
-            vals = []
-            for pid in data:
-                ss = data[pid][device]["session_summary"]
-                if ss is None:
-                    continue
-                metric_vals = [v for v in ss.get(key, {}).values() if v is not None]
-                if metric_vals:
-                    vals.append(np.mean(metric_vals))
-            means.append(safe_mean(vals))
-            sems.append(safe_sem(vals))
-            all_pts.append(vals)
-
-        ax.bar(x, means, yerr=sems, capsize=5,
-               color=[DEVICE_COLORS[d] for d in DEVICES],
-               error_kw={"elinewidth": 1.5}, zorder=2)
-        for i, pts in enumerate(all_pts):
-            jitter = np.random.uniform(-0.05, 0.05, len(pts))
-            ax.scatter(i + jitter, pts, color="black", s=25, zorder=3, alpha=0.8)
-        ax.set_xticks(x)
-        ax.set_xticklabels([DEVICE_LABELS[d] for d in DEVICES])
-        ax.set_ylabel(ylabel)
-        ax.set_title(title)
-
-    plt.tight_layout()
-    out_path = os.path.join(out_dir, "plot_complexity_grand.png")
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"[grand_analysis] Saved {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -1098,7 +1037,6 @@ def main():
     plot_hr_grand(data, out_dir)
     plot_theta_alpha_grand(data, out_dir)
 
-    plot_complexity_grand(data, out_dir)
     plot_detection_accuracy(data, out_dir)
 
     print(f"\n[grand_analysis] Done. All outputs saved to {out_dir}/")

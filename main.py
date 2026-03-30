@@ -27,12 +27,12 @@ from arduino.bridge import ArduinoBridge, TimestampedArduinoEvent, ARDUINO_DEFAU
 
 # ── Device enable flags — set to False to run without a device ────────────────
 USE_MUSE    = True
-USE_POLAR   = True
-USE_GSR     = True
+USE_POLAR   = False
+USE_GSR     = False
 USE_ARDUINO = True
 
 # ── Baseline recording flag — set to False to skip baseline at session start ──
-RUN_BASELINE = True
+RUN_BASELINE = False
 
 from haptics import HapticsController, load_haptic_targets
 import baseline

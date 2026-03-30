@@ -4,8 +4,9 @@
  * Inputs:
  *   Rotary encoder phase A → pin 2 (INT0), phase B → pin 3 (INT1)
  * Outputs:
- *   Vibration motor 1 (via transistor / motor driver) on PWM pin 9
- *   Vibration motor 2 (via transistor / motor driver) on PWM pin 10
+ *   Vibration motor 1 (via transistor / motor driver) on PWM pin 5  (Timer 0)
+ *   Vibration motor 2 (via transistor / motor driver) on PWM pin 11 (Timer 2)
+ *   Servo motor (shape-changing device) on pin 8
  *
  * Serial protocol (115200 baud, JSON lines):
  *
@@ -14,6 +15,7 @@
  *     {"cmd":"stop"}                                  — stop, zero both motors; ack sent back
  *     {"cmd":"set_vibration","motor":1,"intensity":N} — set motor 1 PWM 0-255; no ack
  *     {"cmd":"set_vibration","motor":2,"intensity":N} — set motor 2 PWM 0-255; no ack
+ *     {"cmd":"set_servo","angle":N}                   — set servo to angle 0-180°; no ack
  *     {"cmd":"set_report_interval","ms":N}            — set encoder report interval (10-1000 ms)
  *
  *   Arduino → Python:
@@ -22,17 +24,22 @@
  *     {"type":"ack","cmd":"start","task":N} — start command acknowledgement (also resets position to 0)
  *     {"type":"ack","cmd":"stop"}           — stop command acknowledgement
  *
- *   Pin assignments: ENC_A=2(INT0)  ENC_B=3(INT1)  VIB1=9(PWM)  VIB2=10(PWM)
+ *   Pin assignments: ENC_A=2(INT0)  ENC_B=3(INT1)  VIB1=5(PWM/T0)  VIB2=11(PWM/T2)  SERVO=8
  */
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <Servo.h>
 
 // ── Pin assignments ───────────────────────────────────────────────────────────
 static const uint8_t ENC_A   = 2;   // INT0 — encoder phase A
 static const uint8_t ENC_B   = 3;   // INT1 — encoder phase B
-static const uint8_t VIB1    = 9;   // PWM pin for vibration motor 1
-static const uint8_t VIB2    = 10;  // PWM pin for vibration motor 2
+static const uint8_t VIB1    = 5;   // PWM pin for vibration motor 1 (Timer 0 — avoids Timer 1 conflict with Servo)
+static const uint8_t VIB2    = 11;  // PWM pin for vibration motor 2 (Timer 2 — avoids Timer 1 conflict with Servo)
+static const uint8_t SERVO_PIN = 8; // Servo signal pin (shape-changing device)
+
+// ── Servo instance ────────────────────────────────────────────────────────────
+static Servo shapeServo;
 
 // ── Encoder state (volatile — shared with ISR) ────────────────────────────────
 volatile int32_t encoderDelta = 0;
@@ -83,6 +90,7 @@ void handleCommand(const char* jsonStr) {
     } else if (strcmp(cmd, "stop") == 0) {
         analogWrite(VIB1, 0);
         analogWrite(VIB2, 0);
+        shapeServo.write(90);  // Return servo to neutral centre
         StaticJsonDocument<48> ack;
         ack["type"] = "ack";
         ack["cmd"]  = "stop";
@@ -102,6 +110,11 @@ void handleCommand(const char* jsonStr) {
             analogWrite(VIB1, (uint8_t)intensity);
         }
         // No ack — high-frequency motor commands must not flood the serial link
+
+    } else if (strcmp(cmd, "set_servo") == 0) {
+        int angle = constrain(doc["angle"] | 90, 0, 180);
+        shapeServo.write(angle);
+        // No ack — high-frequency servo commands must not flood the serial link
     }
 }
 
@@ -115,6 +128,8 @@ void setup() {
     pinMode(VIB2,  OUTPUT);
     analogWrite(VIB1, 0);
     analogWrite(VIB2, 0);
+    shapeServo.attach(SERVO_PIN);
+    shapeServo.write(90);  // Start at neutral centre
 
     // Reduce stream timeout so readBytesUntil() doesn't block the loop for 1 s
     Serial.setTimeout(50);

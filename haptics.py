@@ -130,6 +130,7 @@ class HapticsController:
         if self._arduino is not None:
             self._arduino.send_command({"cmd": "set_vibration", "motor": 1, "intensity": 0})
             self._arduino.send_command({"cmd": "set_vibration", "motor": 2, "intensity": 0})
+            self._arduino.send_command({"cmd": "set_servo", "angle": 90})
 
     def set_target(self, target_ticks: int) -> None:
         """Set a new target for the current task and reset the encoder position to 0."""
@@ -193,8 +194,33 @@ class HapticsController:
         self._arduino.send_command({"cmd": "set_vibration", "motor": 2, "intensity": m2})
 
     def _update_shape(self, error: int) -> None:
-        """Stub for shape-changing device (servo motor — future implementation)."""
-        pass  # TODO: send servo position command when hardware is integrated
+        """Drive the servo motor proportionally to encoder error.
+
+        Matches the same directional convention as vibration/auditory:
+          error < 0  → need to go CW  → servo sweeps toward 0°
+          error > 0  → need to go CCW → servo sweeps toward 180°
+          dead zone  → servo returns to neutral 90°
+
+        Uses HAPTIC_MAX_ERROR so the sensitivity matches auditory and vibration.
+        """
+        if self._arduino is None:
+            return
+
+        now = time.time()
+        if now - self._last_motor_update < HAPTIC_MOTOR_INTERVAL:
+            return
+        self._last_motor_update = now
+
+        if abs(error) <= HAPTIC_DEAD_ZONE:
+            angle = 90
+        else:
+            proportion = min(abs(error) / 500, 1.0)
+            if error < 0:   # Need to go CW  → deflect toward 20°
+                angle = int(90 - proportion * 70)
+            else:            # Need to go CCW → deflect toward 160°
+                angle = int(90 + proportion * 70)
+
+        self._arduino.send_command({"cmd": "set_servo", "angle": angle})
 
     # ── Audio callback (runs in sounddevice audio thread) ─────────────────────
 

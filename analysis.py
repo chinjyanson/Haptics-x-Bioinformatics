@@ -1018,9 +1018,10 @@ def run_statistics(band_df, out_prefix=''):
 def save_session_summary(band_df, task_onset_epochs,
                          baseline_features, out_prefix=''):
     summary = {
-        'theta_alpha_ratio_by_condition': {},
-        'n_task_onset_epochs_accepted':   len(task_onset_epochs) if task_onset_epochs else 0,
-        'iaf_hz':                         baseline_features.get('IAF_hz') if baseline_features else None,
+        'theta_alpha_ratio_by_condition':    {},
+        'task_onset_erp_peak_by_condition':  {},
+        'n_task_onset_epochs_accepted':      len(task_onset_epochs) if task_onset_epochs else 0,
+        'iaf_hz':                            baseline_features.get('IAF_hz') if baseline_features else None,
     }
 
     if not band_df.empty:
@@ -1029,6 +1030,17 @@ def save_session_summary(band_df, task_onset_epochs,
             ta   = row.get('theta_alpha_ratio', np.nan)
             if not np.isnan(float(ta if ta is not None else np.nan)):
                 summary['theta_alpha_ratio_by_condition'][cond] = float(ta)
+
+    if task_onset_epochs:
+        ci_tp   = _ch_idx('TP_pool')
+        time_ms = task_onset_epochs[0]['time_ms']
+        p300_m  = (time_ms >= 250) & (time_ms <= 600)
+        by_cond = {}
+        for ep in task_onset_epochs:
+            cond = ep.get('condition', 'unknown')
+            by_cond.setdefault(cond, []).append(float(ep['data'][p300_m, ci_tp].mean()))
+        for cond, vals in by_cond.items():
+            summary['task_onset_erp_peak_by_condition'][cond] = float(np.mean(vals))
 
 
     def _sanitise(obj):

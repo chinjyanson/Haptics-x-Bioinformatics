@@ -10,6 +10,7 @@ Serial protocol (115200 baud, JSON lines) — see src/main.cpp for the C++ side.
     {"cmd":"stop"}                                  — stop, zero both motors; ack returned
     {"cmd":"set_vibration","motor":1,"intensity":N} — set motor 1 PWM 0-255; no ack
     {"cmd":"set_vibration","motor":2,"intensity":N} — set motor 2 PWM 0-255; no ack
+    {"cmd":"set_servo","angle":N}                   — set servo to angle 0-180°; no ack
 
   Arduino → Python:
     {"type":"ready"}                      — sent once on boot
@@ -17,7 +18,7 @@ Serial protocol (115200 baud, JSON lines) — see src/main.cpp for the C++ side.
     {"type":"ack","cmd":"start","task":N} — start acknowledgement
     {"type":"ack","cmd":"stop"}           — stop acknowledgement
 
-  Pin assignments: ENC_A=2(INT0)  ENC_B=3(INT1)  VIB1=9(PWM)  VIB2=10(PWM)
+  Pin assignments: ENC_A=2(INT0)  ENC_B=3(INT1)  VIB1=5(PWM/T0)  VIB2=11(PWM/T2)  SERVO=6
 """
 
 import json
