@@ -1,7 +1,8 @@
 """
 denoising.py - EEG preprocessing pipeline
 
-Applies notch filtering, wavelet denoising, EMD drift removal, and bandpass filtering.
+Applies notch filtering, wavelet denoising, EMD drift removal, EOG regression,
+and bandpass filtering.
 Produces two output files: erp_clean.csv (0.1-30Hz + Savitzky-Golay) and psd_clean.csv (1-45Hz).
 
 Usage:
@@ -161,6 +162,117 @@ def emd_drift_remove(sig, n_imfs=EMD_DRIFT_IMFS):
         return sig
 
 
+# --- Step 5: EOG artefact removal (pseudo-EOG from AF7/AF8) ---
+
+# Channels to clean — AF7/AF8 are the reference so excluded
+EOG_REFERENCE_CHANNELS  = ['AF7', 'AF8']
+EOG_TARGET_CHANNELS     = ['TP9', 'TP10']
+
+# Blink detection on the AF pseudo-EOG
+# Blink detection on the AF pseudo-EOG
+EOG_BLINK_LP_HZ        = 4.0   # Lowpass cutoff to isolate slow blink envelope
+EOG_BLINK_THRESHOLD_UV = 50.0  # AF pseudo-EOG amplitude to declare a blink (µV)
+EOG_BLINK_CONTEXT      = 154   # Samples each side of blink peak (±600 ms at 256 Hz)
+
+# Residual artefact interpolation on TP channels after bandpass
+EOG_TP_THRESHOLD_UV    = 60.0  # TP amplitude above which residual is interpolated
+
+
+def eog_regression(df):
+    """
+    Blink-gated OLS regression to remove EOG component from TP9/TP10.
+
+    Detects blink windows from the AF7/AF8 pseudo-EOG (lowpass + threshold),
+    estimates β only from blink-epoch samples, then subtracts β × EOG from
+    the full signal. Gating to blink windows avoids attenuating correlated
+    neural activity (e.g. frontal-temporal theta) during non-blink periods.
+    AF7/AF8 are left untouched.
+    """
+    df  = df.copy()
+    n   = len(df)
+    nyq = SAMPLE_RATE / 2.0
+
+    af7     = df['AF7'].values.astype(float)
+    af8     = df['AF8'].values.astype(float)
+    eog_raw = (af7 + af8) / 2.0
+
+    # Lowpass to isolate blink envelope
+    b, a   = signal.butter(4, EOG_BLINK_LP_HZ / nyq, btype='low')
+    padlen = 3 * (max(len(a), len(b)) - 1)
+    if n <= padlen:
+        print("[denoising] EOG: signal too short, skipping.")
+        return df
+    eog_lp = signal.filtfilt(b, a, eog_raw)
+
+    print(f"[denoising] EOG: pseudo-EOG peak={np.abs(eog_lp).max():.1f}µV, threshold={EOG_BLINK_THRESHOLD_UV}µV")
+    blink_mask = np.abs(eog_lp) > EOG_BLINK_THRESHOLD_UV
+    if not blink_mask.any():
+        print("[denoising] EOG: no blinks detected — skipping regression.")
+        return df
+
+    expanded = np.zeros(n, dtype=bool)
+    for idx in np.where(blink_mask)[0]:
+        lo = max(0, idx - EOG_BLINK_CONTEXT)
+        hi = min(n - 1, idx + EOG_BLINK_CONTEXT)
+        expanded[lo:hi + 1] = True
+
+    n_blinks = int(np.sum(np.diff(expanded.astype(int)) == 1))
+    print(f"[denoising] EOG: {n_blinks} blink(s) detected.")
+
+    eog_blink    = eog_raw[expanded] - eog_raw[expanded].mean()
+    denom        = np.dot(eog_blink, eog_blink)
+    eog_centered = eog_raw - eog_raw.mean()
+
+    for ch in EOG_TARGET_CHANNELS:
+        sig       = df[ch].values.astype(float)
+        sig_blink = sig[expanded] - sig[expanded].mean()
+        if denom >= 1e-12:
+            beta   = np.dot(eog_blink, sig_blink) / denom
+            df[ch] = sig - beta * eog_centered
+            print(f"[denoising] EOG regression: {ch} β={beta:.4f}")
+
+    return df
+
+
+def eog_interpolate_tp(df):
+    """
+    Stage 2 — Interpolate residual blink artefacts in TP9/TP10 after bandpass.
+    Any contiguous run of samples exceeding EOG_TP_THRESHOLD_UV is replaced
+    with linear interpolation between the nearest clean anchor points.
+    Called after bandpass filtering so the threshold operates on the filtered signal.
+    """
+    df    = df.copy()
+    n     = len(df)
+    t_all = np.arange(n)
+
+    for ch in EOG_TARGET_CHANNELS:
+        sig         = df[ch].values.astype(float)
+        artefact    = np.abs(sig) > EOG_TP_THRESHOLD_UV
+        if not artefact.any():
+            continue
+
+        sig_clean  = sig.copy()
+        padded     = np.concatenate([[False], artefact, [False]])
+        run_starts = np.where(np.diff(padded.astype(int)) == 1)[0]
+        run_ends   = np.where(np.diff(padded.astype(int)) == -1)[0]
+
+        n_interp = 0
+        for rs, re in zip(run_starts, run_ends):
+            pre = rs - 1
+            while pre > 0 and np.abs(sig[pre]) > EOG_TP_THRESHOLD_UV:
+                pre -= 1
+            post = re
+            while post < n - 1 and np.abs(sig[post]) > EOG_TP_THRESHOLD_UV:
+                post += 1
+            sig_clean[rs:re] = np.interp(t_all[rs:re], [pre, post], [sig[pre], sig[post]])
+            n_interp += re - rs
+
+        df[ch] = sig_clean
+        print(f"[denoising] EOG interpolation: {ch} — {n_interp} samples replaced.")
+
+    return df
+
+
 # --- Bandpass FIR ---
 
 def bandpass_fir(sig, fs=SAMPLE_RATE, low=ERP_HIGHPASS, high=ERP_LOWPASS):
@@ -182,7 +294,7 @@ def bandpass_fir(sig, fs=SAMPLE_RATE, low=ERP_HIGHPASS, high=ERP_LOWPASS):
     return signal.filtfilt(taps, 1.0, sig)
 
 
-# --- Step 6A: Savitzky-Golay ---
+# --- Step 6A: Savitzky-Golay (ERP path) ---
 
 def savitzky_golay(sig, window=SG_WINDOW, polyorder=SG_POLYORDER):
     """Smooth signal preserving ERP peak morphology."""
@@ -195,13 +307,14 @@ def savitzky_golay(sig, window=SG_WINDOW, polyorder=SG_POLYORDER):
 # --- ERP path (Steps 5A-7A) ---
 
 def run_erp_path(df, bad_segments):
-    """Apply bandpass 0.1-30Hz and Savitzky-Golay to all channels."""
+    """Apply bandpass 0.1-30Hz, Savitzky-Golay, then TP blink interpolation."""
     out = df.copy()
     for ch in CHANNELS:
         sig = df[ch].values.astype(float)
         sig = bandpass_fir(sig, fs=SAMPLE_RATE, low=ERP_HIGHPASS, high=ERP_LOWPASS)
         sig = savitzky_golay(sig, window=SG_WINDOW, polyorder=SG_POLYORDER)
         out[ch] = sig
+    out = eog_interpolate_tp(out)
     out['bad_segment'] = bad_segments.values
     return out[['time'] + CHANNELS + ['bad_segment']]
 
@@ -209,12 +322,13 @@ def run_erp_path(df, bad_segments):
 # --- PSD path (Steps 5B-6B) ---
 
 def run_psd_path(df, bad_segments):
-    """Apply bandpass 1-45Hz to all channels."""
+    """Apply bandpass 1-45Hz, then TP blink interpolation."""
     out = df.copy()
     for ch in CHANNELS:
         sig = df[ch].values.astype(float)
         sig = bandpass_fir(sig, fs=SAMPLE_RATE, low=PSD_HIGHPASS, high=PSD_LOWPASS)
         out[ch] = sig
+    out = eog_interpolate_tp(out)
     out['bad_segment'] = bad_segments.values
     return out[['time'] + CHANNELS + ['bad_segment']]
 
@@ -235,17 +349,21 @@ def denoise_session(eeg_path, erp_out, psd_out):
     # Step 1: interpolate short gaps, flag long ones
     df, bad_segments = interpolate_dropouts(df, dropout_mask)
 
-    # Step 2: notch filter
+    # Step 2: EOG artefact removal — must run before wavelet/EMD compress blink amplitudes
+    print("[denoising] Applying EOG artefact removal...")
+    df = eog_regression(df)
+
+    # Step 3: notch filter
     print("[denoising] Applying notch filter (50 Hz)...")
     for ch in CHANNELS:
         df[ch] = notch_filter(df[ch].values)
 
-    # Step 3: wavelet denoising
+    # Step 4: wavelet denoising
     print("[denoising] Applying wavelet denoising...")
     for ch in CHANNELS:
         df[ch] = wavelet_denoise(df[ch].values)
 
-    # Step 4: EMD drift removal
+    # Step 5: EMD drift removal
     print("[denoising] Applying EMD drift removal...")
     for ch in CHANNELS:
         df[ch] = emd_drift_remove(df[ch].values)
