@@ -32,7 +32,7 @@ USE_GSR     = True
 USE_ARDUINO = True
 
 # ── Baseline recording flag — set to False to skip baseline at session start ──
-RUN_BASELINE = False
+RUN_BASELINE = True
 
 from haptics import HapticsController, load_haptic_targets
 import baseline
@@ -475,8 +475,12 @@ class SynchronizedCollector:
         # Data store with synchronized timestamps
         self.data_store = SynchronizedDataStore()
 
-        # Thread synchronization
-        self._lock = threading.Lock()
+        # Thread synchronization.
+        # Per-type locks prevent high-frequency EEG writes (256 Hz) from
+        # starving GSR, HR, Arduino, and GUI threads that need different data.
+        self._lock         = threading.Lock()   # general / markers
+        self._eeg_lock     = threading.Lock()   # EEG data only
+        self._gsr_lock     = threading.Lock()   # GSR data only
         self._stop_event = threading.Event()
 
         # Device instances (created during collection)
@@ -771,6 +775,10 @@ class SynchronizedCollector:
             # Outer loop — runs once per session slot; stays alive across all sessions
             total_samples = 0
             while not self._stop_event.is_set():
+                # Clear paused flag here so end_session() on the next session always
+                # gets a fresh wait (not a stale set from the previous session).
+                self._muse_paused.clear()
+
                 # Between sessions: drain buffer and wait for record_event
                 while not self._record_event.is_set() and not self._stop_event.is_set():
                     self.muse.get_data()  # prevent BrainFlow buffer overflow
@@ -790,15 +798,21 @@ class SynchronizedCollector:
 
                     if eeg_data is not None and eeg_data.shape[1] > 0:
                         n_samples = eeg_data.shape[1]
+                        # Build all samples first, then write in capped chunks so we
+                        # never hold self._lock for more than ~50 samples at a time.
+                        # This prevents starving GSR, Arduino, and GUI threads.
+                        batch = []
                         for i in range(n_samples):
                             sample_timestamp = float(hw_timestamps[i])
                             channel_values = {
                                 self.muse.channels[ch]: float(eeg_data[ch, i])
                                 for ch in range(self.muse.n_channels)
                             }
-                            with self._lock:
+                            batch.append((sample_timestamp, channel_values))
+                        with self._eeg_lock:
+                            for sample_timestamp, channel_values in batch:
                                 self.data_store.add_eeg_sample(sample_timestamp, channel_values)
-                            sample_count += 1
+                        sample_count += n_samples
 
                     time.sleep(0.01)
 
@@ -928,6 +942,11 @@ class SynchronizedCollector:
 
                     # Outer loop — stays alive across all sessions
                     while not self._stop_event.is_set():
+                        # Clear paused flag here so end_session() on the next
+                        # session always gets a fresh wait (not a stale set from
+                        # the previous session).
+                        self._polar_paused.clear()
+
                         # Between sessions: wait for record_event
                         while not self._record_event.is_set() and not self._stop_event.is_set():
                             await asyncio.sleep(0.01)
@@ -1002,11 +1021,15 @@ class SynchronizedCollector:
             else:
                 print("[GSR] Using existing connection...")
 
-            # Override the GSR's internal callback to feed our data store
-            original_callback = self.gsr._audio_callback
+            # Override the GSR's internal callback to feed our data store.
+            # IMPORTANT: never acquire self._lock inside this callback — it runs on
+            # the sounddevice real-time audio thread and would contend with the GUI
+            # thread, causing visible stutter or hangs.  Instead, append to a
+            # lock-free deque and drain it from the polling loop below.
+            _gsr_pending: deque = deque()
 
             def synchronized_callback(indata, frames, time_info, status):
-                """Custom callback that feeds data to our synchronized store."""
+                """Custom callback that stages GSR samples into _gsr_pending."""
                 if status:
                     print(f"[GSR] Audio status: {status}")
 
@@ -1025,8 +1048,8 @@ class SynchronizedCollector:
                 gsr_uS = self.gsr._convert_to_gsr(filt_ds)
                 timestamp = time.time()
 
-                with self._lock:
-                    self.data_store.add_gsr_sample(timestamp, raw_mean, filt_ds, gsr_uS)
+                # Append without holding the shared lock
+                _gsr_pending.append((timestamp, raw_mean, filt_ds, gsr_uS))
 
             # Start the audio stream with our custom callback
             import sounddevice as sd
@@ -1048,6 +1071,9 @@ class SynchronizedCollector:
 
             # Outer loop — stays alive across all sessions
             while not self._stop_event.is_set():
+                # Clear paused flag so end_session() always gets a fresh wait.
+                self._gsr_paused.clear()
+
                 # Between sessions: wait for record_event
                 while not self._record_event.is_set() and not self._stop_event.is_set():
                     time.sleep(0.01)
@@ -1057,18 +1083,36 @@ class SynchronizedCollector:
 
                 print("[GSR] Starting data collection...")
                 last_print = time.time()
+                total_drained = 0
 
-                # Inner recording loop — callback does the actual recording
+                # Inner recording loop — drain pending samples and print status
                 while self._record_event.is_set() and not self._stop_event.is_set():
+                    # Flush all samples staged by the audio callback into the data store.
+                    # Acquire the lock once per batch (not once per audio frame).
+                    if _gsr_pending:
+                        batch = []
+                        while _gsr_pending:
+                            batch.append(_gsr_pending.popleft())
+                        with self._gsr_lock:
+                            for ts, raw_mean, filt_ds, gsr_uS in batch:
+                                self.data_store.add_gsr_sample(ts, raw_mean, filt_ds, gsr_uS)
+                        total_drained += len(batch)
+
                     # Print status every 5 seconds
                     if time.time() - last_print >= 5.0:
-                        with self._lock:
-                            gsr_count = len(self.data_store.gsr_data)
-                            if gsr_count > 0:
-                                latest_gsr = self.data_store.gsr_data[-1].gsr_uS
-                                print(f"[GSR] GSR: {latest_gsr:.4f} µS | Total samples: {gsr_count}")
+                        print(f"[GSR] {total_drained} samples collected | pending={len(_gsr_pending)}")
+                        total_drained = 0
                         last_print = time.time()
                     time.sleep(0.1)
+
+                # Flush any samples that arrived between the last drain and now
+                if _gsr_pending:
+                    batch = []
+                    while _gsr_pending:
+                        batch.append(_gsr_pending.popleft())
+                    with self._gsr_lock:
+                        for ts, raw_mean, filt_ds, gsr_uS in batch:
+                            self.data_store.add_gsr_sample(ts, raw_mean, filt_ds, gsr_uS)
 
                 print("[GSR] Session paused.")
                 self._gsr_paused.set()

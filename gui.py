@@ -633,14 +633,16 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
         haptics.set_target(_targets[0])
         print(f"[Haptics] Session started. Task 1 target = {_targets[0]} ticks.")
 
-    # ── Oddball state machine initialisation ──────────────────────────────
-    # States: 'fixation' → show "+" and wait ISI, then → 'stimulus'
-    #         'stimulus' → show circle, then → 'fixation'
-    _ob_canvas      = window['-ODDBALL-']
-    _ob_state       = 'fixation'           # current state
-    _ob_deadline    = time.monotonic()     # when to transition next
-    _ob_trial       = 0
-    _ob_is_oddball  = False
+    # ── Oddball stimulus — background thread drives timing ────────────────
+    # The GUI thread must not sleep for timing: any lock contention or Tk
+    # processing overhead causes missed deadlines and scrambled P300 epochs.
+    # Solution: a daemon thread owns all sleep() calls and pushes draw
+    # commands onto _ob_queue; the GUI loop drains that queue each tick.
+    import queue as _queue_mod
+
+    _ob_canvas  = window['-ODDBALL-']
+    _ob_queue: _queue_mod.Queue = _queue_mod.Queue()
+    _ob_stop    = threading.Event()
 
     def _ob_draw_fixation():
         _ob_canvas.erase()
@@ -652,9 +654,43 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
         _ob_canvas.erase()
         _ob_canvas.draw_circle((_OB_CX, _OB_CY), _OB_R, fill_color=colour, line_color=colour)
 
-    _ob_draw_fixation()
+    def _ob_thread_fn():
+        """Runs in a daemon thread. Sleeps precisely and queues draw commands."""
+        trial = 0
+        isi_s   = (_OB_SOA_MS - _OB_STIM_MS) / 1000.0
+        stim_s  = _OB_STIM_MS / 1000.0
+        _ob_queue.put(('fixation',))
+        while not _ob_stop.is_set():
+            # ISI — fixation cross already shown; sleep until next stimulus
+            deadline = time.monotonic() + isi_s
+            remaining = deadline - time.monotonic()
+            while remaining > 0 and not _ob_stop.is_set():
+                time.sleep(min(remaining, 0.005))
+                remaining = deadline - time.monotonic()
+            if _ob_stop.is_set():
+                break
 
-    # Update loop — 50 ms timeout gives ~20 Hz tick for oddball state machine
+            is_oddball = random.random() < _OB_PROB
+            onset_time = time.time()
+            _ob_queue.put(('stimulus', is_oddball, onset_time, trial))
+            trial += 1
+
+            # Stimulus on-time
+            deadline = time.monotonic() + stim_s
+            remaining = deadline - time.monotonic()
+            while remaining > 0 and not _ob_stop.is_set():
+                time.sleep(min(remaining, 0.005))
+                remaining = deadline - time.monotonic()
+            if _ob_stop.is_set():
+                break
+
+            _ob_queue.put(('fixation',))
+
+    _ob_thread = threading.Thread(target=_ob_thread_fn, daemon=True, name="OddballThread")
+    _ob_thread.start()
+
+    # Update loop — 50 ms timeout keeps the queue drain responsive.
+    # Oddball timing is owned by _ob_thread, not this loop.
     while True:
         event, _ = window.read(timeout=50)
 
@@ -667,7 +703,17 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
                 if ev.event_type == "encoder":
                     delta = ev.data.get("delta", 0)
                     haptics.update_encoder(delta)
-                    print(f"[Haptics] encoder delta={delta:+d}  pos={haptics.current_position:+d}  L={haptics._left_gain:.2f}  R={haptics._right_gain:.2f}")
+                    error = haptics.current_position - haptics.target
+                    if haptics._mode == "shape_changing":
+                        from haptics import HAPTIC_SERVO_MAX_ERROR, HAPTIC_SERVO_MAX_DEG, HAPTIC_DEAD_ZONE
+                        if abs(error) <= HAPTIC_DEAD_ZONE:
+                            servo_angle = 90
+                        else:
+                            prop = min(abs(error) / HAPTIC_SERVO_MAX_ERROR, 1.0)
+                            servo_angle = int(90 + prop * HAPTIC_SERVO_MAX_DEG) if error < 0 else int(90 - prop * HAPTIC_SERVO_MAX_DEG)
+                        print(f"[Haptics] encoder delta={delta:+d}  pos={haptics.current_position:+d}  error={error:+d}  servo={servo_angle}°")
+                    else:
+                        print(f"[Haptics] encoder delta={delta:+d}  pos={haptics.current_position:+d}  L={haptics._left_gain:.2f}  R={haptics._right_gain:.2f}")
 
         if event == "-NEXT_TASK-":
             # Record error before advancing
@@ -714,19 +760,15 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
         seconds = int(elapsed % 60)
         window['-DURATION-'].update(f'{hours:02d}:{minutes:02d}:{seconds:02d}')
 
-        with collector._lock:
+        with collector._eeg_lock:
             eeg_count = len(collector.data_store.eeg_data)
-            hr_count = len(collector.data_store.hr_data)
+        with collector._gsr_lock:
             gsr_count = len(collector.data_store.gsr_data)
+            latest_gsr = collector.data_store.gsr_data[-1].gsr_uS if gsr_count > 0 else None
+        with collector._lock:
+            hr_count = len(collector.data_store.hr_data)
             arduino_count = len(collector.data_store.arduino_data)
-            if collector.data_store.hr_data:
-                latest_hr = collector.data_store.hr_data[-1].heart_rate
-            else:
-                latest_hr = None
-            if collector.data_store.gsr_data:
-                latest_gsr = collector.data_store.gsr_data[-1].gsr_uS
-            else:
-                latest_gsr = None
+            latest_hr = collector.data_store.hr_data[-1].heart_rate if collector.data_store.hr_data else None
 
         window['-EEG_COUNT-'].update(str(eeg_count))
         window['-HR_COUNT-'].update(str(hr_count))
@@ -737,31 +779,30 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
         if latest_gsr is not None:
             window['-LATEST_GSR-'].update(f'{latest_gsr:.4f} µS')
 
-        # ── Oddball state machine tick ─────────────────────────────────────
-        now = time.monotonic()
-        if _ob_state == 'fixation' and now >= _ob_deadline:
-            # ISI elapsed — pick and show next stimulus
-            _ob_is_oddball = random.random() < _OB_PROB
-            _ob_draw_stimulus(_ob_is_oddball)
-            onset_time = time.time()
-            stim_label = "oddball" if _ob_is_oddball else "standard"
-            with collector._lock:
-                collector.data_store.add_task_marker(
-                    timestamp=onset_time,
-                    task_number=0,
-                    event="oddball_onset" if _ob_is_oddball else "standard_onset",
-                    extra={"stim_type": stim_label, "trial_number": _ob_trial},
-                )
-            print(f"[Oddball] trial {_ob_trial + 1:04d}: {stim_label}")
-            _ob_trial    += 1
-            _ob_state     = 'stimulus'
-            _ob_deadline  = now + _OB_STIM_MS / 1000.0
+        # ── Drain oddball draw commands from background thread ────────────
+        while True:
+            try:
+                cmd = _ob_queue.get_nowait()
+            except _queue_mod.Empty:
+                break
+            if cmd[0] == 'fixation':
+                _ob_draw_fixation()
+            elif cmd[0] == 'stimulus':
+                _, is_oddball, onset_time, trial_num = cmd
+                _ob_draw_stimulus(is_oddball)
+                stim_label = "oddball" if is_oddball else "standard"
+                with collector._lock:
+                    collector.data_store.add_task_marker(
+                        timestamp=onset_time,
+                        task_number=0,
+                        event="oddball_onset" if is_oddball else "standard_onset",
+                        extra={"stim_type": stim_label, "trial_number": trial_num},
+                    )
+                print(f"[Oddball] trial {trial_num + 1:04d}: {stim_label}")
 
-        elif _ob_state == 'stimulus' and now >= _ob_deadline:
-            # Stimulus duration elapsed — return to fixation
-            _ob_draw_fixation()
-            _ob_state    = 'fixation'
-            _ob_deadline = now + (_OB_SOA_MS - _OB_STIM_MS) / 1000.0
+    # Stop oddball thread
+    _ob_stop.set()
+    _ob_thread.join(timeout=1.0)
 
     # Stop haptics before threads so motors are zeroed and audio is silenced
     if haptics is not None:

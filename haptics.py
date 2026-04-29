@@ -1,16 +1,16 @@
 """
 haptics.py — Real-time haptic feedback controller for BCI FYP.
 
-Manages auditory (stereo-panned sine tone) and vibration motor feedback
-during experiment sessions, guided by rotary encoder position vs. target.
+Manages auditory (stereo-panned sine tone), vibration motor, and servo
+feedback during experiment sessions, guided by rotary encoder position vs. target.
 
 Session modes
 -------------
   "auditory"      — stereo-panned 440 Hz sine tone via USB-C audio output
                     left channel louder → turn CW (away from sound); right → turn CCW (away from sound)
   "vibrations"    — motor 1 = CCW cue, motor 2 = CW cue (PWM intensity ∝ error)
-  "shape_changing" — encoder tracking + task-error markers only;
-                    servo motor integration is a future stub
+  "shape_changing" — servo motor on pin 8; deflects ±HAPTIC_SERVO_MAX_DEG from neutral 90°,
+                    proportional to encoder error (same HAPTIC_MAX_ERROR scale as other modes)
 
 Configuration constants can be overridden by importing and reassigning before
 constructing a HapticsController, or by editing this file directly.
@@ -26,9 +26,11 @@ import numpy as np
 # ── Configuration ─────────────────────────────────────────────────────────────
 HAPTIC_TARGETS_FILE   = "haptic_targets.json"  # Edit this file between experiments
 HAPTIC_MAX_ERROR      = 10000   # Ticks at which feedback reaches maximum intensity
-HAPTIC_DEAD_ZONE      = 5     # Ticks of silence around the target (±)
-HAPTIC_TONE_HZ        = 440   # Sine tone frequency for auditory feedback (Hz)
-HAPTIC_MOTOR_INTERVAL = 0   # Minimum seconds between vibration motor command updates
+HAPTIC_DEAD_ZONE      = 5       # Ticks of silence around the target (±)
+HAPTIC_TONE_HZ        = 440     # Sine tone frequency for auditory feedback (Hz)
+HAPTIC_MOTOR_INTERVAL = 0       # Minimum seconds between vibration motor command updates
+HAPTIC_SERVO_MAX_DEG  = 70      # Max servo deflection from neutral 90° (i.e. range 20°–160°)
+HAPTIC_SERVO_MAX_ERROR = 5000   # Ticks at which servo reaches max deflection (separate from other modes)
 
 
 # ── Target loader ─────────────────────────────────────────────────────────────
@@ -196,12 +198,13 @@ class HapticsController:
     def _update_shape(self, error: int) -> None:
         """Drive the servo motor proportionally to encoder error.
 
-        Matches the same directional convention as vibration/auditory:
-          error < 0  → need to go CW  → servo sweeps toward 0°
-          error > 0  → need to go CCW → servo sweeps toward 180°
+        Opposite directional convention to vibration/auditory (servo is inverted):
+          error < 0  → need to go CW  → servo sweeps toward (90 + HAPTIC_SERVO_MAX_DEG)°
+          error > 0  → need to go CCW → servo sweeps toward (90 - HAPTIC_SERVO_MAX_DEG)°
           dead zone  → servo returns to neutral 90°
 
-        Uses HAPTIC_MAX_ERROR so the sensitivity matches auditory and vibration.
+        Proportion is computed against HAPTIC_SERVO_MAX_ERROR (independent of
+        the other modes) to allow separate sensitivity tuning.
         """
         if self._arduino is None:
             return
@@ -214,13 +217,15 @@ class HapticsController:
         if abs(error) <= HAPTIC_DEAD_ZONE:
             angle = 90
         else:
-            proportion = min(abs(error) / 500, 1.0)
-            if error < 0:   # Need to go CW  → deflect toward 20°
-                angle = int(90 - proportion * 70)
-            else:            # Need to go CCW → deflect toward 160°
-                angle = int(90 + proportion * 70)
+            proportion = min(abs(error) / HAPTIC_SERVO_MAX_ERROR, 1.0)
+            if error < 0:   # Need to go CW  → deflect above neutral (inverted)
+                angle = int(90 + proportion * HAPTIC_SERVO_MAX_DEG)
+            else:            # Need to go CCW → deflect below neutral (inverted)
+                angle = int(90 - proportion * HAPTIC_SERVO_MAX_DEG)
 
-        self._arduino.send_command({"cmd": "set_servo", "angle": angle})
+        sent = self._arduino.send_command({"cmd": "set_servo", "angle": angle})
+        if not sent:
+            print(f"[Haptics] WARNING: set_servo command failed (serial not open?)")
 
     # ── Audio callback (runs in sounddevice audio thread) ─────────────────────
 
