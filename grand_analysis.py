@@ -15,7 +15,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy import interpolate
+from scipy import interpolate, signal as scipy_signal, integrate
 
 warnings.filterwarnings("ignore")
 
@@ -520,14 +520,21 @@ def _compute_mean_hr(data: dict, device: str) -> float:
     return safe_mean(vals)
 
 
-def _compute_mean_gsr(data: dict, device: str) -> float:
-    vals = []
+def _compute_gsr_grand_metrics(data: dict, device: str):
+    """Return (mean_scl, scr_rate, scr_amplitude) averaged across participants."""
+    scls, rates, amps = [], [], []
     for pid in data:
         gsr_df = data[pid][device]["gsr"]
         if gsr_df is None or gsr_df.empty:
             continue
-        vals.append(gsr_df["gsr_uS"].mean())
-    return safe_mean(vals)
+        scl, rate, amp = _compute_gsr_metrics_from_df(gsr_df)
+        if not np.isnan(scl):
+            scls.append(scl)
+        if not np.isnan(rate):
+            rates.append(rate)
+        if not np.isnan(amp):
+            amps.append(amp)
+    return safe_mean(scls), safe_mean(rates), safe_mean(amps)
 
 
 def _compute_mean_p300(data: dict, device: str) -> float:
@@ -559,12 +566,15 @@ def plot_summary_table(data: dict, out_dir: str):
     """Save grand_stats_summary.csv and a matplotlib table PNG."""
     rows = []
     for device in DEVICES:
+        mean_scl, scr_rate, scr_amp = _compute_gsr_grand_metrics(data, device)
         rows.append({
             "Device":              DEVICE_LABELS[device],
             "Encoder MSE":         round(_compute_encoder_mse(data, device), 2),
             "Mean Task Time (s)":  round(_compute_mean_task_time(data, device), 2),
             "Mean HR (bpm)":       round(_compute_mean_hr(data, device), 2),
-            "Mean GSR (µS)":       round(_compute_mean_gsr(data, device), 6),
+            "Mean SCL (µS)":       round(mean_scl, 6),
+            "NS-SCR Rate (/min)":  round(scr_rate, 3),
+            "SCR Amplitude (µS)":  round(scr_amp, 6),
             "P300 Amp (µV)":       round(_compute_mean_p300(data, device), 3),
             "NASA-TLX Avg":        round(_compute_nasa_avg(data, device), 2),
         })
@@ -686,16 +696,83 @@ def plot_erd_ers_grand(data: dict, out_dir: str):
 
 
 # ---------------------------------------------------------------------------
-# Plot F: GSR grand average — normalised time line graph
+# Plot F: GSR grand average — timeseries + SCL / SCR metrics
 # ---------------------------------------------------------------------------
 
+# Tonic/phasic decomposition parameters (must match analysis.py)
+_GSR_TONIC_LP_HZ  = 0.05   # Hz — SCL lowpass cutoff
+_GSR_SCR_MIN_AMP  = 0.01   # µS — minimum SCR peak height
+_GSR_SCR_MIN_DIST = 1.0    # seconds — minimum inter-peak distance
+
+
+def _gsr_decompose(gsr_df: pd.DataFrame):
+    """
+    Decompose a GSR DataFrame into tonic (SCL) and phasic (SCR) components.
+
+    Returns (tonic, phasic, peaks, fs) or None if signal is too short.
+    """
+    sig   = gsr_df["gsr_uS"].values.astype(float)
+    times = gsr_df["time"].values.astype(float)
+    n     = len(sig)
+    if n < 10:
+        return None
+
+    dt = float(np.median(np.diff(times)))
+    fs = 1.0 / dt if dt > 0 else 50.0
+
+    nyq    = fs / 2.0
+    cutoff = min(_GSR_TONIC_LP_HZ, nyq * 0.9)
+    order  = 2
+    padlen = 3 * order * max(1, int(np.ceil(fs / cutoff)))
+    if n > padlen:
+        b, a  = scipy_signal.butter(order, cutoff / nyq, btype="low")
+        tonic = scipy_signal.filtfilt(b, a, sig)
+    else:
+        tonic = np.full(n, np.mean(sig))
+
+    phasic           = sig - tonic
+    min_dist_samples = max(1, int(_GSR_SCR_MIN_DIST * fs))
+    peaks, props     = scipy_signal.find_peaks(
+        phasic, height=_GSR_SCR_MIN_AMP, distance=min_dist_samples
+    )
+    return tonic, phasic, peaks, props, fs
+
+
+def _compute_gsr_metrics_from_df(gsr_df: pd.DataFrame):
+    """Return (mean_scl, scr_rate_per_min, mean_scr_amplitude) for one session."""
+    result = _gsr_decompose(gsr_df)
+    if result is None:
+        return np.nan, np.nan, np.nan
+    tonic, phasic, peaks, props, fs = result
+    times        = gsr_df["time"].values.astype(float)
+    duration_min = (times[-1] - times[0]) / 60.0
+    mean_scl     = float(np.mean(tonic))
+    scr_rate     = len(peaks) / duration_min if duration_min > 0 else np.nan
+    mean_scr_amp = float(np.mean(props["peak_heights"])) if len(peaks) > 0 else 0.0
+    return mean_scl, scr_rate, mean_scr_amp
+
+
 def plot_gsr_grand(data: dict, out_dir: str):
-    """Interpolate each participant's GSR to 1000 common time points (0–1), then average."""
+    """
+    Four-panel grand average GSR figure:
+      1. Mean GSR timeseries (normalised 0-100% session time)
+      2. Mean SCL per device (bar chart with participant scatter)
+      3. NS-SCR Rate per device
+      4. Mean SCR Amplitude per device
+    """
     N_POINTS = 1000
     common_t = np.linspace(0, 1, N_POINTS)
 
-    fig, ax = plt.subplots(figsize=(11, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("Grand Average GSR — Tonic & Phasic Metrics per Device",
+                 fontsize=13, fontweight="bold")
 
+    ax_ts  = axes[0, 0]   # timeseries
+    ax_scl = axes[0, 1]   # mean SCL bar
+    ax_scr = axes[1, 0]   # NS-SCR rate bar
+    ax_amp = axes[1, 1]   # SCR amplitude bar
+
+    # ── Panel 1: GSR timeseries ───────────────────────────────────────────────
     for device in DEVICES:
         traces = []
         for pid in data:
@@ -707,31 +784,68 @@ def plot_gsr_grand(data: dict, out_dir: str):
             if times.max() == 0:
                 continue
             t_norm = times / times.max()
-            # interpolate
             try:
                 f = interpolate.interp1d(t_norm, vals, kind="linear",
-                                         bounds_error=False, fill_value=(vals[0], vals[-1]))
+                                         bounds_error=False,
+                                         fill_value=(vals[0], vals[-1]))
                 traces.append(f(common_t))
             except Exception:
                 continue
-
         if not traces:
             continue
-        arr = np.array(traces)  # (n_participants, N_POINTS)
+        arr        = np.array(traces)
         mean_trace = arr.mean(axis=0)
-        sem_trace  = arr.std(axis=0, ddof=1) / np.sqrt(arr.shape[0]) if arr.shape[0] > 1 else np.zeros(N_POINTS)
+        sem_trace  = (arr.std(axis=0, ddof=1) / np.sqrt(arr.shape[0])
+                      if arr.shape[0] > 1 else np.zeros(N_POINTS))
+        ax_ts.plot(common_t * 100, mean_trace,
+                   label=DEVICE_LABELS[device], color=DEVICE_COLORS[device], lw=2)
+        ax_ts.fill_between(common_t * 100,
+                           mean_trace - sem_trace, mean_trace + sem_trace,
+                           color=DEVICE_COLORS[device], alpha=0.2)
 
-        ax.plot(common_t * 100, mean_trace, label=DEVICE_LABELS[device],
-                color=DEVICE_COLORS[device], linewidth=2)
-        ax.fill_between(common_t * 100,
-                        mean_trace - sem_trace,
-                        mean_trace + sem_trace,
-                        color=DEVICE_COLORS[device], alpha=0.2)
+    ax_ts.set_xlabel("Session Progress (%)")
+    ax_ts.set_ylabel("GSR (µS)")
+    ax_ts.set_title("Mean GSR Timeseries (Normalised)")
+    ax_ts.legend(fontsize=8)
+    ax_ts.grid(True, alpha=0.3)
 
-    ax.set_xlabel("Session Progress (%)")
-    ax.set_ylabel("GSR (µS)")
-    ax.set_title("Grand Average GSR Timeseries (Normalised Time)", fontsize=12, fontweight="bold")
-    ax.legend()
+    # ── Panels 2-4: bar charts per device ────────────────────────────────────
+    x = np.arange(len(DEVICES))
+    bar_specs = [
+        (ax_scl, 0, "Mean SCL (µS)",       "Mean SCL"),
+        (ax_scr, 1, "NS-SCR Rate (/min)",  "NS-SCR Rate"),
+        (ax_amp, 2, "Mean SCR Amp (µS)",   "Mean SCR Amplitude"),
+    ]
+
+    for ax, metric_idx, ylabel, title in bar_specs:
+        means, sems, all_pts = [], [], []
+        for device in DEVICES:
+            vals = []
+            for pid in data:
+                gsr_df = data[pid][device]["gsr"]
+                if gsr_df is None or gsr_df.empty:
+                    continue
+                scl, rate, amp = _compute_gsr_metrics_from_df(gsr_df)
+                v = [scl, rate, amp][metric_idx]
+                if not np.isnan(v):
+                    vals.append(v)
+            means.append(float(np.mean(vals)) if vals else np.nan)
+            sems.append(float(np.std(vals, ddof=1) / np.sqrt(len(vals)))
+                        if len(vals) > 1 else 0.0)
+            all_pts.append(vals)
+
+        ax.bar(x, means, yerr=sems, capsize=5,
+               color=[DEVICE_COLORS[d] for d in DEVICES],
+               error_kw={"elinewidth": 1.5}, zorder=2)
+        for i, pts in enumerate(all_pts):
+            jitter = np.random.uniform(-0.08, 0.08, len(pts))
+            ax.scatter(i + jitter, pts, color="black", s=20, zorder=3, alpha=0.7)
+        ax.set_xticks(x)
+        ax.set_xticklabels([DEVICE_LABELS[d] for d in DEVICES])
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.2, axis="y")
+
     plt.tight_layout()
     out_path = os.path.join(out_dir, "plot_gsr_grand.png")
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -836,30 +950,60 @@ def plot_p300_grand(data: dict, out_dir: str):
 # Plot I: Heart rate & HRV
 # ---------------------------------------------------------------------------
 
-def _compute_rmssd(rr_series: pd.Series) -> float:
-    """Compute RMSSD from a column of possibly semicolon-separated RR strings."""
+def _parse_rr(rr_series: pd.Series) -> np.ndarray:
+    """Extract all RR intervals (ms) from a semicolon-separated Series."""
     all_rr = []
     for v in rr_series.dropna():
-        parts = str(v).split(";")
-        for p in parts:
+        for p in str(v).split(";"):
             try:
                 all_rr.append(float(p.strip()))
             except ValueError:
                 pass
+    return np.array(all_rr)
+
+
+def _compute_rmssd(rr_series: pd.Series) -> float:
+    """Compute RMSSD (ms) from a column of possibly semicolon-separated RR strings."""
+    all_rr = _parse_rr(rr_series)
     if len(all_rr) < 2:
         return np.nan
-    diffs = np.diff(all_rr)
-    return float(np.sqrt(np.mean(diffs ** 2)))
+    return float(np.sqrt(np.mean(np.diff(all_rr) ** 2)))
+
+
+def _compute_hf_power(rr_series: pd.Series, interp_fs: int = 4) -> float:
+    """
+    Compute HF power (0.15–0.40 Hz) in ms² from RR intervals.
+
+    Uses the full available RR block: interpolates to uniform interp_fs Hz,
+    applies Welch's method, then integrates power in the HF band.
+    """
+    all_rr = _parse_rr(rr_series)
+    if len(all_rr) < 10:
+        return np.nan
+    t_rr = np.cumsum(all_rr) / 1000.0
+    t_rr -= t_rr[0]
+    t_uniform = np.arange(0, t_rr[-1], 1.0 / interp_fs)
+    if len(t_uniform) < 8:
+        return np.nan
+    rr_uniform = np.interp(t_uniform, t_rr, all_rr)
+    nperseg = min(len(rr_uniform), interp_fs * 60)
+    freqs, psd = scipy_signal.welch(rr_uniform, fs=interp_fs, window='hann',
+                                    nperseg=nperseg, noverlap=nperseg // 2)
+    hf_mask = (freqs >= 0.15) & (freqs <= 0.40)
+    if hf_mask.sum() < 2:
+        return np.nan
+    return float(integrate.trapezoid(psd[hf_mask], freqs[hf_mask]))
 
 
 def plot_hr_grand(data: dict, out_dir: str):
-    """Two-panel: mean HR and RMSSD per device with participant scatter."""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
+    """Three-panel: mean HR, RMSSD, and HF Power per device with participant scatter."""
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(14, 5))
     fig.suptitle("Heart Rate & HRV Grand Average per Device", fontsize=13, fontweight="bold")
 
     for ax, metric, ylabel, title in [
-        (ax1, "hr",    "Heart Rate (bpm)",  "Mean Heart Rate"),
-        (ax2, "rmssd", "RMSSD (ms)",        "HRV — RMSSD"),
+        (ax1, "hr",       "Heart Rate (bpm)", "Mean Heart Rate"),
+        (ax2, "rmssd",    "RMSSD (ms)",       "HRV — RMSSD"),
+        (ax3, "hf_power", "HF Power (ms²)",   "HRV — HF Power"),
     ]:
         x = np.arange(len(DEVICES))
         means, sems, all_pts = [], [], []
@@ -871,10 +1015,14 @@ def plot_hr_grand(data: dict, out_dir: str):
                     continue
                 if metric == "hr":
                     vals.append(hr_df["heart_rate"].mean())
-                else:
-                    rmssd = _compute_rmssd(hr_df["rr_intervals"])
-                    if not np.isnan(rmssd):
-                        vals.append(rmssd)
+                elif metric == "rmssd":
+                    v = _compute_rmssd(hr_df["rr_intervals"])
+                    if not np.isnan(v):
+                        vals.append(v)
+                else:  # hf_power
+                    v = _compute_hf_power(hr_df["rr_intervals"])
+                    if not np.isnan(v):
+                        vals.append(v)
             means.append(safe_mean(vals))
             sems.append(safe_sem(vals))
             all_pts.append(vals)
@@ -882,7 +1030,6 @@ def plot_hr_grand(data: dict, out_dir: str):
         ax.bar(x, means, yerr=sems, capsize=5,
                color=[DEVICE_COLORS[d] for d in DEVICES],
                error_kw={"elinewidth": 1.5}, zorder=2)
-        # scatter individual participants
         for i, pts in enumerate(all_pts):
             jitter = np.random.uniform(-0.08, 0.08, len(pts))
             ax.scatter(i + jitter, pts, color="black", s=20, zorder=3, alpha=0.7)

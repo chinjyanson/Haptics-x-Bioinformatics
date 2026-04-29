@@ -1065,6 +1065,145 @@ def save_session_summary(band_df, task_onset_epochs,
 
 # ── GSR analysis ─────────────────────────────────────────────────────────────
 
+# Tonic / phasic decomposition constants
+GSR_TONIC_LP_HZ   = 0.05   # Lowpass cutoff for SCL (tonic) extraction
+GSR_SCR_MIN_AMP   = 0.01   # µS — minimum peak amplitude to count as an SCR
+GSR_SCR_MIN_DIST  = 1.0    # seconds — minimum distance between SCR peaks
+
+
+def compute_gsr_metrics(gsr_df, fs=None):
+    """
+    Decompose GSR into tonic (SCL) and phasic (SCR) components and compute:
+      - Mean SCL (µS)       : mean of the lowpass-filtered tonic signal
+      - NS-SCR Rate (/min)  : non-specific SCR count per minute
+      - SCR Amplitude (µS)  : mean peak amplitude of detected SCRs
+
+    Decomposition:
+      Tonic  = zero-phase Butterworth lowpass at GSR_TONIC_LP_HZ (0.05 Hz)
+      Phasic = raw GSR − tonic
+
+    SCR detection on phasic component:
+      Peaks with amplitude >= GSR_SCR_MIN_AMP µS and separated by
+      >= GSR_SCR_MIN_DIST seconds are counted as NS-SCRs.
+
+    Returns a dict with keys: mean_scl, scr_rate_per_min, mean_scr_amplitude,
+    and arrays: tonic, phasic, scr_indices (sample indices of detected peaks).
+    Returns None if signal is too short.
+    """
+    sig   = gsr_df['gsr_uS'].values.astype(float)
+    times = gsr_df['time'].values.astype(float)
+    n     = len(sig)
+
+    if n < 10:
+        return None
+
+    # Estimate sampling rate from time axis if not provided
+    if fs is None:
+        dt = np.median(np.diff(times))
+        fs = 1.0 / dt if dt > 0 else 50.0
+
+    duration_min = (times[-1] - times[0]) / 60.0
+
+    # ── Tonic extraction (SCL) ────────────────────────────────────────────────
+    nyq    = fs / 2.0
+    cutoff = min(GSR_TONIC_LP_HZ, nyq * 0.9)
+    order  = 2
+    padlen = 3 * order * max(1, int(np.ceil(fs / cutoff)))
+    if n > padlen:
+        b, a   = scipy_signal.butter(order, cutoff / nyq, btype='low')
+        tonic  = scipy_signal.filtfilt(b, a, sig)
+    else:
+        tonic = np.full(n, np.mean(sig))
+
+    mean_scl = float(np.mean(tonic))
+
+    # ── Phasic extraction (SCR) ───────────────────────────────────────────────
+    phasic = sig - tonic
+
+    # Peak detection on phasic signal
+    min_dist_samples = max(1, int(GSR_SCR_MIN_DIST * fs))
+    peaks, props = scipy_signal.find_peaks(
+        phasic,
+        height=GSR_SCR_MIN_AMP,
+        distance=min_dist_samples,
+    )
+
+    n_scr          = len(peaks)
+    scr_rate       = n_scr / duration_min if duration_min > 0 else np.nan
+    mean_scr_amp   = float(np.mean(props['peak_heights'])) if n_scr > 0 else 0.0
+
+    return {
+        'mean_scl':           mean_scl,
+        'scr_rate_per_min':   scr_rate,
+        'mean_scr_amplitude': mean_scr_amp,
+        'n_scr':              n_scr,
+        'tonic':              tonic,
+        'phasic':             phasic,
+        'scr_indices':        peaks,
+    }
+
+
+def plot_gsr_decomposition(gsr_df, metrics, out_prefix=''):
+    """
+    4-panel plot showing:
+      1. Raw GSR + tonic (SCL) overlay
+      2. Phasic component with detected SCR peaks marked
+      3. SCL trajectory
+      4. Summary text box with all three metrics
+    """
+    times  = gsr_df['time'].values.astype(float)
+    sig    = gsr_df['gsr_uS'].values.astype(float)
+    tonic  = metrics['tonic']
+    phasic = metrics['phasic']
+    peaks  = metrics['scr_indices']
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+
+    # Panel 1: Raw + tonic
+    axes[0].plot(times, sig,   color='steelblue', lw=0.8, alpha=0.7, label='Raw GSR')
+    axes[0].plot(times, tonic, color='red',       lw=1.5,             label='Tonic (SCL)')
+    axes[0].set_ylabel('GSR (µS)')
+    axes[0].set_title('GSR Signal with Tonic (SCL) Component')
+    axes[0].legend(fontsize=8)
+    axes[0].grid(True, alpha=0.3)
+
+    # Panel 2: Phasic + SCR peaks
+    axes[1].plot(times, phasic, color='darkorange', lw=0.8, label='Phasic (SCR)')
+    if len(peaks) > 0:
+        axes[1].scatter(times[peaks], phasic[peaks],
+                        color='red', zorder=5, s=25, label=f'SCRs (n={len(peaks)})')
+    axes[1].axhline(GSR_SCR_MIN_AMP, color='gray', lw=0.8, linestyle='--',
+                    label=f'Min amp ({GSR_SCR_MIN_AMP} µS)')
+    axes[1].set_ylabel('Phasic GSR (µS)')
+    axes[1].set_title('Phasic Component with Detected SCRs')
+    axes[1].legend(fontsize=8)
+    axes[1].grid(True, alpha=0.3)
+
+    # Panel 3: SCL trajectory
+    axes[2].plot(times, tonic, color='red', lw=1.5)
+    axes[2].fill_between(times, tonic.min(), tonic, alpha=0.2, color='red')
+    axes[2].set_ylabel('SCL (µS)')
+    axes[2].set_xlabel('Time (s)')
+    axes[2].set_title('Skin Conductance Level (Tonic) Trajectory')
+    axes[2].grid(True, alpha=0.3)
+
+    scl  = metrics['mean_scl']
+    rate = metrics['scr_rate_per_min']
+    amp  = metrics['mean_scr_amplitude']
+    fig.text(0.99, 0.01,
+             f"Mean SCL: {scl:.4f} µS   |   NS-SCR Rate: {rate:.2f} /min   |   "
+             f"Mean SCR Amplitude: {amp:.4f} µS",
+             ha='right', va='bottom', fontsize=9,
+             bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
+
+    plt.tight_layout()
+    plt.subplots_adjust(bottom=0.07)
+    fname = f"{out_prefix}gsr_decomposition.png"
+    plt.savefig(fname, dpi=150)
+    plt.close()
+    print(f"[analysis] Saved {fname}")
+
+
 def run_gsr_analysis(gsr_path, events_path, out_prefix=''):
     """
     Load GSR CSV and markers CSV, plot the GSR signal with task_end markers
@@ -1122,6 +1261,25 @@ def run_gsr_analysis(gsr_path, events_path, out_prefix=''):
 
     # ── Plot 2: rolling-statistics analysis ───────────────────────────────────
     plot_gsr_analysis(gsr_path, save_path=f"{out_prefix}gsr_analysis.png")
+
+    # ── GSR metrics: SCL, NS-SCR Rate, SCR Amplitude ─────────────────────────
+    metrics = compute_gsr_metrics(gsr_df)
+    if metrics:
+        plot_gsr_decomposition(gsr_df, metrics, out_prefix)
+
+        metrics_csv = f"{out_prefix}gsr_metrics.csv"
+        pd.DataFrame([{
+            'mean_scl_uS':          metrics['mean_scl'],
+            'scr_rate_per_min':     metrics['scr_rate_per_min'],
+            'mean_scr_amplitude_uS': metrics['mean_scr_amplitude'],
+            'n_scr':                metrics['n_scr'],
+        }]).to_csv(metrics_csv, index=False)
+        print(f"[analysis] GSR metrics — Mean SCL: {metrics['mean_scl']:.4f} µS | "
+              f"NS-SCR Rate: {metrics['scr_rate_per_min']:.2f}/min | "
+              f"Mean SCR Amp: {metrics['mean_scr_amplitude']:.4f} µS")
+        print(f"[analysis] Saved {metrics_csv}")
+    else:
+        print("[analysis] WARNING: GSR signal too short for metrics computation.")
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────

@@ -27,8 +27,8 @@ from arduino.bridge import ArduinoBridge, TimestampedArduinoEvent, ARDUINO_DEFAU
 
 # ── Device enable flags — set to False to run without a device ────────────────
 USE_MUSE    = True
-USE_POLAR   = False
-USE_GSR     = False
+USE_POLAR   = True
+USE_GSR     = True
 USE_ARDUINO = True
 
 # ── Baseline recording flag — set to False to skip baseline at session start ──
@@ -956,7 +956,8 @@ class SynchronizedCollector:
                     print(f"  Mean HR: {metrics['mean_hr']:.1f} bpm")
                     print(f"  SDNN: {metrics['sdnn']:.1f} ms")
                     print(f"  RMSSD: {metrics['rmssd']:.1f} ms")
-                    print(f"  pNN50: {metrics['pnn50']:.1f}%")
+                    hf = metrics['hf_power']
+                    print(f"  HF Power: {hf:.2f} ms²" if not np.isnan(hf) else "  HF Power: N/A (insufficient data)")
 
                 print("[Polar] Collection complete.")
                 connected = True

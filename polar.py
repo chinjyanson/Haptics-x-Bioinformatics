@@ -5,12 +5,60 @@ from bleak import BleakClient, BleakScanner
 import numpy as np
 from datetime import datetime
 from collections import deque
+from scipy import signal as scipy_signal
+from scipy import integrate
 import matplotlib
 matplotlib.use('MacOSX')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.animation import FuncAnimation
 import threading
+
+# Polar H10 BLE Service UUIDs
+HF_LOW  = 0.15   # Hz
+HF_HIGH = 0.40   # Hz
+RR_INTERP_FS = 4  # Hz — uniform resampling rate for spectral HRV
+
+
+def compute_hf_power(rr_array: np.ndarray) -> float:
+    """
+    Compute HF power (0.15–0.40 Hz) from an array of RR intervals (ms).
+
+    Steps:
+      1. Build cumulative time axis from RR intervals.
+      2. Interpolate to a uniform 4 Hz time series.
+      3. Apply Welch's method to estimate PSD.
+      4. Integrate power in the HF band (0.15–0.40 Hz).
+
+    Returns HF power in ms² (log-transform with np.log() for normality if needed).
+    Returns np.nan if insufficient data.
+    """
+    if len(rr_array) < 10:
+        return np.nan
+
+    # Cumulative time in seconds (RR intervals are in ms)
+    t_rr = np.cumsum(rr_array) / 1000.0
+    t_rr -= t_rr[0]  # start at 0
+
+    # Uniform time grid at RR_INTERP_FS Hz
+    t_uniform = np.arange(0, t_rr[-1], 1.0 / RR_INTERP_FS)
+    if len(t_uniform) < 8:
+        return np.nan
+
+    rr_uniform = np.interp(t_uniform, t_rr, rr_array)
+
+    # Welch PSD
+    nperseg = min(len(rr_uniform), int(RR_INTERP_FS * 60))  # up to 60-s segments
+    freqs, psd = scipy_signal.welch(rr_uniform, fs=RR_INTERP_FS,
+                                    window='hann', nperseg=nperseg,
+                                    noverlap=nperseg // 2)
+
+    # Integrate HF band
+    hf_mask = (freqs >= HF_LOW) & (freqs <= HF_HIGH)
+    if hf_mask.sum() < 2:
+        return np.nan
+    return float(integrate.trapezoid(psd[hf_mask], freqs[hf_mask]))
+
 
 # Polar H10 BLE Service UUIDs
 HEART_RATE_SERVICE_UUID     = "0000180d-0000-1000-8000-00805f9b34fb"
@@ -107,15 +155,12 @@ class PolarH10:
         sdnn = np.std(rr_array, ddof=1)
         diff_rr = np.diff(rr_array)
         rmssd = np.sqrt(np.mean(diff_rr**2))
-        nn50 = np.sum(np.abs(diff_rr) > 50)
-        pnn50 = (nn50 / len(diff_rr)) * 100 if len(diff_rr) > 0 else 0
+        hf_power = compute_hf_power(rr_array)
         return {
-            'mean_rr': mean_rr,
             'mean_hr': 60000 / mean_rr if mean_rr > 0 else 0,
             'sdnn': sdnn,
             'rmssd': rmssd,
-            'nn50': nn50,
-            'pnn50': pnn50,
+            'hf_power': hf_power,
             'num_intervals': len(rr_array),
         }
 
@@ -258,10 +303,9 @@ if __name__ == "__main__":
         if metrics:
             print("\n--- Final HRV Summary ---")
             print(f"Number of RR intervals : {metrics['num_intervals']}")
-            print(f"Mean RR interval       : {metrics['mean_rr']:.1f} ms")
             print(f"Mean Heart Rate        : {metrics['mean_hr']:.1f} bpm")
             print(f"SDNN                   : {metrics['sdnn']:.1f} ms")
             print(f"RMSSD                  : {metrics['rmssd']:.1f} ms")
-            print(f"NN50                   : {metrics['nn50']}")
-            print(f"pNN50                  : {metrics['pnn50']:.1f}%")
+            hf = metrics['hf_power']
+            print(f"HF Power               : {hf:.2f} ms²" if not np.isnan(hf) else "HF Power               : N/A (insufficient data)")
             print("="*70)

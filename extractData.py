@@ -9,6 +9,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 from scipy import signal
+from scipy import integrate
 import mne
 from mne.preprocessing import ICA
 from mne.time_frequency import tfr_array_morlet
@@ -400,6 +401,30 @@ class DataExtractor:
 
     # ==================== HRV ANALYSIS ====================
 
+    @staticmethod
+    def _compute_hf_power(rr_array: np.ndarray, interp_fs: int = 4) -> float:
+        """
+        Compute HF power (0.15–0.40 Hz) from RR intervals (ms).
+
+        Interpolates to a uniform time series at interp_fs Hz, applies Welch's
+        method, then integrates power in the HF band. Returns ms².
+        """
+        if len(rr_array) < 10:
+            return np.nan
+        t_rr = np.cumsum(rr_array) / 1000.0
+        t_rr -= t_rr[0]
+        t_uniform = np.arange(0, t_rr[-1], 1.0 / interp_fs)
+        if len(t_uniform) < 8:
+            return np.nan
+        rr_uniform = np.interp(t_uniform, t_rr, rr_array)
+        nperseg = min(len(rr_uniform), interp_fs * 60)
+        freqs, psd = signal.welch(rr_uniform, fs=interp_fs, window='hann',
+                                  nperseg=nperseg, noverlap=nperseg // 2)
+        hf_mask = (freqs >= 0.15) & (freqs <= 0.40)
+        if hf_mask.sum() < 2:
+            return np.nan
+        return float(integrate.trapezoid(psd[hf_mask], freqs[hf_mask]))
+
     def compute_hrv_metrics(self) -> pd.DataFrame:
         """
         Compute HRV metrics from HR data.
@@ -414,7 +439,6 @@ class DataExtractor:
         all_rr = []
         for rr_list in self.hr_data['rr_intervals']:
             if isinstance(rr_list, str):
-                # Parse string representation
                 rr_list = [float(x) for x in rr_list.split(';') if x.strip()]
             if isinstance(rr_list, list) and len(rr_list) > 0:
                 all_rr.extend(rr_list)
@@ -425,15 +449,12 @@ class DataExtractor:
 
         rr_array = np.array(all_rr)
 
-        # Time domain metrics
         metrics = {
-            'Mean RR (ms)': np.mean(rr_array),
             'Mean HR (bpm)': 60000 / np.mean(rr_array),
             'SDNN (ms)': np.std(rr_array, ddof=1),
             'RMSSD (ms)': np.sqrt(np.mean(np.diff(rr_array) ** 2)),
-            'NN50': np.sum(np.abs(np.diff(rr_array)) > 50),
-            'pNN50 (%)': (np.sum(np.abs(np.diff(rr_array)) > 50) / len(np.diff(rr_array))) * 100,
             'CV (%)': (np.std(rr_array, ddof=1) / np.mean(rr_array)) * 100,
+            'HF Power (ms²)': self._compute_hf_power(rr_array),
             'Total RR intervals': len(rr_array)
         }
 
@@ -493,11 +514,10 @@ class DataExtractor:
 
                 metrics = {
                     'time': current_time + window_size / 2,  # Center of window
-                    'mean_rr': np.mean(window_rr),
                     'mean_hr': 60000 / np.mean(window_rr),
                     'sdnn': np.std(window_rr, ddof=1) if len(window_rr) > 1 else 0,
                     'rmssd': np.sqrt(np.mean(diff_rr ** 2)) if len(diff_rr) > 0 else 0,
-                    'pnn50': (np.sum(np.abs(diff_rr) > 50) / len(diff_rr)) * 100 if len(diff_rr) > 0 else 0,
+                    'hf_power': self._compute_hf_power(window_rr),
                     'n_intervals': len(window_rr)
                 }
                 results.append(metrics)
@@ -655,10 +675,10 @@ class DataExtractor:
         axes[2].set_ylabel('SDNN (ms)')
         axes[2].grid(True, alpha=0.3)
 
-        # 4. pNN50
-        axes[3].plot(times, sliding_hrv['pnn50'], 'm-', linewidth=1.5)
-        axes[3].fill_between(times, 0, sliding_hrv['pnn50'], alpha=0.3, color='magenta')
-        axes[3].set_ylabel('pNN50 (%)')
+        # 4. HF Power
+        axes[3].plot(times, sliding_hrv['hf_power'], 'm-', linewidth=1.5)
+        axes[3].fill_between(times, 0, sliding_hrv['hf_power'], alpha=0.3, color='magenta')
+        axes[3].set_ylabel('HF Power (ms²)')
         axes[3].set_xlabel('Time (s)')
         axes[3].grid(True, alpha=0.3)
 
