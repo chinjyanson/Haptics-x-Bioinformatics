@@ -1,7 +1,7 @@
 """
 denoising.py - EEG preprocessing pipeline
 
-Applies notch filtering, wavelet denoising, EMD drift removal, EOG regression,
+Applies notch filtering, EOG regression, wavelet denoising, EMD drift removal,
 and bandpass filtering.
 Produces two output files: erp_clean.csv (0.1-30Hz + Savitzky-Golay) and psd_clean.csv (1-45Hz).
 
@@ -349,14 +349,19 @@ def denoise_session(eeg_path, erp_out, psd_out):
     # Step 1: interpolate short gaps, flag long ones
     df, bad_segments = interpolate_dropouts(df, dropout_mask)
 
-    # Step 2: EOG artefact removal — must run before wavelet/EMD compress blink amplitudes
-    print("[denoising] Applying EOG artefact removal...")
-    df = eog_regression(df)
-
-    # Step 3: notch filter
+    # Step 2: notch filter — runs before EOG regression so that 50 Hz mains
+    # noise does not bias the OLS β estimate (shared 50 Hz between AF and TP
+    # channels would otherwise be partially absorbed into the regression fit).
     print("[denoising] Applying notch filter (50 Hz)...")
     for ch in CHANNELS:
         df[ch] = notch_filter(df[ch].values)
+
+    # Step 3: EOG artefact removal — after notch so the pseudo-EOG reference
+    # is clean, but before wavelet/EMD so blink amplitudes are still large
+    # enough to (a) be detected reliably and (b) not inflate the wavelet noise
+    # estimate used to set the soft-threshold.
+    print("[denoising] Applying EOG artefact removal...")
+    df = eog_regression(df)
 
     # Step 4: wavelet denoising
     print("[denoising] Applying wavelet denoising...")
