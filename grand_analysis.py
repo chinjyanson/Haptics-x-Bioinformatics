@@ -15,7 +15,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy import interpolate, signal as scipy_signal, integrate
+from scipy import interpolate, signal as scipy_signal, integrate, stats as scipy_stats
 
 warnings.filterwarnings("ignore")
 
@@ -243,6 +243,53 @@ def safe_sem(values) -> float:
     if len(clean) < 2:
         return 0.0
     return float(np.std(clean, ddof=1) / np.sqrt(len(clean)))
+
+
+# ---------------------------------------------------------------------------
+# Statistical testing helpers
+# ---------------------------------------------------------------------------
+
+def _cohens_d(a, b):
+    """Pooled-SD Cohen's d. Returns NaN if either group has <2 samples."""
+    na, nb = len(a), len(b)
+    if na < 2 or nb < 2:
+        return np.nan
+    pooled = np.sqrt(((na - 1) * np.var(a, ddof=1) + (nb - 1) * np.var(b, ddof=1)) / (na + nb - 2))
+    return float((np.mean(a) - np.mean(b)) / pooled) if pooled != 0 else np.nan
+
+
+def _run_device_stats(feature_name: str, groups: dict) -> list:
+    """
+    Run one-way ANOVA + post-hoc pairwise t-tests + Cohen's d for one scalar feature.
+    groups = {"auditory": [v1, v2, ...], "shape_changing": [...], "vibrations": [...]}
+    Returns a list of result row dicts.
+    """
+    rows = []
+    clean = {d: [v for v in vals if v is not None and not np.isnan(float(v))]
+             for d, vals in groups.items()}
+    valid = {d: v for d, v in clean.items() if len(v) >= 2}
+    if len(valid) < 2:
+        return rows
+
+    # One-way ANOVA (only meaningful when 3 groups present)
+    if len(valid) == 3:
+        F, p_anova = scipy_stats.f_oneway(*[np.array(v) for v in valid.values()])
+        rows.append({"feature": feature_name, "test": "ANOVA", "pair": "all",
+                     "statistic": float(F), "p_value": float(p_anova),
+                     "p_corrected": np.nan, "cohens_d": np.nan})
+
+    # Post-hoc pairwise t-tests
+    devs = list(valid.keys())
+    for i in range(len(devs)):
+        for j in range(i + 1, len(devs)):
+            da, db = devs[i], devs[j]
+            t, p = scipy_stats.ttest_ind(np.array(valid[da]), np.array(valid[db]))
+            d = _cohens_d(np.array(valid[da]), np.array(valid[db]))
+            rows.append({"feature": feature_name, "test": "ttest",
+                         "pair": f"{da}_vs_{db}", "statistic": float(t),
+                         "p_value": float(p), "p_corrected": np.nan,
+                         "cohens_d": d})
+    return rows
 
 
 def _bar_group(ax, device_values: dict, ylabel: str, title: str,
@@ -1191,6 +1238,205 @@ def plot_detection_accuracy(data: dict, out_dir: str):
 
 
 # ---------------------------------------------------------------------------
+# Grand statistical testing
+# ---------------------------------------------------------------------------
+
+def run_grand_statistics(data: dict, out_dir: str):
+    """
+    Run between-device statistical tests for all scalar features.
+
+    Pipeline per feature:
+      1. One-way ANOVA (3 devices as groups)
+      2. Post-hoc pairwise t-tests (3 pairs)
+      3. Global Bonferroni correction across all pairwise tests
+      4. Cohen's d for each pair
+
+    Saves output/grand/grand_stats_summary.csv and prints significant hits.
+    """
+    all_rows = []
+
+    # ── EEG: band power (abs, rel, norm) per band per channel ─────────────────
+    for band in BANDS:
+        for channel in ["TP_pool", "AF_pool"]:
+            for suffix, label in [("_abs", "abs"), ("_rel", "rel"), ("_norm", "norm")]:
+                col = f"{band}{suffix}"
+                groups = {dev: [] for dev in DEVICES}
+                for pid in data:
+                    for dev in DEVICES:
+                        bp = data[pid][dev]["band_power"]
+                        if bp is None:
+                            continue
+                        ch_rows = bp[bp["channel"] == channel]
+                        if ch_rows.empty or col not in ch_rows.columns:
+                            continue
+                        val = ch_rows[col].dropna().mean()
+                        if not np.isnan(val):
+                            groups[dev].append(float(val))
+                all_rows += _run_device_stats(f"EEG_{band}_{channel}_{label}", groups)
+
+    # ── EEG: theta/alpha ratio (averaged across task conditions per session) ───
+    groups = {dev: [] for dev in DEVICES}
+    for pid in data:
+        for dev in DEVICES:
+            ss = data[pid][dev]["session_summary"]
+            if ss is None:
+                continue
+            vals = [v for v in ss.get("theta_alpha_ratio_by_condition", {}).values()
+                    if v is not None]
+            if vals:
+                groups[dev].append(float(np.nanmean(vals)))
+    all_rows += _run_device_stats("EEG_theta_alpha_ratio", groups)
+
+    # ── EEG: P300 amplitude (mean across task conditions) ─────────────────────
+    groups = {dev: [] for dev in DEVICES}
+    for pid in data:
+        for dev in DEVICES:
+            ss = data[pid][dev]["session_summary"]
+            if ss is None:
+                continue
+            vals = [v for v in ss.get("task_onset_erp_peak_by_condition", {}).values()
+                    if v is not None]
+            if vals:
+                groups[dev].append(float(np.nanmean(vals)))
+    all_rows += _run_device_stats("EEG_P300_amplitude_uV", groups)
+
+    # ── Cardiac: mean HR ──────────────────────────────────────────────────────
+    groups = {dev: [] for dev in DEVICES}
+    for pid in data:
+        for dev in DEVICES:
+            hr_df = data[pid][dev]["hr"]
+            if hr_df is None or hr_df.empty or "heart_rate" not in hr_df.columns:
+                continue
+            v = float(hr_df["heart_rate"].mean())
+            if not np.isnan(v):
+                groups[dev].append(v)
+    all_rows += _run_device_stats("Cardiac_mean_HR_bpm", groups)
+
+    # ── Cardiac: RMSSD ────────────────────────────────────────────────────────
+    groups = {dev: [] for dev in DEVICES}
+    for pid in data:
+        for dev in DEVICES:
+            hr_df = data[pid][dev]["hr"]
+            if hr_df is None or hr_df.empty or "rr_intervals" not in hr_df.columns:
+                continue
+            v = _compute_rmssd(hr_df["rr_intervals"])
+            if not np.isnan(v):
+                groups[dev].append(v)
+    all_rows += _run_device_stats("Cardiac_RMSSD_ms", groups)
+
+    # ── Cardiac: HF Power ─────────────────────────────────────────────────────
+    groups = {dev: [] for dev in DEVICES}
+    for pid in data:
+        for dev in DEVICES:
+            hr_df = data[pid][dev]["hr"]
+            if hr_df is None or hr_df.empty or "rr_intervals" not in hr_df.columns:
+                continue
+            v = _compute_hf_power(hr_df["rr_intervals"])
+            if not np.isnan(v):
+                groups[dev].append(v)
+    all_rows += _run_device_stats("Cardiac_HF_power_ms2", groups)
+
+    # ── GSR: mean SCL, NS-SCR rate, SCR amplitude ─────────────────────────────
+    gsr_feature_names = ["GSR_mean_SCL_uS", "GSR_NS_SCR_rate_per_min", "GSR_mean_SCR_amplitude_uS"]
+    gsr_groups = [{dev: [] for dev in DEVICES} for _ in range(3)]
+    for pid in data:
+        for dev in DEVICES:
+            gsr_df = data[pid][dev]["gsr"]
+            if gsr_df is None or gsr_df.empty:
+                continue
+            scl, rate, amp = _compute_gsr_metrics_from_df(gsr_df)
+            for i, v in enumerate([scl, rate, amp]):
+                if not np.isnan(v):
+                    gsr_groups[i][dev].append(float(v))
+    for feat_name, groups in zip(gsr_feature_names, gsr_groups):
+        all_rows += _run_device_stats(feat_name, groups)
+
+    # ── Behavioural: encoder MSE (continuous position error) ─────────────────
+    groups = {dev: [] for dev in DEVICES}
+    for pid in data:
+        for dev in DEVICES:
+            arduino_df = data[pid][dev]["arduino"]
+            if arduino_df is None or arduino_df.empty:
+                continue
+            if "position" not in arduino_df.columns or "target" not in arduino_df.columns:
+                continue
+            errors_sq = (arduino_df["position"] - arduino_df["target"]) ** 2
+            v = float(errors_sq.mean())
+            if not np.isnan(v):
+                groups[dev].append(v)
+    all_rows += _run_device_stats("Behavioural_encoder_MSE", groups)
+
+    # ── Behavioural: oddball detection accuracy ───────────────────────────────
+    groups = {dev: [] for dev in DEVICES}
+    for pid in data:
+        for dev in DEVICES:
+            tlx = data[pid][dev]["nasa_tlx"]
+            if tlx is None:
+                continue
+            detected = tlx.get("red_circle_count")
+            actual   = tlx.get("actual_red_circle_count")
+            if detected is not None and actual and actual > 0:
+                groups[dev].append(float(detected) / float(actual) * 100.0)
+    all_rows += _run_device_stats("Behavioural_detection_accuracy_pct", groups)
+
+    # ── NASA-TLX: subscales + average ─────────────────────────────────────────
+    subscales = ["Mental Demand", "Physical Demand", "Temporal Demand",
+                 "Performance", "Effort", "Frustration"]
+    for sub in subscales + ["average"]:
+        groups = {dev: [] for dev in DEVICES}
+        for pid in data:
+            for dev in DEVICES:
+                tlx = data[pid][dev]["nasa_tlx"]
+                if tlx is None:
+                    continue
+                if sub == "average":
+                    sub_vals = [tlx.get(s) for s in subscales if tlx.get(s) is not None]
+                    v = float(np.nanmean(sub_vals)) if sub_vals else None
+                else:
+                    v = tlx.get(sub)
+                if v is not None:
+                    groups[dev].append(float(v))
+        feat_key = "NASA_TLX_" + sub.replace(" ", "_")
+        all_rows += _run_device_stats(feat_key, groups)
+
+    if not all_rows:
+        print("[grand_analysis] No statistical tests ran (insufficient data).")
+        return
+
+    # ── Bonferroni correction (global, applied to pairwise t-tests only) ───────
+    n_pairwise = sum(1 for r in all_rows if r["test"] == "ttest")
+    for r in all_rows:
+        if r["test"] == "ttest":
+            r["p_corrected"] = min(r["p_value"] * n_pairwise, 1.0)
+        else:
+            r["p_corrected"] = r["p_value"]  # ANOVA is omnibus, not corrected
+
+    # ── Save CSV ──────────────────────────────────────────────────────────────
+    df = pd.DataFrame(all_rows,
+                      columns=["feature", "test", "pair", "statistic",
+                               "p_value", "p_corrected", "cohens_d"])
+    csv_path = os.path.join(out_dir, "grand_stats_summary.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"[grand_analysis] Saved {csv_path}")
+    print(f"[grand_analysis] {len(all_rows)} total tests "
+          f"({n_pairwise} pairwise, Bonferroni n={n_pairwise})")
+
+    # ── Print significant results ─────────────────────────────────────────────
+    sig = df[df["p_corrected"] < 0.05]
+    if len(sig) > 0:
+        print(f"\n[grand_analysis] {len(sig)} significant results after Bonferroni correction (p<0.05):")
+        print(sig[["feature", "pair", "statistic", "p_value", "p_corrected", "cohens_d"]].to_string(index=False))
+    else:
+        print("[grand_analysis] No significant results after Bonferroni correction.")
+
+    # Also print uncorrected significant results for reference
+    sig_uncorr = df[(df["test"] == "ttest") & (df["p_value"] < 0.05)]
+    if len(sig_uncorr) > 0:
+        print(f"\n[grand_analysis] {len(sig_uncorr)} nominally significant (uncorrected p<0.05):")
+        print(sig_uncorr[["feature", "pair", "p_value", "cohens_d"]].to_string(index=False))
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1220,6 +1466,9 @@ def main():
     plot_theta_alpha_grand(data, out_dir)
 
     plot_detection_accuracy(data, out_dir)
+
+    print("[grand_analysis] Running statistical tests...")
+    run_grand_statistics(data, out_dir)
 
     print(f"\n[grand_analysis] Done. All outputs saved to {out_dir}/")
 
