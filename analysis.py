@@ -455,7 +455,8 @@ def plot_ersp_itpc(ersp, itpc, freqs, time_ms, epochs_data,
                               gridspec_kw={'height_ratios': [1, 2, 2]})
     axes[0].plot(time_ms, grand_avg, color='steelblue', lw=1.2)
     axes[0].axvline(0, color='k', lw=0.8, linestyle='--')
-    axes[0].set_ylabel('µV')
+    axes[0].set_xlabel('Time (ms)')
+    axes[0].set_ylabel('Amplitude (µV)')
     axes[0].set_title(f'ERP — {channel_name} ({condition})')
     axes[0].invert_yaxis()
 
@@ -569,6 +570,7 @@ def plot_erd_ers(erd_data, time_axis, out_prefix=''):
     if not bands:
         return
     fig, axes = plt.subplots(1, len(bands), figsize=(5 * len(bands), 5))
+    fig.suptitle('Event-Related Desynchronisation / Synchronisation (TP_pool)', fontweight='bold')
     if len(bands) == 1:
         axes = [axes]
     for ax, band in zip(axes, bands):
@@ -581,7 +583,7 @@ def plot_erd_ers(erd_data, time_axis, out_prefix=''):
         ax.plot(time_axis, mean, color='steelblue', lw=1.5)
         ax.set_xlabel('Time (ms)')
         ax.set_ylabel('ERD/ERS (%)')
-        ax.set_title(f'{band} ERD/ERS')
+        ax.set_title(f'{band} Band')
         ax.legend(fontsize=8)
     plt.tight_layout()
     fname = f"{out_prefix}plot_erd_ers.png"
@@ -751,8 +753,9 @@ def _plot_band_power(band_df, out_prefix):
             ax.bar(x + ci * w, vals, w, label=cond, color=colors[ci])
         ax.set_xticks(x + w * (len(conditions) - 1) / 2)
         ax.set_xticklabels(band_names)
-        ax.set_ylabel('Relative power')
-        ax.set_title(f'Band Power — {ch}')
+        ax.set_xlabel('Frequency Band')
+        ax.set_ylabel('Relative Power')
+        ax.set_title(f'Relative Band Power — {ch}')
         ax.legend(fontsize=8)
         plt.tight_layout()
         fname = f"{out_prefix}plot5_band_power_{ch}.png"
@@ -778,8 +781,9 @@ def _plot_theta_alpha(band_df, out_prefix):
             ax.bar(x + i * w, ratios, w, label=ch, alpha=0.8)
     ax.set_xticks(x + w * (len(ch_list) - 1) / 2)
     ax.set_xticklabels(conditions, rotation=15, ha='right')
-    ax.set_ylabel('Theta / Alpha')
-    ax.set_title('Theta/Alpha Ratio by Condition')
+    ax.set_xlabel('Task Condition')
+    ax.set_ylabel('Theta / Alpha Ratio')
+    ax.set_title('Theta/Alpha Ratio by Condition\n(Higher = Greater Cognitive Load)', fontweight='bold')
     ax.legend(fontsize=8)
     plt.tight_layout()
     fname = f"{out_prefix}plot6_theta_alpha_ratio.png"

@@ -311,8 +311,8 @@ def plot_band_power_avg(data: dict, out_dir: str):
         ax.set_xticklabels(BANDS)
         ax.set_xlabel("Frequency Band")
         ax.set_ylabel("Absolute Power (µV²)")
-        ax.set_title(f"Channel: {ch}")
-        ax.legend()
+        ax.set_title(f"Channel pool: {ch}\n(error bars = ±1 SEM across participants)")
+        ax.legend(title="Haptic Device")
 
     plt.tight_layout()
     out_path = os.path.join(out_dir, "plot_band_power_avg.png")
@@ -365,13 +365,14 @@ def plot_band_power_diff(data: dict, out_dir: str):
                    color=DEVICE_COLORS[device], yerr=sems, capsize=4,
                    error_kw={"elinewidth": 1.5})
 
-        ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+        ax.axhline(0, color="black", linewidth=0.8, linestyle="--",
+                   label="No change (late = early)")
         ax.set_xticks(x)
         ax.set_xticklabels(BANDS)
         ax.set_xlabel("Frequency Band")
-        ax.set_ylabel("Δ Absolute Power (µV²)")
-        ax.set_title(f"Channel: {ch}")
-        ax.legend()
+        ax.set_ylabel("Δ Absolute Power (µV²)\n(late tasks − early tasks)")
+        ax.set_title(f"Channel pool: {ch}\n(error bars = ±1 SEM across participants)")
+        ax.legend(title="Haptic Device")
 
     plt.tight_layout()
     out_path = os.path.join(out_dir, "plot_band_power_diff.png")
@@ -458,15 +459,17 @@ def plot_knob_rotation(data: dict, out_dir: str):
                       if arr.shape[0] > 1 else np.zeros(len(common_t)))
 
         ax.plot(common_t, mean_trace, color=DEVICE_COLORS[device], linewidth=2,
-                label=f"Grand avg (n={arr.shape[0]} task-trials)")
+                label=f"Grand mean (n={arr.shape[0]} task-trials)")
         ax.fill_between(common_t,
                         mean_trace - sem_trace,
                         mean_trace + sem_trace,
-                        color=DEVICE_COLORS[device], alpha=0.2, label="±SEM")
-        ax.axhline(0, color="black", linewidth=1, linestyle="--", label="On target (0)")
+                        color=DEVICE_COLORS[device], alpha=0.2,
+                        label="±1 SEM across task-trials")
+        ax.axhline(0, color="black", linewidth=1, linestyle="--",
+                   label="Target (error = 0)")
 
         ax.set_xlabel("Time from task start (s)")
-        ax.set_ylabel("|Encoder − Target| (position units)")
+        ax.set_ylabel("|Encoder position − Target| (ticks)")
         ax.set_title(DEVICE_LABELS[device])
         ax.legend(fontsize=8)
 
@@ -676,16 +679,19 @@ def plot_erd_ers_grand(data: dict, out_dir: str):
                    yerr=sems, capsize=3,
                    error_kw={"elinewidth": 1.2})
 
-        ax.axhline(1.0, color="black", linewidth=1, linestyle="--")
+        ax.axhline(1.0, color="black", linewidth=1, linestyle="--",
+                   label="Baseline level (ratio = 1)")
         ax.set_xticks(x)
-        ax.set_xticklabels([c.replace("task_", "T") for c in task_conds])
+        ax.set_xticklabels([c.replace("task_", "Task ") for c in task_conds])
         ax.set_xlabel("Task")
-        ax.set_ylabel("Normalised Power (session / baseline)")
-        ax.set_title(f"{band} Band")
+        ax.set_ylabel("Normalised Power (task / baseline)")
+        ax.set_title(f"{band} Band\n(< 1 = ERD / desync,  > 1 = ERS / sync)")
         if ax is axes[0]:
-            ax.legend(fontsize=8)
+            ax.legend(fontsize=8, title="Haptic Device")
 
-    axes[0].text(0.01, 0.02, "< 1.0 = ERD   > 1.0 = ERS",
+    axes[0].text(0.01, 0.02,
+                 "Error bars = ±1 SEM across participants\n"
+                 "Dashed line = baseline power level (ratio 1.0)",
                  transform=axes[0].transAxes, fontsize=7, color="gray")
 
     plt.tight_layout()
@@ -801,12 +807,17 @@ def plot_gsr_grand(data: dict, out_dir: str):
                    label=DEVICE_LABELS[device], color=DEVICE_COLORS[device], lw=2)
         ax_ts.fill_between(common_t * 100,
                            mean_trace - sem_trace, mean_trace + sem_trace,
-                           color=DEVICE_COLORS[device], alpha=0.2)
+                           color=DEVICE_COLORS[device], alpha=0.2,
+                           label="_nolegend_")
 
+    import matplotlib.patches as mpatches
+    shade_patch = mpatches.Patch(alpha=0.3, color="gray", label="±1 SEM across participants")
     ax_ts.set_xlabel("Session Progress (%)")
-    ax_ts.set_ylabel("GSR (µS)")
-    ax_ts.set_title("Mean GSR Timeseries (Normalised)")
-    ax_ts.legend(fontsize=8)
+    ax_ts.set_ylabel("Skin Conductance (µS)")
+    ax_ts.set_title("Mean GSR Timeseries (Normalised to Session Duration)")
+    handles, labels = ax_ts.get_legend_handles_labels()
+    ax_ts.legend(handles + [shade_patch], labels + ["±1 SEM across participants"],
+                 fontsize=8, title="Haptic Device")
     ax_ts.grid(True, alpha=0.3)
 
     # ── Panels 2-4: bar charts per device ────────────────────────────────────
@@ -836,14 +847,18 @@ def plot_gsr_grand(data: dict, out_dir: str):
 
         ax.bar(x, means, yerr=sems, capsize=5,
                color=[DEVICE_COLORS[d] for d in DEVICES],
-               error_kw={"elinewidth": 1.5}, zorder=2)
+               error_kw={"elinewidth": 1.5}, zorder=2,
+               label="Group mean ± 1 SEM")
         for i, pts in enumerate(all_pts):
             jitter = np.random.uniform(-0.08, 0.08, len(pts))
-            ax.scatter(i + jitter, pts, color="black", s=20, zorder=3, alpha=0.7)
+            ax.scatter(i + jitter, pts, color="black", s=20, zorder=3, alpha=0.7,
+                       label="Individual participant" if i == 0 else "_nolegend_")
         ax.set_xticks(x)
         ax.set_xticklabels([DEVICE_LABELS[d] for d in DEVICES])
+        ax.set_xlabel("Haptic Device")
         ax.set_ylabel(ylabel)
         ax.set_title(title)
+        ax.legend(fontsize=8)
         ax.grid(True, alpha=0.2, axis="y")
 
     plt.tight_layout()
@@ -892,9 +907,11 @@ def plot_nasa_tlx(data: dict, out_dir: str):
 
     ax.set_xticks(x)
     ax.set_xticklabels(subscales, rotation=20, ha="right")
-    ax.set_ylabel("NASA TLX Score (0–100)")
-    ax.set_title("NASA TLX Workload Scores per Device", fontsize=12, fontweight="bold")
-    ax.legend()
+    ax.set_xlabel("Workload Subscale")
+    ax.set_ylabel("NASA-TLX Score (0–100)")
+    ax.set_title("NASA-TLX Workload Scores per Device\n(error bars = ±1 SEM across participants)",
+                 fontsize=12, fontweight="bold")
+    ax.legend(title="Haptic Device")
     plt.tight_layout()
     out_path = os.path.join(out_dir, "plot_nasa_tlx.png")
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -930,14 +947,19 @@ def plot_p300_grand(data: dict, out_dir: str):
 
     ax.bar(x, means, yerr=sems, capsize=5,
            color=[DEVICE_COLORS[d] for d in DEVICES],
-           error_kw={"elinewidth": 1.5}, zorder=2)
+           error_kw={"elinewidth": 1.5}, zorder=2,
+           label="Group mean ± 1 SEM")
     for i, pts in enumerate(all_pts):
         jitter = np.random.uniform(-0.08, 0.08, len(pts))
-        ax.scatter(i + jitter, pts, color="black", s=25, zorder=3, alpha=0.8)
-    ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+        ax.scatter(i + jitter, pts, color="black", s=25, zorder=3, alpha=0.8,
+                   label="Individual participant" if i == 0 else "_nolegend_")
+    ax.axhline(0, color="black", linewidth=0.8, linestyle="--", label="Zero amplitude")
     ax.set_xticks(x)
     ax.set_xticklabels([DEVICE_LABELS[d] for d in DEVICES])
+    ax.set_xlabel("Haptic Device")
     ax.set_ylabel("Mean Amplitude (µV)")
+    ax.set_title("Task-Onset ERP Peak Amplitude per Device\n(TP_pool, 250–600 ms)", fontweight="bold")
+    ax.legend(fontsize=8)
 
     plt.tight_layout()
     out_path = os.path.join(out_dir, "plot_p300_grand.png")
@@ -1029,15 +1051,19 @@ def plot_hr_grand(data: dict, out_dir: str):
 
         ax.bar(x, means, yerr=sems, capsize=5,
                color=[DEVICE_COLORS[d] for d in DEVICES],
-               error_kw={"elinewidth": 1.5}, zorder=2)
+               error_kw={"elinewidth": 1.5}, zorder=2,
+               label="Group mean ± 1 SEM")
         for i, pts in enumerate(all_pts):
             jitter = np.random.uniform(-0.08, 0.08, len(pts))
-            ax.scatter(i + jitter, pts, color="black", s=20, zorder=3, alpha=0.7)
+            ax.scatter(i + jitter, pts, color="black", s=20, zorder=3, alpha=0.7,
+                       label="Individual participant" if i == 0 else "_nolegend_")
 
         ax.set_xticks(x)
         ax.set_xticklabels([DEVICE_LABELS[d] for d in DEVICES])
+        ax.set_xlabel("Haptic Device")
         ax.set_ylabel(ylabel)
         ax.set_title(title)
+        ax.legend(fontsize=8)
 
     plt.tight_layout()
     out_path = os.path.join(out_dir, "plot_hr_grand.png")
@@ -1089,7 +1115,8 @@ def plot_theta_alpha_grand(data: dict, out_dir: str):
         ax.plot(x, means, marker="o", lw=2, color=DEVICE_COLORS[device],
                 label=DEVICE_LABELS[device])
         ax.fill_between(x, means - sems, means + sems,
-                        color=DEVICE_COLORS[device], alpha=0.15)
+                        color=DEVICE_COLORS[device], alpha=0.15,
+                        label="_nolegend_")
 
     ax.set_xticks(x)
     ax.set_xticklabels([c.replace("task_", "Task ") for c in task_conds])
@@ -1097,7 +1124,10 @@ def plot_theta_alpha_grand(data: dict, out_dir: str):
     ax.set_ylabel("Theta / Alpha Ratio")
     ax.set_title("Theta/Alpha Ratio per Task — Grand Average by Device\n(Higher = Greater Cognitive Load)",
                  fontweight="bold")
-    ax.legend()
+    ax.legend(title="Haptic Device")
+    ax.text(0.01, 0.01,
+            "Markers = task mean   |   Lines = trend across tasks   |   Shaded = ±1 SEM across participants",
+            transform=ax.transAxes, fontsize=7, color="gray")
     plt.tight_layout()
     out_path = os.path.join(out_dir, "plot_theta_alpha_grand.png")
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -1136,18 +1166,23 @@ def plot_detection_accuracy(data: dict, out_dir: str):
 
     ax.bar(x, means, yerr=sems, capsize=5,
            color=[DEVICE_COLORS[d] for d in DEVICES],
-           error_kw={"elinewidth": 1.5}, zorder=2)
+           error_kw={"elinewidth": 1.5}, zorder=2,
+           label="Group mean ± 1 SEM")
     for i, pts in enumerate(all_pts):
         jitter = np.random.uniform(-0.08, 0.08, len(pts))
-        ax.scatter(i + jitter, pts, color="black", s=25, zorder=3, alpha=0.8)
+        ax.scatter(i + jitter, pts, color="black", s=25, zorder=3, alpha=0.8,
+                   label="Individual participant" if i == 0 else "_nolegend_")
 
     ax.set_xticks(x)
     ax.set_xticklabels([DEVICE_LABELS[d] for d in DEVICES])
-    ax.set_ylabel("Detection Accuracy (%)")
-    ax.set_ylim(0, 110)
-    ax.axhline(100, color="green", linewidth=1, linestyle="--", label="Perfect (100%)")
-    ax.set_title("Oddball Detection Accuracy per Device", fontweight="bold")
-    ax.legend()
+    ax.set_xlabel("Haptic Device")
+    ax.set_ylabel("Detection Accuracy\n(reported count / actual count × 100%)")
+    ax.set_ylim(0, 115)
+    ax.axhline(100, color="green", linewidth=1, linestyle="--",
+               label="Perfect accuracy (100%)")
+    ax.set_title("Oddball Detection Accuracy per Device\n"
+                 "(self-reported red circle count vs. actual)", fontweight="bold")
+    ax.legend(fontsize=8)
     plt.tight_layout()
     out_path = os.path.join(out_dir, "plot_detection_accuracy.png")
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
