@@ -1206,6 +1206,165 @@ def plot_gsr_decomposition(gsr_df, metrics, out_prefix=''):
     print(f"[analysis] Saved {fname}")
 
 
+# ── Encoder (rotary knob) analysis ───────────────────────────────────────────
+#
+# Metrics, per task:
+#   duration_s         elapsed time the participant spent on this task,
+#                      i.e. t_end − t_start from the task_end markers.
+#   final_angle_ticks  encoder position at task_end — the "submitted" answer.
+#                      Defaults to 0 (firmware reset value) if no encoder
+#                      sample fell inside the task window.
+#   final_error_ticks  signed final_angle − target.
+#   mae_ticks          time-weighted mean absolute error |θ_target − θ(t)|.
+#                      Encoder messages are emitted only when delta != 0, so
+#                      naive sample-averaging under-weights stationary periods.
+#                      Each sample is weighted by Δt = duration it was the
+#                      "current" value, with the last sample extended to t_end.
+#   overshoot_ticks    max signed excursion past the target,
+#                      max(0, max(sign(target − start) · (θ − target))). 0 if
+#                      the knob never crossed past the target.
+#
+# Inputs are in raw quadrature ticks (the firmware does not divide by 4 — see
+# arduino/src/main.cpp:174). Convert to degrees downstream if needed.
+
+
+def _encoder_task_trace(arduino_df, t_start, t_end):
+    """Slice encoder samples for a single task window (t_start, t_end].
+
+    Returns (times, positions) as float arrays. Times are relative to t_start.
+    Prepends a (0, 0) anchor so the stationary period before the first encoder
+    event is counted in time-weighted metrics — the firmware resets position to
+    0 on task start. Returns (None, None) if the slice is empty.
+    """
+    enc = arduino_df[arduino_df["event_type"] == "encoder"]
+    if enc.empty:
+        return None, None
+    t = enc["time"].values.astype(float)
+    mask = (t > t_start) & (t <= t_end)
+    if not mask.any():
+        return None, None
+    t = t[mask] - t_start
+    pos = np.array([
+        json.loads(s)["position"]
+        for s in enc.loc[mask, "data_json"].values
+    ], dtype=float)
+    # Anchor at task start (position resets to 0 on the "start" command)
+    t = np.insert(t, 0, 0.0)
+    pos = np.insert(pos, 0, 0.0)
+    return t, pos
+
+
+def _time_weighted_mae(times, positions, target, duration):
+    """Σ |θ − target| · Δtᵢ / duration. Last sample extends to `duration`."""
+    if len(times) == 0 or duration <= 0:
+        return np.nan
+    err = np.abs(positions - float(target))
+    # Δt for sample i is the time until sample i+1 (or until end of task for last)
+    dt = np.diff(np.append(times, duration))
+    dt = np.clip(dt, 0.0, None)
+    total = dt.sum()
+    if total <= 0:
+        return np.nan
+    return float(np.sum(err * dt) / total)
+
+
+def _overshoot(positions, target, start=0.0):
+    """Max signed excursion past the target (ticks). 0 if never crossed."""
+    direction = np.sign(float(target) - float(start))
+    if direction == 0:
+        return 0.0
+    excursion = direction * (positions - float(target))
+    return float(max(0.0, np.nanmax(excursion)))
+
+
+def compute_encoder_metrics(arduino_df, events_df):
+    """Per-task knob-control metrics.
+
+    Returns a list of dicts (one per task with a known target), with keys:
+    task_number, target, duration_s, final_angle_ticks, final_error_ticks,
+    mae_ticks, overshoot_ticks.
+    """
+    if arduino_df is None or arduino_df.empty:
+        return []
+    if events_df is None or events_df.empty:
+        return []
+
+    task_ends = events_df[events_df["event"] == "task_end"].copy()
+    task_ends = task_ends.sort_values("time").reset_index(drop=True)
+    if task_ends.empty:
+        return []
+
+    boundaries = [0.0] + task_ends["time"].tolist()
+    rows = []
+    for i, (_, end_row) in enumerate(task_ends.iterrows()):
+        t_start = float(boundaries[i])
+        t_end   = float(end_row["time"])
+        duration = t_end - t_start
+        target = end_row.get("target")
+        if pd.isna(target):
+            continue
+        target = float(target)
+
+        times, positions = _encoder_task_trace(arduino_df, t_start, t_end)
+        if times is None:
+            # No encoder events in this window — knob untouched, position=0.
+            rows.append({
+                "task_number":       int(end_row["task_number"]),
+                "target":            target,
+                "duration_s":        duration,
+                "final_angle_ticks": 0.0,
+                "final_error_ticks": -target,
+                "mae_ticks":         abs(target),
+                "overshoot_ticks":   0.0,
+            })
+            continue
+
+        final_angle = float(positions[-1])
+        rows.append({
+            "task_number":       int(end_row["task_number"]),
+            "target":            target,
+            "duration_s":        duration,
+            "final_angle_ticks": final_angle,
+            "final_error_ticks": final_angle - target,
+            "mae_ticks":         _time_weighted_mae(times, positions, target, duration),
+            "overshoot_ticks":   _overshoot(positions, target, start=0.0),
+        })
+    return rows
+
+
+def run_arduino_analysis(arduino_path, events_path, out_prefix=''):
+    """Compute encoder metrics per task and save a CSV next to other outputs."""
+    print("\n[analysis] --- Encoder Analysis ---")
+    if not os.path.exists(arduino_path):
+        print(f"[analysis] WARNING: arduino file not found: {arduino_path}, skipping.")
+        return
+    if not os.path.exists(events_path):
+        print(f"[analysis] WARNING: markers file not found: {events_path}, skipping.")
+        return
+
+    arduino_df = pd.read_csv(arduino_path)
+    events_df  = pd.read_csv(events_path)
+
+    rows = compute_encoder_metrics(arduino_df, events_df)
+    if not rows:
+        print("[analysis] No encoder metrics could be computed (no tasks with targets).")
+        return
+
+    df = pd.DataFrame(rows)
+    csv_path = f"{out_prefix}encoder_metrics.csv"
+    df.to_csv(csv_path, index=False)
+
+    mae_mean = float(np.nanmean(df["mae_ticks"]))
+    dur_mean = float(np.nanmean(df["duration_s"]))
+    ferr_abs = float(np.nanmean(np.abs(df["final_error_ticks"])))
+    ovs_mean = float(np.nanmean(df["overshoot_ticks"]))
+    print(f"[analysis] Encoder metrics — Mean MAE: {mae_mean:.2f} ticks | "
+          f"Mean Duration: {dur_mean:.2f} s | "
+          f"Mean |Final Error|: {ferr_abs:.2f} ticks | "
+          f"Mean Overshoot: {ovs_mean:.2f} ticks")
+    print(f"[analysis] Saved {csv_path}")
+
+
 def run_gsr_analysis(gsr_path, events_path, out_prefix=''):
     """
     Load GSR CSV and markers CSV, plot the GSR signal with task_end markers
@@ -1346,6 +1505,10 @@ def analyse_session(erp_path, psd_path, events_path,
     # GSR CSV lives alongside the markers CSV: same dir, _gsr.csv suffix
     gsr_path = events_path.replace('_markers.csv', '_gsr.csv')
     run_gsr_analysis(gsr_path, events_path, out_prefix)
+
+    # Stage 14: Encoder (rotary knob) metrics
+    arduino_path = events_path.replace('_markers.csv', '_arduino.csv')
+    run_arduino_analysis(arduino_path, events_path, out_prefix)
 
     print("\n[analysis] Session complete.")
     return {

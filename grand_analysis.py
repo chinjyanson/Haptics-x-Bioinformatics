@@ -528,36 +528,101 @@ def plot_knob_rotation(data: dict, out_dir: str):
 
 
 # ---------------------------------------------------------------------------
-# Plot D: Summary table — encoder MSE + task time (CSV + PNG)
+# Plot D: Summary table — encoder metrics + task time (CSV + PNG)
 # ---------------------------------------------------------------------------
 
-def _compute_encoder_mse(data: dict, device: str) -> float:
-    errors_sq = []
-    for pid in data:
-        enc = data[pid][device]["encoder"]
-        if enc is None or enc.empty:
+
+def _compute_task_encoder_metrics(arduino_df: pd.DataFrame) -> list:
+    """Per-task knob-control metrics from a loaded arduino DataFrame.
+
+    Returns a list of dicts (one per task) with keys:
+      task_number, target, duration_s, final_angle_ticks, final_error_ticks,
+      mae_ticks, overshoot_ticks.
+
+    MAE is time-weighted: each sample contributes |error| · Δt, where Δt is the
+    duration the sample remained the "current" position. The last sample is
+    extended to t_end. Encoder firmware resets position to 0 on task start, so
+    a (t=0, position=0) anchor is prepended to count the pre-movement period.
+
+    final_angle = last encoder sample within (t_start, t_end] — the position
+    the participant "submitted" before moving on to the next task.
+    """
+    if arduino_df is None or arduino_df.empty:
+        return []
+    if not {"position", "target", "task_number", "time", "t_start", "t_end"}.issubset(arduino_df.columns):
+        return []
+
+    rows = []
+    for task_num, grp in arduino_df.groupby("task_number"):
+        grp = grp.sort_values("time")
+        t_start  = float(grp["t_start"].iloc[0])
+        t_end    = float(grp["t_end"].iloc[0])
+        duration = t_end - t_start
+        target   = float(grp["target"].iloc[0])
+        if duration <= 0:
             continue
-        for _, row in enc.iterrows():
-            err = row.get("encoder_error")
-            if not pd.isna(err):
-                errors_sq.append(float(err) ** 2)
-    return float(np.mean(errors_sq)) if errors_sq else np.nan
+
+        # Anchor at task start (position resets to 0 on the firmware "start" cmd)
+        t_rel = np.insert(grp["time"].values.astype(float) - t_start, 0, 0.0)
+        pos   = np.insert(grp["position"].values.astype(float),       0, 0.0)
+        err   = np.abs(pos - target)
+
+        # Time-weighted MAE
+        dt = np.diff(np.append(t_rel, duration))
+        dt = np.clip(dt, 0.0, None)
+        total = dt.sum()
+        mae = float(np.sum(err * dt) / total) if total > 0 else np.nan
+
+        # Final submitted angle = last sample in the task window
+        final_angle = float(pos[-1])
+
+        # Overshoot (signed, relative to start=0)
+        direction = np.sign(target)
+        overshoot = float(max(0.0, np.nanmax(direction * (pos - target)))) if direction != 0 else 0.0
+
+        rows.append({
+            "task_number":       int(task_num),
+            "target":            target,
+            "duration_s":        duration,
+            "final_angle_ticks": final_angle,
+            "final_error_ticks": final_angle - target,
+            "mae_ticks":         mae,
+            "overshoot_ticks":   overshoot,
+        })
+    return rows
 
 
-def _compute_mean_task_time(data: dict, device: str) -> float:
-    times = []
+def _participant_encoder_means(data: dict, device: str):
+    """Per-participant means for (mae, duration, final_error_abs, overshoot).
+
+    Returns four lists (one entry per participant who has data). Each entry is
+    the mean across that participant's tasks for the given device.
+    final_error_abs is the absolute value of the signed final error so that
+    direction doesn't average to zero across tasks with positive/negative
+    targets.
+    """
+    mae_means, dur_means, ferr_means, ovs_means = [], [], [], []
     for pid in data:
-        enc = data[pid][device]["encoder"]
-        if enc is None or enc.empty:
+        arduino_df = data[pid][device]["arduino"]
+        rows = _compute_task_encoder_metrics(arduino_df)
+        if not rows:
             continue
-        ts = enc["time"].values.astype(float)
-        if len(ts) == 0:
-            continue
-        # time for task 1 = ts[0] (from session start ~0)
-        # time for task N = ts[N] - ts[N-1]
-        diffs = [ts[0]] + [ts[i] - ts[i-1] for i in range(1, len(ts))]
-        times.extend(diffs)
-    return float(np.mean(times)) if times else np.nan
+        mae_vals  = [r["mae_ticks"]                  for r in rows if not np.isnan(r["mae_ticks"])]
+        dur_vals  = [r["duration_s"]                 for r in rows if not np.isnan(r["duration_s"])]
+        ferr_vals = [abs(r["final_error_ticks"])     for r in rows if not np.isnan(r["final_error_ticks"])]
+        ovs_vals  = [r["overshoot_ticks"]            for r in rows if not np.isnan(r["overshoot_ticks"])]
+        if mae_vals:  mae_means.append(float(np.mean(mae_vals)))
+        if dur_vals:  dur_means.append(float(np.mean(dur_vals)))
+        if ferr_vals: ferr_means.append(float(np.mean(ferr_vals)))
+        if ovs_vals:  ovs_means.append(float(np.mean(ovs_vals)))
+    return mae_means, dur_means, ferr_means, ovs_means
+
+
+def _compute_encoder_grand_metrics(data: dict, device: str):
+    """Grand means across participants of (mae, duration, final_error_abs, overshoot)."""
+    mae_means, dur_means, ferr_means, ovs_means = _participant_encoder_means(data, device)
+    return (safe_mean(mae_means), safe_mean(dur_means),
+            safe_mean(ferr_means), safe_mean(ovs_means))
 
 
 def _compute_mean_hr(data: dict, device: str) -> float:
@@ -616,17 +681,20 @@ def plot_summary_table(data: dict, out_dir: str):
     """Save grand_stats_summary.csv and a matplotlib table PNG."""
     rows = []
     for device in DEVICES:
-        mean_scl, scr_rate, scr_amp = _compute_gsr_grand_metrics(data, device)
+        mean_scl, scr_rate, scr_amp     = _compute_gsr_grand_metrics(data, device)
+        mae, dur, final_err_abs, ovs    = _compute_encoder_grand_metrics(data, device)
         rows.append({
-            "Device":              DEVICE_LABELS[device],
-            "Encoder MSE":         round(_compute_encoder_mse(data, device), 2),
-            "Mean Task Time (s)":  round(_compute_mean_task_time(data, device), 2),
-            "Mean HR (bpm)":       round(_compute_mean_hr(data, device), 2),
-            "Mean SCL (µS)":       round(mean_scl, 6),
-            "NS-SCR Rate (/min)":  round(scr_rate, 3),
-            "SCR Amplitude (µS)":  round(scr_amp, 6),
-            "P300 Amp (µV)":       round(_compute_mean_p300(data, device), 3),
-            "NASA-TLX Avg":        round(_compute_nasa_avg(data, device), 2),
+            "Device":                DEVICE_LABELS[device],
+            "Encoder MAE (ticks)":   round(mae, 2),
+            "Task Duration (s)":     round(dur, 2),
+            "|Final Error| (ticks)": round(final_err_abs, 2),
+            "Overshoot (ticks)":     round(ovs, 2),
+            "Mean HR (bpm)":         round(_compute_mean_hr(data, device), 2),
+            "Mean SCL (µS)":         round(mean_scl, 6),
+            "NS-SCR Rate (/min)":    round(scr_rate, 3),
+            "SCR Amplitude (µS)":    round(scr_amp, 6),
+            "P300 Amp (µV)":         round(_compute_mean_p300(data, device), 3),
+            "NASA-TLX Avg":          round(_compute_nasa_avg(data, device), 2),
         })
 
     df = pd.DataFrame(rows)
@@ -635,7 +703,7 @@ def plot_summary_table(data: dict, out_dir: str):
     print(f"[grand_analysis] Saved {csv_path}")
 
     # PNG table
-    fig, ax = plt.subplots(figsize=(13, 2 + 0.6 * len(df)))
+    fig, ax = plt.subplots(figsize=(16, 2 + 0.6 * len(df)))
     ax.axis("off")
     col_labels = df.columns.tolist()
     cell_text  = df.values.tolist()
@@ -1351,20 +1419,30 @@ def run_grand_statistics(data: dict, out_dir: str):
     for feat_name, groups in zip(gsr_feature_names, gsr_groups):
         all_rows += _run_device_stats(feat_name, groups)
 
-    # ── Behavioural: encoder MSE (continuous position error) ─────────────────
-    groups = {dev: [] for dev in DEVICES}
+    # ── Behavioural: encoder metrics (one value per participant per device) ──
+    # MAE_t (time-weighted), Task Duration, |Final Error|, Overshoot — see
+    # _compute_task_encoder_metrics. Per-participant value = mean across tasks.
+    mae_groups  = {dev: [] for dev in DEVICES}
+    dur_groups  = {dev: [] for dev in DEVICES}
+    ferr_groups = {dev: [] for dev in DEVICES}
+    ovs_groups  = {dev: [] for dev in DEVICES}
     for pid in data:
         for dev in DEVICES:
-            arduino_df = data[pid][dev]["arduino"]
-            if arduino_df is None or arduino_df.empty:
+            rows = _compute_task_encoder_metrics(data[pid][dev]["arduino"])
+            if not rows:
                 continue
-            if "position" not in arduino_df.columns or "target" not in arduino_df.columns:
-                continue
-            errors_sq = (arduino_df["position"] - arduino_df["target"]) ** 2
-            v = float(errors_sq.mean())
-            if not np.isnan(v):
-                groups[dev].append(v)
-    all_rows += _run_device_stats("Behavioural_encoder_MSE", groups)
+            mae_vals  = [r["mae_ticks"]              for r in rows if not np.isnan(r["mae_ticks"])]
+            dur_vals  = [r["duration_s"]             for r in rows if not np.isnan(r["duration_s"])]
+            ferr_vals = [abs(r["final_error_ticks"]) for r in rows if not np.isnan(r["final_error_ticks"])]
+            ovs_vals  = [r["overshoot_ticks"]        for r in rows if not np.isnan(r["overshoot_ticks"])]
+            if mae_vals:  mae_groups[dev].append(float(np.mean(mae_vals)))
+            if dur_vals:  dur_groups[dev].append(float(np.mean(dur_vals)))
+            if ferr_vals: ferr_groups[dev].append(float(np.mean(ferr_vals)))
+            if ovs_vals:  ovs_groups[dev].append(float(np.mean(ovs_vals)))
+    all_rows += _run_device_stats("Behavioural_encoder_MAE_ticks",         mae_groups)
+    all_rows += _run_device_stats("Behavioural_task_duration_s",           dur_groups)
+    all_rows += _run_device_stats("Behavioural_final_error_abs_ticks",     ferr_groups)
+    all_rows += _run_device_stats("Behavioural_overshoot_ticks",           ovs_groups)
 
     # ── Behavioural: oddball detection accuracy ───────────────────────────────
     groups = {dev: [] for dev in DEVICES}
