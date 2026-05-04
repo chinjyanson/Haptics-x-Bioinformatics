@@ -113,13 +113,7 @@ def load_baseline_features(participant_dir, session_id):
               "Analyses will use absolute power instead of normalised.")
         return None
     with open(path) as f:
-        bf = json.load(f)
-    iaf = bf.get('IAF_hz')
-    if iaf is not None:
-        BANDS['Alpha'] = (iaf - 2, iaf + 2)
-        print(f"[analysis] IAF={iaf:.1f}Hz, personalised alpha band: "
-              f"[{iaf-2:.1f}, {iaf+2:.1f}]Hz")
-    return bf
+        return json.load(f)
 
 
 def add_pooled_channels(df):
@@ -542,12 +536,9 @@ def compute_erd_ers(task_epochs, fs, baseline_features=None):
             ep_pow[band] = row_pow
 
         for band in ['Theta', 'Alpha', 'Beta']:
-            # Always use the pre-stimulus window as the ERD baseline so that the
-            # band definition used for baseline and epoch power is identical.
-            # Using external baseline_features here causes a mismatch when the
-            # Alpha band has been personalised via IAF (the stored baseline power
-            # was computed with the original 8-13 Hz band, but BANDS['Alpha'] may
-            # now point to a different range).
+            # Use the per-epoch pre-stimulus window as the ERD baseline rather
+            # than the resting-state baseline_features value, so the same band
+            # definition and same trial conditions feed both halves of the ratio.
             pre_idx = time_axis < 0
             pre_v   = np.array(ep_pow[band])[pre_idx]
             bl_pow  = float(np.nanmean(pre_v)) if len(pre_v) > 0 else None
@@ -1023,7 +1014,6 @@ def save_session_summary(band_df, task_onset_epochs,
         'theta_alpha_ratio_by_condition':    {},
         'task_onset_erp_peak_by_condition':  {},
         'n_task_onset_epochs_accepted':      len(task_onset_epochs) if task_onset_epochs else 0,
-        'iaf_hz':                            baseline_features.get('IAF_hz') if baseline_features else None,
     }
 
     if not band_df.empty:

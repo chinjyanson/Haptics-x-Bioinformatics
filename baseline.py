@@ -7,7 +7,6 @@ session. Produces reference metrics consumed by analysis.py for:
   - ERSP baseline correction
   - DFA reference values
   - PermEn reference values
-  - Individual Alpha Frequency (IAF) extraction
 
 Usage:
     python baseline.py <participant_id> <session_id> [--data-dir data] [--out-dir output]
@@ -39,10 +38,6 @@ BANDS = {
     'Alpha': (8,  12),
     'Beta':  (12, 30),
 }
-
-IAF_SEARCH_LOW  = 6.0   # Hz
-IAF_SEARCH_HIGH = 14.0  # Hz
-IAF_DEFAULT     = 10.0  # Hz (fallback when no clear peak found)
 
 
 # ── REQ-B1: Baseline Recording ────────────────────────────────────────────────
@@ -227,44 +222,6 @@ def _welch_band_power(sig, fs, bands, nperseg=None, noverlap=None):
     return freqs, psd, band_powers
 
 
-def _compute_iaf(sig, fs):
-    """
-    Compute Individual Alpha Frequency from eyes-closed signal.
-
-    Finds the peak in the 6–14 Hz range of the Welch PSD.
-    Falls back to IAF_DEFAULT if no clear peak (peak < 2× mean of neighbouring bins).
-
-    Returns:
-        iaf_hz (float)
-    """
-    nperseg = min(4 * fs, len(sig))
-    noverlap = min(2 * fs, nperseg - 1)
-    freqs, psd = scipy_signal.welch(sig, fs=fs, window='hann',
-                                    nperseg=nperseg, noverlap=noverlap)
-
-    mask = (freqs >= IAF_SEARCH_LOW) & (freqs <= IAF_SEARCH_HIGH)
-    if mask.sum() < 3:
-        print(f"[baseline] WARNING: No clear alpha peak found, using default IAF={IAF_DEFAULT}Hz")
-        return IAF_DEFAULT
-
-    search_freqs = freqs[mask]
-    search_psd   = psd[mask]
-
-    peak_idx = int(np.argmax(search_psd))
-    peak_power = search_psd[peak_idx]
-
-    # Check clarity: peak must be > 2× mean of surrounding bins (excluding itself)
-    neighbour_mask = np.ones(len(search_psd), dtype=bool)
-    neighbour_mask[peak_idx] = False
-    neighbour_mean = float(np.mean(search_psd[neighbour_mask]))
-
-    if peak_power < 2.0 * neighbour_mean:
-        print(f"[baseline] WARNING: No clear alpha peak found, using default IAF={IAF_DEFAULT}Hz")
-        return IAF_DEFAULT
-
-    return float(search_freqs[peak_idx])
-
-
 def _dfa(sig, scales=None):
     """
     Detrended Fluctuation Analysis (DFA).
@@ -415,29 +372,19 @@ def extract_baseline_features(participant_id, session_id, out_dir='output'):
     channel_features['TP_pool']['band_power'] = tp_bp
     channel_features['AF_pool']['band_power'] = af_bp
 
-    # ── B3b: IAF (from ec_psd, TP_pool) ─────────────────────────────────────
-    ec_good = ec_psd_df[ec_psd_df['bad_segment'] == False] if 'bad_segment' in ec_psd_df.columns else ec_psd_df
-
-    ec_tp9  = ec_good['TP9'].values.astype(float)
-    ec_tp10 = ec_good['TP10'].values.astype(float)
-    ec_tp_pool = (ec_tp9 + ec_tp10) / 2.0
-
-    iaf_hz = _compute_iaf(ec_tp_pool, SAMPLE_RATE)
-    alpha_band_personalised = [round(iaf_hz - 2.0, 4), round(iaf_hz + 2.0, 4)]
-
-    # ── B3c: DFA Reference (from eo_psd) ─────────────────────────────────────
+    # ── B3b: DFA Reference (from eo_psd) ─────────────────────────────────────
     for ch in CHANNELS:
         sig = eo_good[ch].values.astype(float)
         channel_features[ch]['dfa_baseline'] = _dfa(sig)
 
-    # ── B3d: PermEn Reference (from eo_erp) ──────────────────────────────────
+    # ── B3c: PermEn Reference (from eo_erp) ──────────────────────────────────
     eo_erp_good = eo_erp_df[eo_erp_df['bad_segment'] == False] if 'bad_segment' in eo_erp_df.columns else eo_erp_df
 
     for ch in CHANNELS:
         sig = eo_erp_good[ch].values.astype(float)
         channel_features[ch]['permen_baseline'] = _permutation_entropy(sig, m=3, tau=1)
 
-    # ── B3e: Theta/Alpha Ratio ────────────────────────────────────────────────
+    # ── B3d: Theta/Alpha Ratio ────────────────────────────────────────────────
     for ch in CHANNELS:
         bp = channel_features[ch]['band_power']
         theta = bp.get('Theta', 0.0)
@@ -451,8 +398,6 @@ def extract_baseline_features(participant_id, session_id, out_dir='output'):
     features = {
         'participant_id': participant_id,
         'session_id': session_id,
-        'IAF_hz': iaf_hz,
-        'alpha_band_personalised': alpha_band_personalised,
         'channels': channel_features,
     }
 
