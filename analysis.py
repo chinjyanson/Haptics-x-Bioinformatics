@@ -1056,144 +1056,58 @@ def save_session_summary(band_df, task_onset_epochs,
 
 
 # ── GSR analysis ─────────────────────────────────────────────────────────────
-
-# Tonic / phasic decomposition constants
-GSR_TONIC_LP_HZ   = 0.05   # Lowpass cutoff for SCL (tonic) extraction
-GSR_SCR_MIN_AMP   = 0.01   # µS — minimum peak amplitude to count as an SCR
-GSR_SCR_MIN_DIST  = 1.0    # seconds — minimum distance between SCR peaks
+#
+# GSR is recorded externally on the Mindfield eSense iPad app and exported as
+# a CSV that this pipeline reads via gsr_io.load_ipad_gsr_csv. The iPad's
+# onboard SCR detector populates an `scr_per_min` column that increments
+# cumulatively each time it identifies an SCR event; we use that as the
+# authoritative SCR count rather than recomputing offline. SCL is reported as
+# the mean of the calibrated `gsr_uS` samples.
 
 
 def compute_gsr_metrics(gsr_df, fs=None):
+    """Compute per-session GSR scalars from an iPad-imported DataFrame.
+
+    Required columns: `gsr_uS`, `time`, `scr_per_min` (cumulative SCR count
+    from the iPad's onboard detector).
+
+    Returns a dict with keys:
+      mean_scl            time-mean of `gsr_uS` (µS)
+      n_scr               total SCRs detected by the iPad over the session
+      scr_rate_per_min    n_scr divided by session duration (minutes)
+      mean_scr_amplitude  always NaN — the iPad export does not expose
+                          per-event amplitudes
+    Returns None when the signal is empty or unusable.
     """
-    Decompose GSR into tonic (SCL) and phasic (SCR) components and compute:
-      - Mean SCL (µS)       : mean of the lowpass-filtered tonic signal
-      - NS-SCR Rate (/min)  : non-specific SCR count per minute
-      - SCR Amplitude (µS)  : mean peak amplitude of detected SCRs
-
-    Decomposition:
-      Tonic  = zero-phase Butterworth lowpass at GSR_TONIC_LP_HZ (0.05 Hz)
-      Phasic = raw GSR − tonic
-
-    SCR detection on phasic component:
-      Peaks with amplitude >= GSR_SCR_MIN_AMP µS and separated by
-      >= GSR_SCR_MIN_DIST seconds are counted as NS-SCRs.
-
-    Returns a dict with keys: mean_scl, scr_rate_per_min, mean_scr_amplitude,
-    and arrays: tonic, phasic, scr_indices (sample indices of detected peaks).
-    Returns None if signal is too short.
-    """
-    sig   = gsr_df['gsr_uS'].values.astype(float)
-    times = gsr_df['time'].values.astype(float)
-    n     = len(sig)
-
-    if n < 10:
+    if gsr_df is None or gsr_df.empty:
+        return None
+    if 'gsr_uS' not in gsr_df.columns:
         return None
 
-    # Estimate sampling rate from time axis if not provided
-    if fs is None:
-        dt = np.median(np.diff(times))
-        fs = 1.0 / dt if dt > 0 else 50.0
+    sig = gsr_df['gsr_uS'].values.astype(float)
+    if sig.size < 2:
+        return None
 
-    duration_min = (times[-1] - times[0]) / 60.0
-
-    # ── Tonic extraction (SCL) ────────────────────────────────────────────────
-    nyq    = fs / 2.0
-    cutoff = min(GSR_TONIC_LP_HZ, nyq * 0.9)
-    order  = 2
-    padlen = 3 * order * max(1, int(np.ceil(fs / cutoff)))
-    if n > padlen:
-        b, a   = scipy_signal.butter(order, cutoff / nyq, btype='low')
-        tonic  = scipy_signal.filtfilt(b, a, sig)
+    if 'time' in gsr_df.columns and gsr_df['time'].size:
+        duration_s = float(gsr_df['time'].iloc[-1] - gsr_df['time'].iloc[0])
     else:
-        tonic = np.full(n, np.mean(sig))
+        duration_s = 0.0
+    duration_min = max(duration_s / 60.0, 1e-9)
 
-    mean_scl = float(np.mean(tonic))
-
-    # ── Phasic extraction (SCR) ───────────────────────────────────────────────
-    phasic = sig - tonic
-
-    # Peak detection on phasic signal
-    min_dist_samples = max(1, int(GSR_SCR_MIN_DIST * fs))
-    peaks, props = scipy_signal.find_peaks(
-        phasic,
-        height=GSR_SCR_MIN_AMP,
-        distance=min_dist_samples,
-    )
-
-    n_scr          = len(peaks)
-    scr_rate       = n_scr / duration_min if duration_min > 0 else np.nan
-    mean_scr_amp   = float(np.mean(props['peak_heights'])) if n_scr > 0 else 0.0
+    # The iPad's cumulative SCR counter is in scr_per_min (which increments by
+    # 1 at each detected event). The binary `scr` column is 1 only during the
+    # SCR's response window and is therefore not a good count source.
+    if 'scr_per_min' in gsr_df.columns and gsr_df['scr_per_min'].size:
+        n_scr = int(gsr_df['scr_per_min'].max())
+    else:
+        n_scr = 0
 
     return {
-        'mean_scl':           mean_scl,
-        'scr_rate_per_min':   scr_rate,
-        'mean_scr_amplitude': mean_scr_amp,
+        'mean_scl':           float(np.mean(sig)),
+        'scr_rate_per_min':   n_scr / duration_min,
+        'mean_scr_amplitude': float('nan'),
         'n_scr':              n_scr,
-        'tonic':              tonic,
-        'phasic':             phasic,
-        'scr_indices':        peaks,
     }
-
-
-def plot_gsr_decomposition(gsr_df, metrics, out_prefix=''):
-    """
-    4-panel plot showing:
-      1. Raw GSR + tonic (SCL) overlay
-      2. Phasic component with detected SCR peaks marked
-      3. SCL trajectory
-      4. Summary text box with all three metrics
-    """
-    times  = gsr_df['time'].values.astype(float)
-    sig    = gsr_df['gsr_uS'].values.astype(float)
-    tonic  = metrics['tonic']
-    phasic = metrics['phasic']
-    peaks  = metrics['scr_indices']
-
-    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
-
-    # Panel 1: Raw + tonic
-    axes[0].plot(times, sig,   color='steelblue', lw=0.8, alpha=0.7, label='Raw GSR')
-    axes[0].plot(times, tonic, color='red',       lw=1.5,             label='Tonic (SCL)')
-    axes[0].set_ylabel('GSR (µS)')
-    axes[0].set_title('GSR Signal with Tonic (SCL) Component')
-    axes[0].legend(fontsize=8)
-    axes[0].grid(True, alpha=0.3)
-
-    # Panel 2: Phasic + SCR peaks
-    axes[1].plot(times, phasic, color='darkorange', lw=0.8, label='Phasic (SCR)')
-    if len(peaks) > 0:
-        axes[1].scatter(times[peaks], phasic[peaks],
-                        color='red', zorder=5, s=25, label=f'SCRs (n={len(peaks)})')
-    axes[1].axhline(GSR_SCR_MIN_AMP, color='gray', lw=0.8, linestyle='--',
-                    label=f'Min amp ({GSR_SCR_MIN_AMP} µS)')
-    axes[1].set_ylabel('Phasic GSR (µS)')
-    axes[1].set_title('Phasic Component with Detected SCRs')
-    axes[1].legend(fontsize=8)
-    axes[1].grid(True, alpha=0.3)
-
-    # Panel 3: SCL trajectory
-    axes[2].plot(times, tonic, color='red', lw=1.5)
-    axes[2].fill_between(times, tonic.min(), tonic, alpha=0.2, color='red')
-    axes[2].set_ylabel('SCL (µS)')
-    axes[2].set_xlabel('Time (s)')
-    axes[2].set_title('Skin Conductance Level (Tonic) Trajectory')
-    axes[2].grid(True, alpha=0.3)
-
-    scl  = metrics['mean_scl']
-    rate = metrics['scr_rate_per_min']
-    amp  = metrics['mean_scr_amplitude']
-    fig.text(0.99, 0.01,
-             f"Mean SCL: {scl:.4f} µS   |   NS-SCR Rate: {rate:.2f} /min   |   "
-             f"Mean SCR Amplitude: {amp:.4f} µS",
-             ha='right', va='bottom', fontsize=9,
-             bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
-
-    plt.tight_layout()
-    plt.subplots_adjust(bottom=0.07)
-    fname = f"{out_prefix}gsr_decomposition.png"
-    plt.savefig(fname, dpi=150)
-    plt.close()
-    print(f"[analysis] Saved {fname}")
 
 
 # ── Encoder (rotary knob) analysis ───────────────────────────────────────────
@@ -1356,33 +1270,52 @@ def run_arduino_analysis(arduino_path, events_path, out_prefix=''):
 
 
 def run_gsr_analysis(gsr_path, events_path, out_prefix=''):
-    """
-    Load GSR CSV and markers CSV, plot the GSR signal with task_end markers
-    overlaid, plus the rolling-statistics analysis plot.
-    Saves two PNGs alongside other session outputs.
+    """Plot the iPad-imported GSR trace against the session's task markers and
+    save per-session GSR metrics.
+
+    The CSV at `gsr_path` is expected to be a Mindfield eSense iPad export
+    (manually copied into the participant folder under the canonical
+    `session_*_*_gsr.csv` name). Time is re-anchored to study time using
+    `session_start_unix` from the matching `_markers.json` so that GSR aligns
+    with the EEG / HR / Arduino streams from the same session.
     """
     print("\n[analysis] --- GSR Analysis ---")
     if not os.path.exists(gsr_path):
         print(f"[analysis] WARNING: GSR file not found: {gsr_path}, skipping.")
         return
 
-    import pandas as pd
+    from gsr_io import is_ipad_export, load_ipad_gsr_csv, load_session_start_unix
 
-    gsr_df = pd.read_csv(gsr_path)
-    if 'timestamp' in gsr_df.columns:
-        gsr_df['time'] = gsr_df['timestamp'] - gsr_df['timestamp'].iloc[0]
+    if not is_ipad_export(gsr_path):
+        print(f"[analysis] WARNING: {gsr_path} is not an iPad eSense export; skipping.")
+        return
 
-    # Load task_end markers
+    pdir = os.path.dirname(gsr_path)
+    basename = os.path.basename(gsr_path).replace("_gsr.csv", "")
+    session_start = load_session_start_unix(pdir, basename)
+    gsr_df, ipad_meta = load_ipad_gsr_csv(gsr_path, session_start_unix=session_start)
+    if session_start is None:
+        print(f"[analysis] WARNING: no session_start_unix in {basename}_markers.json; "
+              "GSR time axis is iPad-relative, not study-relative.")
+
+    if gsr_df.empty:
+        print(f"[analysis] WARNING: GSR data is empty after parsing; skipping.")
+        return
+
+    # Drop any rows that fall outside the session window when re-anchored
+    if session_start is not None:
+        gsr_df = gsr_df[gsr_df["time"] >= 0].reset_index(drop=True)
+        if gsr_df.empty:
+            print(f"[analysis] WARNING: GSR samples all precede session_start; skipping.")
+            return
+
+    # Load task_end markers (already in study-time)
     task_ends = []
     if events_path and os.path.exists(events_path):
         ev = pd.read_csv(events_path)
         task_ends = ev[ev['event'] == 'task_end'][['time', 'task_number']].values.tolist()
 
-    is_calibrated = gsr_df['gsr_uS'].abs().max() > 1e-3
-    unit      = "µS" if is_calibrated else "a.u."
-    gsr_label = f"GSR ({unit})"
-
-    # ── Plot 1: GSR signal with task markers ──────────────────────────────────
+    # ── Plot: GSR signal with task markers ────────────────────────────────────
     fig, ax = plt.subplots(figsize=(14, 5))
     ax.plot(gsr_df['time'], gsr_df['gsr_uS'], 'r-', linewidth=0.8, label='GSR')
 
@@ -1401,7 +1334,7 @@ def run_gsr_analysis(gsr_path, events_path, out_prefix=''):
     ax.legend(seen.values(), seen.keys(), fontsize=8, loc='upper right')
 
     ax.set_xlabel('Time (seconds)')
-    ax.set_ylabel(gsr_label)
+    ax.set_ylabel('GSR (µS)')
     ax.set_title('GSR Signal with Task Markers')
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -1410,27 +1343,23 @@ def run_gsr_analysis(gsr_path, events_path, out_prefix=''):
     plt.close(fig)
     print(f"[analysis] Saved {fname}")
 
-    # ── Plot 2: rolling-statistics analysis ───────────────────────────────────
-    plot_gsr_analysis(gsr_path, save_path=f"{out_prefix}gsr_analysis.png")
-
-    # ── GSR metrics: SCL, NS-SCR Rate, SCR Amplitude ─────────────────────────
+    # ── Per-session metrics ───────────────────────────────────────────────────
     metrics = compute_gsr_metrics(gsr_df)
-    if metrics:
-        plot_gsr_decomposition(gsr_df, metrics, out_prefix)
-
-        metrics_csv = f"{out_prefix}gsr_metrics.csv"
-        pd.DataFrame([{
-            'mean_scl_uS':          metrics['mean_scl'],
-            'scr_rate_per_min':     metrics['scr_rate_per_min'],
-            'mean_scr_amplitude_uS': metrics['mean_scr_amplitude'],
-            'n_scr':                metrics['n_scr'],
-        }]).to_csv(metrics_csv, index=False)
-        print(f"[analysis] GSR metrics — Mean SCL: {metrics['mean_scl']:.4f} µS | "
-              f"NS-SCR Rate: {metrics['scr_rate_per_min']:.2f}/min | "
-              f"Mean SCR Amp: {metrics['mean_scr_amplitude']:.4f} µS")
-        print(f"[analysis] Saved {metrics_csv}")
-    else:
+    if metrics is None:
         print("[analysis] WARNING: GSR signal too short for metrics computation.")
+        return
+
+    metrics_csv = f"{out_prefix}gsr_metrics.csv"
+    pd.DataFrame([{
+        'mean_scl_uS':           metrics['mean_scl'],
+        'scr_rate_per_min':      metrics['scr_rate_per_min'],
+        'mean_scr_amplitude_uS': metrics['mean_scr_amplitude'],
+        'n_scr':                 metrics['n_scr'],
+    }]).to_csv(metrics_csv, index=False)
+    print(f"[analysis] GSR metrics — Mean SCL: {metrics['mean_scl']:.4f} µS | "
+          f"Total SCRs (iPad): {metrics['n_scr']} | "
+          f"Rate: {metrics['scr_rate_per_min']:.2f}/min")
+    print(f"[analysis] Saved {metrics_csv}")
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
@@ -1509,169 +1438,6 @@ def analyse_session(erp_path, psd_path, events_path,
         'erd_time_axis':     erd_time_axis,
         'mse_data':          mse_cache if mse_cache else {},
     }
-
-
-# ── GSR plotting ──────────────────────────────────────────────────────────────
-
-def plot_gsr_data(filepath: str, save_path: str | None = None):
-    """
-    Plot GSR data from a CSV file.
-
-    Creates a 3-panel figure showing:
-    1. Raw audio signal
-    2. Filtered signal
-    3. GSR conductance (µS)
-
-    Args:
-        filepath: Path to GSR CSV file
-        save_path: Optional path to save the figure
-    """
-    import pandas as pd
-
-    df = pd.read_csv(filepath)
-
-    if 'timestamp' in df.columns:
-        df['time'] = df['timestamp'] - df['timestamp'].iloc[0]
-    elif 'time' not in df.columns:
-        raise ValueError("CSV must have 'timestamp' or 'time' column")
-
-    is_calibrated = df['gsr_uS'].abs().max() > 1e-3
-    unit = "µS" if is_calibrated else "a.u."
-    gsr_label = f"GSR ({unit})"
-    calibration_note = "" if is_calibrated else "\n⚠ Uncalibrated — values are raw audio amplitude, not µS"
-
-    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
-    fig.suptitle('eSense GSR Recording Analysis', fontsize=14, fontweight='bold')
-
-    axes[0].plot(df['time'], df['raw_audio'], 'b-', linewidth=0.5, alpha=0.7)
-    axes[0].set_ylabel('Raw Audio\nAmplitude')
-    axes[0].set_title('Raw Audio Signal (Microphone Input)')
-    axes[0].grid(True, alpha=0.3)
-    axes[0].margins(y=0.1)
-
-    axes[1].plot(df['time'], df['filtered_signal'], 'g-', linewidth=0.8)
-    axes[1].set_ylabel('Filtered Signal\nAmplitude')
-    axes[1].set_title('Lowpass Filtered Signal (5 Hz cutoff)')
-    axes[1].grid(True, alpha=0.3)
-    axes[1].margins(y=0.1)
-
-    axes[2].plot(df['time'], df['gsr_uS'], 'r-', linewidth=1)
-    axes[2].set_ylabel(gsr_label)
-    axes[2].set_xlabel('Time (seconds)')
-    axes[2].set_title('Galvanic Skin Response (Conductance)')
-    axes[2].grid(True, alpha=0.3)
-
-    duration   = df['time'].iloc[-1]
-    n_samples  = len(df)
-    sample_rate = n_samples / duration if duration > 0 else 0
-    gsr_mean, gsr_std = df['gsr_uS'].mean(), df['gsr_uS'].std()
-    gsr_min,  gsr_max = df['gsr_uS'].min(),  df['gsr_uS'].max()
-    stats_text = (
-        f"Duration: {duration:.1f}s | Samples: {n_samples:,} | Rate: {sample_rate:.1f} Hz\n"
-        f"GSR - Mean: {gsr_mean:.2e} | Std: {gsr_std:.2e} | Range: [{gsr_min:.2e}, {gsr_max:.2e}]"
-        f"{calibration_note}"
-    )
-    fig.text(0.5, 0.02, stats_text, ha='center', fontsize=10,
-             bbox=dict(boxstyle='round', facecolor='wheat' if is_calibrated else 'lightyellow', alpha=0.5))
-
-    plt.tight_layout()
-    plt.subplots_adjust(bottom=0.1)
-
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"[analysis] GSR plot saved to {save_path}")
-        plt.close(fig)
-    else:
-        plt.show()
-    return fig
-
-
-def plot_gsr_analysis(filepath: str, window_size: float = 5.0, save_path: str | None = None):
-    """
-    Plot detailed GSR analysis with rolling statistics.
-
-    Creates a 4-panel figure showing:
-    1. GSR signal with rolling mean
-    2. Rolling standard deviation (variability)
-    3. Rate of change (derivative)
-    4. Distribution histogram
-
-    Args:
-        filepath: Path to GSR CSV file
-        window_size: Rolling window size in seconds
-        save_path: Optional path to save the figure
-    """
-    import pandas as pd
-
-    df = pd.read_csv(filepath)
-
-    if 'timestamp' in df.columns:
-        df['time'] = df['timestamp'] - df['timestamp'].iloc[0]
-
-    duration      = df['time'].iloc[-1]
-    n_samples     = len(df)
-    sample_rate   = n_samples / duration if duration > 0 else 50
-    window_samples = int(window_size * sample_rate)
-
-    df['rolling_mean'] = df['gsr_uS'].rolling(window=window_samples, center=True).mean()
-    df['rolling_std']  = df['gsr_uS'].rolling(window=window_samples, center=True).std()
-    df['derivative']   = np.gradient(df['gsr_uS'], df['time'])
-
-    is_calibrated    = df['gsr_uS'].abs().max() > 1e-3
-    unit             = "µS" if is_calibrated else "a.u."
-    gsr_label        = f"GSR ({unit})"
-    calibration_note = "" if is_calibrated else "⚠ Uncalibrated — values are raw audio amplitude, not µS"
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle('eSense GSR Detailed Analysis', fontsize=14, fontweight='bold')
-
-    axes[0, 0].plot(df['time'], df['gsr_uS'], 'lightblue', linewidth=0.5, alpha=0.7, label='Raw GSR')
-    axes[0, 0].plot(df['time'], df['rolling_mean'], 'b-', linewidth=1.5, label=f'Rolling Mean ({window_size}s)')
-    axes[0, 0].set_xlabel('Time (seconds)')
-    axes[0, 0].set_ylabel(gsr_label)
-    axes[0, 0].set_title('GSR Signal with Trend')
-    axes[0, 0].legend(loc='upper right')
-    axes[0, 0].grid(True, alpha=0.3)
-
-    axes[0, 1].plot(df['time'], df['rolling_std'], 'orange', linewidth=1)
-    axes[0, 1].fill_between(df['time'], 0, df['rolling_std'], alpha=0.3, color='orange')
-    axes[0, 1].set_xlabel('Time (seconds)')
-    axes[0, 1].set_ylabel(f'Std Dev ({unit})')
-    axes[0, 1].set_title(f'GSR Variability (Rolling Std, {window_size}s window)')
-    axes[0, 1].grid(True, alpha=0.3)
-
-    axes[1, 0].plot(df['time'], df['derivative'], 'green', linewidth=0.5)
-    axes[1, 0].axhline(y=0, color='gray', linestyle='--', alpha=0.5)
-    axes[1, 0].set_xlabel('Time (seconds)')
-    axes[1, 0].set_ylabel(f'dGSR/dt ({unit}/s)')
-    axes[1, 0].set_title('Rate of Change (Phasic Activity Indicator)')
-    axes[1, 0].grid(True, alpha=0.3)
-
-    axes[1, 1].hist(df['gsr_uS'], bins=50, color='purple', alpha=0.7, edgecolor='black')
-    axes[1, 1].axvline(x=df['gsr_uS'].mean(), color='red', linestyle='--', linewidth=2,
-                       label=f"Mean: {df['gsr_uS'].mean():.2e}")
-    axes[1, 1].axvline(x=df['gsr_uS'].median(), color='orange', linestyle='--', linewidth=2,
-                       label=f"Median: {df['gsr_uS'].median():.2e}")
-    axes[1, 1].set_xlabel(gsr_label)
-    axes[1, 1].set_ylabel('Count')
-    axes[1, 1].set_title('GSR Distribution')
-    axes[1, 1].legend()
-    axes[1, 1].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-
-    if calibration_note:
-        fig.text(0.5, 0.01, calibration_note, ha='center', fontsize=10,
-                 color='darkorange', bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
-        plt.subplots_adjust(bottom=0.07)
-
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"[analysis] GSR analysis plot saved to {save_path}")
-        plt.close(fig)
-    else:
-        plt.show()
-    return fig
 
 
 # ── Cross-Device Comparison ───────────────────────────────────────────────────

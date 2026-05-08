@@ -264,7 +264,16 @@ def eog_interpolate_tp(df):
             post = re
             while post < n - 1 and np.abs(sig[post]) > EOG_TP_THRESHOLD_UV:
                 post += 1
-            sig_clean[rs:re] = np.interp(t_all[rs:re], [pre, post], [sig[pre], sig[post]])
+            # Edge cases: artefact at start (pre < 0) or end (post >= n)
+            # — fall back to the only available anchor on the other side.
+            if pre < 0 and post >= n:
+                continue  # entire signal is artefact, nothing to anchor to
+            if pre < 0:
+                sig_clean[rs:re] = sig[post]
+            elif post >= n:
+                sig_clean[rs:re] = sig[pre]
+            else:
+                sig_clean[rs:re] = np.interp(t_all[rs:re], [pre, post], [sig[pre], sig[post]])
             n_interp += re - rs
 
         df[ch] = sig_clean

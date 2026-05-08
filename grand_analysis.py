@@ -150,12 +150,26 @@ def load_arduino(data_dir: str, pid: str, device: str) -> pd.DataFrame | None:
 
 
 def load_gsr(data_dir: str, pid: str, device: str) -> pd.DataFrame | None:
+    """Load the iPad eSense export for one participant/device.
+
+    Returns None if no CSV exists, the file isn't an iPad export, or parsing
+    fails. The returned DataFrame has columns (time, gsr_uS, scr, scr_per_min).
+    """
     path = _glob_first(os.path.join(data_dir, pid, f"session_*_{device}_gsr.csv"))
     if not path:
         return None
+    from gsr_io import is_ipad_export, load_ipad_gsr_csv, load_session_start_unix
+    if not is_ipad_export(path):
+        return None
     try:
-        return pd.read_csv(path)
-    except Exception:
+        basename = os.path.basename(path).replace("_gsr.csv", "")
+        sstart = load_session_start_unix(os.path.dirname(path), basename)
+        df, _meta = load_ipad_gsr_csv(path, session_start_unix=sstart)
+        if sstart is not None:
+            df = df[df["time"] >= 0].reset_index(drop=True)
+        return df if not df.empty else None
+    except Exception as e:
+        print(f"[grand_analysis] WARNING: failed to load iPad GSR {path}: {e}")
         return None
 
 
@@ -177,15 +191,6 @@ def load_nasa_tlx(data_dir: str, pid: str, device: str) -> dict | None:
         return json.load(f)
 
 
-def load_gsr_baseline(data_dir: str, pid: str) -> float | None:
-    path = os.path.join(data_dir, pid, "gsr_baseline.json")
-    if not os.path.exists(path):
-        return None
-    with open(path) as f:
-        d = json.load(f)
-    return d.get("amplitude_baseline")
-
-
 # ---------------------------------------------------------------------------
 # Master loader
 # ---------------------------------------------------------------------------
@@ -197,10 +202,9 @@ def load_all_data(data_dir: str = "data", output_dir: str = "output") -> dict:
         "band_power":      DataFrame | None,
         "encoder":         DataFrame | None,  # task_end rows only
         "arduino":         DataFrame | None,  # continuous encoder positions per task
-        "gsr":             DataFrame | None,
+        "gsr":             DataFrame | None,  # iPad-imported GSR (time, gsr_uS, scr, scr_per_min)
         "hr":              DataFrame | None,
         "nasa_tlx":        dict | None,
-        "gsr_baseline":    float | None,
     }
     """
     pids = discover_participants(data_dir)
@@ -211,7 +215,6 @@ def load_all_data(data_dir: str = "data", output_dir: str = "output") -> dict:
     data = {}
     for pid in pids:
         data[pid] = {}
-        gsr_baseline = load_gsr_baseline(data_dir, pid)
         for device in DEVICES:
             data[pid][device] = {
                 "session_summary": load_session_summary(output_dir, pid, device),
@@ -221,7 +224,6 @@ def load_all_data(data_dir: str = "data", output_dir: str = "output") -> dict:
                 "gsr":             load_gsr(data_dir, pid, device),
                 "hr":              load_hr(data_dir, pid, device),
                 "nasa_tlx":        load_nasa_tlx(data_dir, pid, device),
-                "gsr_baseline":    gsr_baseline,
             }
         print(f"[grand_analysis] Loaded participant {pid}")
     return data
@@ -636,20 +638,22 @@ def _compute_mean_hr(data: dict, device: str) -> float:
 
 
 def _compute_gsr_grand_metrics(data: dict, device: str):
-    """Return (mean_scl, scr_rate, scr_amplitude) averaged across participants."""
-    scls, rates, amps = [], [], []
+    """Return (mean_scl, scr_rate) averaged across participants.
+
+    Per-event SCR amplitude is unavailable from the iPad export and is
+    therefore omitted from the grand summary.
+    """
+    scls, rates = [], []
     for pid in data:
         gsr_df = data[pid][device]["gsr"]
         if gsr_df is None or gsr_df.empty:
             continue
-        scl, rate, amp = _compute_gsr_metrics_from_df(gsr_df)
+        scl, rate, _amp = _compute_gsr_metrics_from_df(gsr_df)
         if not np.isnan(scl):
             scls.append(scl)
         if not np.isnan(rate):
             rates.append(rate)
-        if not np.isnan(amp):
-            amps.append(amp)
-    return safe_mean(scls), safe_mean(rates), safe_mean(amps)
+    return safe_mean(scls), safe_mean(rates)
 
 
 def _compute_mean_p300(data: dict, device: str) -> float:
@@ -681,7 +685,7 @@ def plot_summary_table(data: dict, out_dir: str):
     """Save grand_stats_summary.csv and a matplotlib table PNG."""
     rows = []
     for device in DEVICES:
-        mean_scl, scr_rate, scr_amp     = _compute_gsr_grand_metrics(data, device)
+        mean_scl, scr_rate              = _compute_gsr_grand_metrics(data, device)
         mae, dur, final_err_abs, ovs    = _compute_encoder_grand_metrics(data, device)
         rows.append({
             "Device":                DEVICE_LABELS[device],
@@ -692,7 +696,6 @@ def plot_summary_table(data: dict, out_dir: str):
             "Mean HR (bpm)":         round(_compute_mean_hr(data, device), 2),
             "Mean SCL (µS)":         round(mean_scl, 6),
             "NS-SCR Rate (/min)":    round(scr_rate, 3),
-            "SCR Amplitude (µS)":    round(scr_amp, 6),
             "P300 Amp (µV)":         round(_compute_mean_p300(data, device), 3),
             "NASA-TLX Avg":          round(_compute_nasa_avg(data, device), 2),
         })
@@ -820,78 +823,56 @@ def plot_erd_ers_grand(data: dict, out_dir: str):
 # Plot F: GSR grand average — timeseries + SCL / SCR metrics
 # ---------------------------------------------------------------------------
 
-# Tonic/phasic decomposition parameters (must match analysis.py)
-_GSR_TONIC_LP_HZ  = 0.05   # Hz — SCL lowpass cutoff
-_GSR_SCR_MIN_AMP  = 0.01   # µS — minimum SCR peak height
-_GSR_SCR_MIN_DIST = 1.0    # seconds — minimum inter-peak distance
-
-
-def _gsr_decompose(gsr_df: pd.DataFrame):
-    """
-    Decompose a GSR DataFrame into tonic (SCL) and phasic (SCR) components.
-
-    Returns (tonic, phasic, peaks, fs) or None if signal is too short.
-    """
-    sig   = gsr_df["gsr_uS"].values.astype(float)
-    times = gsr_df["time"].values.astype(float)
-    n     = len(sig)
-    if n < 10:
-        return None
-
-    dt = float(np.median(np.diff(times)))
-    fs = 1.0 / dt if dt > 0 else 50.0
-
-    nyq    = fs / 2.0
-    cutoff = min(_GSR_TONIC_LP_HZ, nyq * 0.9)
-    order  = 2
-    padlen = 3 * order * max(1, int(np.ceil(fs / cutoff)))
-    if n > padlen:
-        b, a  = scipy_signal.butter(order, cutoff / nyq, btype="low")
-        tonic = scipy_signal.filtfilt(b, a, sig)
-    else:
-        tonic = np.full(n, np.mean(sig))
-
-    phasic           = sig - tonic
-    min_dist_samples = max(1, int(_GSR_SCR_MIN_DIST * fs))
-    peaks, props     = scipy_signal.find_peaks(
-        phasic, height=_GSR_SCR_MIN_AMP, distance=min_dist_samples
-    )
-    return tonic, phasic, peaks, props, fs
+# GSR comes from the iPad eSense app (loaded via gsr_io.load_ipad_gsr_csv).
+# The iPad's onboard SCR detector populates `scr_per_min` as a cumulative
+# counter — we use its max as the authoritative SCR count rather than
+# recomputing offline. SCL is just the time-mean of `gsr_uS`. Per-event SCR
+# amplitudes are not exported by the iPad, so the amplitude column is NaN
+# at this layer (and skipped in cross-condition stats).
 
 
 def _compute_gsr_metrics_from_df(gsr_df: pd.DataFrame):
-    """Return (mean_scl, scr_rate_per_min, mean_scr_amplitude) for one session."""
-    result = _gsr_decompose(gsr_df)
-    if result is None:
+    """Return (mean_scl, scr_rate_per_min, mean_scr_amplitude) for one session.
+
+    Reads SCL as the time-mean of `gsr_uS`. Reads SCR count as the max of the
+    iPad's cumulative `scr_per_min` column. Per-event SCR amplitude is not
+    available from the iPad export and is reported as NaN.
+    """
+    if gsr_df is None or gsr_df.empty or "gsr_uS" not in gsr_df.columns:
         return np.nan, np.nan, np.nan
-    tonic, phasic, peaks, props, fs = result
-    times        = gsr_df["time"].values.astype(float)
+    times = gsr_df["time"].values.astype(float) if "time" in gsr_df.columns else None
+    if times is None or len(times) < 2:
+        return np.nan, np.nan, np.nan
     duration_min = (times[-1] - times[0]) / 60.0
-    mean_scl     = float(np.mean(tonic))
-    scr_rate     = len(peaks) / duration_min if duration_min > 0 else np.nan
-    mean_scr_amp = float(np.mean(props["peak_heights"])) if len(peaks) > 0 else 0.0
-    return mean_scl, scr_rate, mean_scr_amp
+    if duration_min <= 0:
+        return np.nan, np.nan, np.nan
+    mean_scl = float(np.mean(gsr_df["gsr_uS"].values.astype(float)))
+    if "scr_per_min" in gsr_df.columns and gsr_df["scr_per_min"].size:
+        n_scr = int(gsr_df["scr_per_min"].max())
+    else:
+        n_scr = 0
+    scr_rate = n_scr / duration_min
+    return mean_scl, scr_rate, np.nan
 
 
 def plot_gsr_grand(data: dict, out_dir: str):
     """
-    Four-panel grand average GSR figure:
+    Three-panel grand average GSR figure:
       1. Mean GSR timeseries (normalised 0-100% session time)
       2. Mean SCL per device (bar chart with participant scatter)
-      3. NS-SCR Rate per device
-      4. Mean SCR Amplitude per device
+      3. NS-SCR Rate per device (using the iPad's onboard SCR detector)
+
+    Per-event SCR amplitudes are not exported by the iPad app, so the
+    amplitude panel from the legacy plot is dropped here.
     """
     N_POINTS = 1000
     common_t = np.linspace(0, 1, N_POINTS)
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle("Grand Average GSR — Tonic & Phasic Metrics per Device",
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle("Grand Average GSR — SCL & SCR Metrics per Device",
                  fontsize=13, fontweight="bold")
 
-    ax_ts  = axes[0, 0]   # timeseries
-    ax_scl = axes[0, 1]   # mean SCL bar
-    ax_scr = axes[1, 0]   # NS-SCR rate bar
-    ax_amp = axes[1, 1]   # SCR amplitude bar
+    ax_ts, ax_scl, ax_scr = axes
 
     # ── Panel 1: GSR timeseries ───────────────────────────────────────────────
     for device in DEVICES:
@@ -935,12 +916,11 @@ def plot_gsr_grand(data: dict, out_dir: str):
                  fontsize=8, title="Haptic Device")
     ax_ts.grid(True, alpha=0.3)
 
-    # ── Panels 2-4: bar charts per device ────────────────────────────────────
+    # ── Panels 2-3: bar charts per device ────────────────────────────────────
     x = np.arange(len(DEVICES))
     bar_specs = [
         (ax_scl, 0, "Mean SCL (µS)",       "Mean SCL"),
         (ax_scr, 1, "NS-SCR Rate (/min)",  "NS-SCR Rate"),
-        (ax_amp, 2, "Mean SCR Amp (µS)",   "Mean SCR Amplitude"),
     ]
 
     for ax, metric_idx, ylabel, title in bar_specs:
@@ -1404,16 +1384,19 @@ def run_grand_statistics(data: dict, out_dir: str):
                 groups[dev].append(v)
     all_rows += _run_device_stats("Cardiac_HF_power_ms2", groups)
 
-    # ── GSR: mean SCL, NS-SCR rate, SCR amplitude ─────────────────────────────
-    gsr_feature_names = ["GSR_mean_SCL_uS", "GSR_NS_SCR_rate_per_min", "GSR_mean_SCR_amplitude_uS"]
-    gsr_groups = [{dev: [] for dev in DEVICES} for _ in range(3)]
+    # ── GSR: mean SCL + NS-SCR rate (iPad onboard detector) ──────────────────
+    # Per-event SCR amplitude is not exported by the iPad app, so the legacy
+    # `GSR_mean_SCR_amplitude_uS` feature is dropped from the cross-condition
+    # statistical comparisons.
+    gsr_feature_names = ["GSR_mean_SCL_uS", "GSR_NS_SCR_rate_per_min"]
+    gsr_groups = [{dev: [] for dev in DEVICES} for _ in range(2)]
     for pid in data:
         for dev in DEVICES:
             gsr_df = data[pid][dev]["gsr"]
             if gsr_df is None or gsr_df.empty:
                 continue
-            scl, rate, amp = _compute_gsr_metrics_from_df(gsr_df)
-            for i, v in enumerate([scl, rate, amp]):
+            scl, rate, _amp = _compute_gsr_metrics_from_df(gsr_df)
+            for i, v in enumerate([scl, rate]):
                 if not np.isnan(v):
                     gsr_groups[i][dev].append(float(v))
     for feat_name, groups in zip(gsr_feature_names, gsr_groups):

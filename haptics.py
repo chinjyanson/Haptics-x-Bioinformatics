@@ -25,10 +25,12 @@ import numpy as np
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 HAPTIC_TARGETS_FILE   = "haptic_targets.json"  # Edit this file between experiments
-HAPTIC_MAX_ERROR      = 10000   # Ticks at which feedback reaches maximum intensity
+HAPTIC_MAX_ERROR      = 10000   # Ticks at which auditory feedback reaches maximum intensity
 HAPTIC_DEAD_ZONE      = 5       # Ticks of silence around the target (±)
 HAPTIC_TONE_HZ        = 440     # Sine tone frequency for auditory feedback (Hz)
 HAPTIC_MOTOR_INTERVAL = 0       # Minimum seconds between vibration motor command updates
+HAPTIC_MOTOR_MIN_PWM  = 110     # PWM at which the ERM motor reliably spins (below this it stalls)
+HAPTIC_MOTOR_MAX_ERROR = 3000   # Ticks at which vibration reaches max intensity (separate from auditory)
 HAPTIC_SERVO_MAX_DEG  = 70      # Max servo deflection from neutral 90° (i.e. range 20°–160°)
 HAPTIC_SERVO_MAX_ERROR = 5000   # Ticks at which servo reaches max deflection (separate from other modes)
 
@@ -184,13 +186,17 @@ class HapticsController:
         if self._arduino is None:
             return
 
-        volume = min(abs(error) / HAPTIC_MAX_ERROR, 1.0)
-        if error < 0:       # Need to go CCW → motor 1
-            m1, m2 = int(volume * 255), 0
-        elif error > 0:     # Need to go CW  → motor 2
-            m1, m2 = 0, int(volume * 255)
-        else:
+        # Remap [0, 1] volume to [MIN_PWM, 255] so the motor turns on the
+        # instant we leave the dead zone (no silent sub-startup-PWM region).
+        if abs(error) <= HAPTIC_DEAD_ZONE:
             m1 = m2 = 0
+        else:
+            volume = min(abs(error) / HAPTIC_MOTOR_MAX_ERROR, 1.0)
+            pwm = int(HAPTIC_MOTOR_MIN_PWM + volume * (255 - HAPTIC_MOTOR_MIN_PWM))
+            if error < 0:       # Need to go CCW → motor 1
+                m1, m2 = pwm, 0
+            else:               # error > 0: Need to go CW → motor 2
+                m1, m2 = 0, pwm
 
         self._arduino.send_command({"cmd": "set_vibration", "motor": 1, "intensity": m1})
         self._arduino.send_command({"cmd": "set_vibration", "motor": 2, "intensity": m2})

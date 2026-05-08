@@ -21,14 +21,12 @@ import numpy as np
 # Import device classes
 from muse import MuseBrainFlowProcessor
 from polar import PolarH10, HEART_RATE_MEASUREMENT_UUID
-from esense import ESenseGSR
 from arduino.bridge import ArduinoBridge, TimestampedArduinoEvent, ARDUINO_DEFAULT_PORT, ARDUINO_DEFAULT_BAUD
 
 
 # ── Device enable flags — set to False to run without a device ────────────────
 USE_MUSE    = True
-USE_POLAR   = True
-USE_GSR     = True
+USE_POLAR   = False
 USE_ARDUINO = True
 
 # ── Baseline recording flag — set to False to skip baseline at session start ──
@@ -57,14 +55,6 @@ class TimestampedHRSample:
     rr_intervals: List[float]  # RR intervals in ms (may be empty)
 
 @dataclass
-class TimestampedGSRSample:
-    """Single GSR sample with synchronized timestamp"""
-    timestamp: float  # Unix timestamp
-    raw_audio: float  # Raw audio amplitude
-    filtered_signal: float  # Lowpass filtered signal
-    gsr_uS: float  # Calibrated conductance in microsiemens
-
-@dataclass
 class TaskMarker:
     """Task transition marker with synchronized timestamp"""
     timestamp: float  # Unix timestamp
@@ -81,14 +71,12 @@ class SynchronizedDataStore:
     session_start: float = field(default_factory=time.time)
     eeg_data: List[TimestampedEEGSample] = field(default_factory=list)
     hr_data: List[TimestampedHRSample] = field(default_factory=list)
-    gsr_data: List[TimestampedGSRSample] = field(default_factory=list)
     task_markers: List[TaskMarker] = field(default_factory=list)
     arduino_data: List[TimestampedArduinoEvent] = field(default_factory=list)
 
     # Metadata
     muse_sampling_rate: int = 256
     muse_channels: List[str] = field(default_factory=lambda: ['TP9', 'AF7', 'AF8', 'TP10'])
-    gsr_sampling_rate: int = 50  # Downsampled rate
 
     def add_eeg_sample(self, timestamp: float, channel_values: Dict[str, float]):
         """Add a timestamped EEG sample"""
@@ -103,16 +91,6 @@ class SynchronizedDataStore:
             rr_intervals=rr_intervals
         )
         self.hr_data.append(sample)
-
-    def add_gsr_sample(self, timestamp: float, raw_audio: float, filtered_signal: float, gsr_uS: float):
-        """Add a timestamped GSR sample"""
-        sample = TimestampedGSRSample(
-            timestamp=timestamp,
-            raw_audio=raw_audio,
-            filtered_signal=filtered_signal,
-            gsr_uS=gsr_uS
-        )
-        self.gsr_data.append(sample)
 
     def add_task_marker(self, timestamp: float, task_number: int, event: str = "task_end",
                         extra: Optional[Dict[str, Any]] = None):
@@ -139,7 +117,6 @@ class SynchronizedDataStore:
                 'session_start_iso': datetime.fromtimestamp(self.session_start).isoformat(),
                 'muse_sampling_rate': self.muse_sampling_rate,
                 'muse_channels': self.muse_channels,
-                'gsr_sampling_rate': self.gsr_sampling_rate,
             },
             'eeg_data': [
                 {
@@ -155,15 +132,6 @@ class SynchronizedDataStore:
                     'rr_intervals': s.rr_intervals
                 }
                 for s in self.hr_data
-            ],
-            'gsr_data': [
-                {
-                    'time': round(self.get_relative_time(s.timestamp), 6),
-                    'raw_audio': s.raw_audio,
-                    'filtered_signal': s.filtered_signal,
-                    'gsr_uS': s.gsr_uS
-                }
-                for s in self.gsr_data
             ],
             'task_markers': [
                 {
@@ -184,7 +152,6 @@ class SynchronizedDataStore:
             'summary': {
                 'total_eeg_samples': len(self.eeg_data),
                 'total_hr_samples': len(self.hr_data),
-                'total_gsr_samples': len(self.gsr_data),
                 'total_task_markers': len(self.task_markers),
                 'total_arduino_events': len(self.arduino_data),
                 'duration_seconds': round(self.get_relative_time(time.time()), 2)
@@ -221,16 +188,6 @@ class SynchronizedDataStore:
                 rr_str = ";".join(f"{rr:.2f}" for rr in sample.rr_intervals)
                 f.write(f"{rel_time:.6f},{sample.heart_rate},{rr_str}\n")
         print(f"HR data saved to {hr_filepath}")
-
-        # Save GSR data
-        gsr_filepath = f"{base_filepath}_gsr.csv"
-        with open(gsr_filepath, 'w') as f:
-            # Header - time is relative time starting from 0
-            f.write("time,raw_audio,filtered_signal,gsr_uS\n")
-            for sample in self.gsr_data:
-                rel_time = self.get_relative_time(sample.timestamp)
-                f.write(f"{rel_time:.6f},{sample.raw_audio},{sample.filtered_signal},{sample.gsr_uS}\n")
-        print(f"GSR data saved to {gsr_filepath}")
 
         # Save Arduino event data
         arduino_filepath = f"{base_filepath}_arduino.csv"
@@ -289,16 +246,6 @@ class SynchronizedDataStore:
                 f.write(f"{rel(s.timestamp):.6f},{s.heart_rate},{rr_str}\n")
         print(f"HR data saved to {hr_filepath}")
 
-        # GSR
-        gsr_filepath = f"{base_filepath}_gsr.csv"
-        with open(gsr_filepath, 'w') as f:
-            f.write("time,raw_audio,filtered_signal,gsr_uS\n")
-            for s in self.gsr_data:
-                if s.timestamp < start_ts or s.timestamp > end_ts_cmp:
-                    continue
-                f.write(f"{rel(s.timestamp):.6f},{s.raw_audio},{s.filtered_signal},{s.gsr_uS}\n")
-        print(f"GSR data saved to {gsr_filepath}")
-
         # Arduino
         arduino_filepath = f"{base_filepath}_arduino.csv"
         with open(arduino_filepath, 'w') as f:
@@ -348,7 +295,6 @@ class SynchronizedDataStore:
         json_path = f"{base_filepath}.json"
         eeg_slice   = [s for s in self.eeg_data     if start_ts <= s.timestamp <= end_ts_cmp]
         hr_slice    = [s for s in self.hr_data       if start_ts <= s.timestamp <= end_ts_cmp]
-        gsr_slice   = [s for s in self.gsr_data      if start_ts <= s.timestamp <= end_ts_cmp]
         ard_slice   = [e for e in self.arduino_data  if start_ts <= e.timestamp <= end_ts_cmp]
         with open(json_path, 'w') as f:
             json.dump({
@@ -358,17 +304,14 @@ class SynchronizedDataStore:
                     'session_start_iso': datetime.fromtimestamp(start_ts).isoformat(),
                     'muse_sampling_rate': self.muse_sampling_rate,
                     'muse_channels': self.muse_channels,
-                    'gsr_sampling_rate': self.gsr_sampling_rate,
                 },
                 'eeg_data': [{'time': round(rel(s.timestamp), 6), 'channels': s.channels} for s in eeg_slice],
                 'hr_data':  [{'time': round(rel(s.timestamp), 6), 'heart_rate': s.heart_rate, 'rr_intervals': s.rr_intervals} for s in hr_slice],
-                'gsr_data': [{'time': round(rel(s.timestamp), 6), 'raw_audio': s.raw_audio, 'filtered_signal': s.filtered_signal, 'gsr_uS': s.gsr_uS} for s in gsr_slice],
                 'task_markers': [{'time': round(rel(m.timestamp), 6), 'task_number': m.task_number, 'event': m.event} for m in session_markers],
                 'arduino_data': [{'time': round(rel(e.timestamp), 6), 'event_type': e.event_type, 'data': e.data} for e in ard_slice],
                 'summary': {
                     'total_eeg_samples': len(eeg_slice),
                     'total_hr_samples': len(hr_slice),
-                    'total_gsr_samples': len(gsr_slice),
                     'total_task_markers': len(session_markers),
                     'total_arduino_events': len(ard_slice),
                     'duration_seconds': round((end_ts - start_ts) if end_ts else 0, 2),
@@ -433,12 +376,10 @@ class SynchronizedCollector:
                  muse_serial_port: Optional[str] = None,
                  muse_mac_address: Optional[str] = None,
                  polar_device_name: str = "Polar H10",
-                 gsr_device: Optional[int] = None,
                  buffer_duration: int = 10,
                  apply_filter: bool = True,
                  use_muse: bool = True,
                  use_polar: bool = True,
-                 use_gsr: bool = True,
                  arduino_port: Optional[str] = None,
                  arduino_baud: int = 115200,
                  use_arduino: bool = True,
@@ -450,7 +391,6 @@ class SynchronizedCollector:
             muse_serial_port: Serial port for BLED112 dongle (optional)
             muse_mac_address: MAC address of Muse 2 (optional)
             polar_device_name: Name of Polar device to scan for
-            gsr_device: Audio input device index for eSense GSR (optional)
             buffer_duration: EEG buffer duration in seconds
             apply_filter: Whether to apply bandpass/notch filters to EEG
             arduino_port: Serial port for Arduino Uno R3 (e.g. /dev/ttyACM0)
@@ -461,7 +401,6 @@ class SynchronizedCollector:
         self.muse_serial_port = muse_serial_port
         self.muse_mac_address = muse_mac_address
         self.polar_device_name = polar_device_name
-        self.gsr_device = gsr_device
         self.buffer_duration = buffer_duration
         self.apply_filter = apply_filter
         self.audio_out_device = audio_out_device
@@ -469,7 +408,6 @@ class SynchronizedCollector:
         # Device enable flags
         self.use_muse    = use_muse
         self.use_polar   = use_polar
-        self.use_gsr     = use_gsr
         self.use_arduino = use_arduino
 
         # Data store with synchronized timestamps
@@ -477,24 +415,20 @@ class SynchronizedCollector:
 
         # Thread synchronization.
         # Per-type locks prevent high-frequency EEG writes (256 Hz) from
-        # starving GSR, HR, Arduino, and GUI threads that need different data.
+        # starving HR, Arduino, and GUI threads that need different data.
         self._lock         = threading.Lock()   # general / markers
         self._eeg_lock     = threading.Lock()   # EEG data only
-        self._gsr_lock     = threading.Lock()   # GSR data only
         self._stop_event = threading.Event()
 
         # Device instances (created during collection)
         self.muse: Optional[MuseBrainFlowProcessor] = None
         self.polar: Optional[PolarH10] = None
-        self.gsr: Optional[ESenseGSR] = None
 
         # Status tracking
         self.muse_connected  = False
         self.polar_connected = False
-        self.gsr_connected   = False
         self.muse_error:  Optional[str] = None
         self.polar_error: Optional[str] = None
-        self.gsr_error:   Optional[str] = None
 
         # Synchronization flags for simultaneous start
         self._muse_ready    = threading.Event()
@@ -502,7 +436,6 @@ class SynchronizedCollector:
         self._polar_ready   = threading.Event()
         self._polar_failed  = False   # True when connection exhausted all retries
         self._polar_retry_status: str = ''  # e.g. 'Retrying (2/5)...'
-        self._gsr_ready     = threading.Event()
 
         # _record_event replaces one-shot _start_recording — can be set/cleared
         # repeatedly to pause/resume recording between sessions.
@@ -512,7 +445,6 @@ class SynchronizedCollector:
         # Per-device paused acknowledgement events (set by thread when idle)
         self._muse_paused  = threading.Event()
         self._polar_paused = threading.Event()
-        self._gsr_paused   = threading.Event()
 
         # Arduino bridge (None when use_arduino=False)
         self._arduino_paused = threading.Event()
@@ -535,7 +467,6 @@ class SynchronizedCollector:
         """Start a new recording session. Emits session_start marker, unblocks threads."""
         self._muse_paused.clear()
         self._polar_paused.clear()
-        self._gsr_paused.clear()
         self._arduino_paused.clear()
         with self._lock:
             self.data_store.add_task_marker(
@@ -550,8 +481,6 @@ class SynchronizedCollector:
             self._muse_paused.wait(timeout=timeout)
         if self.use_polar:
             self._polar_paused.wait(timeout=timeout)
-        if self.use_gsr:
-            self._gsr_paused.wait(timeout=timeout)
         if self.use_arduino and self.arduino:
             self._arduino_paused.wait(timeout=timeout)
         with self._lock:
@@ -638,47 +567,6 @@ class SynchronizedCollector:
             self.polar_connected = False
             return False
 
-    def connect_gsr(self) -> bool:
-        """
-        Connect to eSense GSR device. Returns True if successful.
-        Tests audio input availability.
-        """
-        try:
-            import sounddevice as sd
-
-            # Create GSR instance (doesn't start streaming yet)
-            self.gsr = ESenseGSR(
-                device=self.gsr_device,
-                downsample_rate=50,
-                buffer_size=50  # Smaller buffer for more frequent updates
-            )
-
-            # Test that we can access the audio device
-            devices = sd.query_devices()
-            if self.gsr_device is not None:
-                if self.gsr_device >= len(devices):
-                    raise Exception(f"Audio device {self.gsr_device} not found")
-                device_info = devices[self.gsr_device]
-                if device_info['max_input_channels'] < 1:
-                    raise Exception(f"Device {self.gsr_device} has no input channels")
-                print(f"[GSR] Using device: {device_info['name']}")
-            else:
-                # Check default input device
-                default_input = sd.default.device[0]
-                if default_input is None or default_input < 0:
-                    raise Exception("No default audio input device found")
-                print(f"[GSR] Using default input device: {devices[default_input]['name']}")
-
-            print(f"[GSR] Connection test successful")
-            self.gsr_connected = True
-            self.gsr_error = None
-            self.data_store.gsr_sampling_rate = self.gsr.downsample_rate
-            return True
-        except Exception as e:
-            self.gsr_error = str(e)
-            self.gsr_connected = False
-            return False
-
     def disconnect_devices(self):
         """Disconnect all devices"""
         if self.muse:
@@ -690,13 +578,6 @@ class SynchronizedCollector:
             self.muse_connected = False
         self.polar = None
         self.polar_connected = False
-        if self.gsr:
-            try:
-                self.gsr.stop()
-            except:
-                pass
-            self.gsr = None
-            self.gsr_connected = False
         if self.arduino:
             self.arduino.disconnect()
 
@@ -800,7 +681,7 @@ class SynchronizedCollector:
                         n_samples = eeg_data.shape[1]
                         # Build all samples first, then write in capped chunks so we
                         # never hold self._lock for more than ~50 samples at a time.
-                        # This prevents starving GSR, Arduino, and GUI threads.
+                        # This prevents starving HR, Arduino, and GUI threads.
                         batch = []
                         for i in range(n_samples):
                             sample_timestamp = float(hw_timestamps[i])
@@ -824,8 +705,11 @@ class SynchronizedCollector:
 
         except Exception as e:
             print(f"[Muse] Error: {e}")
+            self.muse_error = str(e)
+            self._muse_failed = True
             self._muse_ready.set()   # Unblock GUI on error
             self._muse_paused.set()  # Unblock end_session() on error
+            self._stop_event.set()   # Abort experiment — no silent continuation
         finally:
             if self.muse:
                 try:
@@ -1001,144 +885,6 @@ class SynchronizedCollector:
             self._polar_paused.set()  # Unblock end_session() on error
             self.polar_connected = False
 
-    def _gsr_collection_thread(self, duration: Optional[float]):
-        """
-        Thread function for GSR data collection.
-        Uses the ESenseGSR callback mechanism.
-
-        Args:
-            duration: Collection duration in seconds, or None for indefinite
-        """
-        try:
-            # Initialize GSR if needed
-            if self.gsr is None:
-                print("[GSR] Initializing connection...")
-                self.gsr = ESenseGSR(
-                    device=self.gsr_device,
-                    downsample_rate=50,
-                    buffer_size=50
-                )
-            else:
-                print("[GSR] Using existing connection...")
-
-            # Override the GSR's internal callback to feed our data store.
-            # IMPORTANT: never acquire self._lock inside this callback — it runs on
-            # the sounddevice real-time audio thread and would contend with the GUI
-            # thread, causing visible stutter or hangs.  Instead, append to a
-            # lock-free deque and drain it from the polling loop below.
-            _gsr_pending: deque = deque()
-
-            def synchronized_callback(indata, frames, time_info, status):
-                """Custom callback that stages GSR samples into _gsr_pending."""
-                if status:
-                    print(f"[GSR] Audio status: {status}")
-
-                raw = indata[:, 0].copy()
-                # _apply_filter decimates and lowpass filters — always run to keep state
-                filtered = self.gsr._apply_filter(raw)
-
-                # Only record if recording is active
-                if not self._record_event.is_set():
-                    return
-                if len(filtered) == 0:
-                    return
-
-                raw_mean = float(np.mean(np.abs(raw)))
-                filt_ds = float(filtered[-1])
-                gsr_uS = self.gsr._convert_to_gsr(filt_ds)
-                timestamp = time.time()
-
-                # Append without holding the shared lock
-                _gsr_pending.append((timestamp, raw_mean, filt_ds, gsr_uS))
-
-            # Start the audio stream with our custom callback
-            import sounddevice as sd
-            self.gsr._init_filter()
-
-            self.gsr.stream = sd.InputStream(
-                callback=synchronized_callback,
-                channels=1,
-                samplerate=self.gsr.fs,
-                device=self.gsr.device,
-                dtype='float32'
-            )
-            self.gsr.stream.start()
-            self.gsr.is_streaming = True
-
-            # Signal that GSR is ready
-            print("[GSR] Ready, waiting for synchronized start...")
-            self._gsr_ready.set()
-
-            # Outer loop — stays alive across all sessions
-            while not self._stop_event.is_set():
-                # Clear paused flag so end_session() always gets a fresh wait.
-                self._gsr_paused.clear()
-
-                # Between sessions: wait for record_event
-                while not self._record_event.is_set() and not self._stop_event.is_set():
-                    time.sleep(0.01)
-
-                if self._stop_event.is_set():
-                    break
-
-                print("[GSR] Starting data collection...")
-                last_print = time.time()
-                total_drained = 0
-
-                # Inner recording loop — drain pending samples and print status
-                while self._record_event.is_set() and not self._stop_event.is_set():
-                    # Flush all samples staged by the audio callback into the data store.
-                    # Acquire the lock once per batch (not once per audio frame).
-                    if _gsr_pending:
-                        batch = []
-                        while _gsr_pending:
-                            batch.append(_gsr_pending.popleft())
-                        with self._gsr_lock:
-                            for ts, raw_mean, filt_ds, gsr_uS in batch:
-                                self.data_store.add_gsr_sample(ts, raw_mean, filt_ds, gsr_uS)
-                        total_drained += len(batch)
-
-                    # Print status every 5 seconds
-                    if time.time() - last_print >= 5.0:
-                        print(f"[GSR] {total_drained} samples collected | pending={len(_gsr_pending)}")
-                        total_drained = 0
-                        last_print = time.time()
-                    time.sleep(0.1)
-
-                # Flush any samples that arrived between the last drain and now
-                if _gsr_pending:
-                    batch = []
-                    while _gsr_pending:
-                        batch.append(_gsr_pending.popleft())
-                    with self._gsr_lock:
-                        for ts, raw_mean, filt_ds, gsr_uS in batch:
-                            self.data_store.add_gsr_sample(ts, raw_mean, filt_ds, gsr_uS)
-
-                print("[GSR] Session paused.")
-                self._gsr_paused.set()
-
-            # Stop streaming
-            self.gsr.stream.stop()
-            self.gsr.stream.close()
-            self.gsr.is_streaming = False
-
-            with self._lock:
-                sample_count = len(self.data_store.gsr_data)
-            print(f"[GSR] Collection complete. {sample_count} total samples.")
-
-        except Exception as e:
-            print(f"[GSR] Error: {e}")
-            self._gsr_ready.set()   # Unblock GUI on error
-            self._gsr_paused.set()  # Unblock end_session() on error
-        finally:
-            if self.gsr and self.gsr.is_streaming:
-                try:
-                    self.gsr.stream.stop()
-                    self.gsr.stream.close()
-                    self.gsr.is_streaming = False
-                except:
-                    pass
-
     def collect(self, duration: float = 60, output_path: Optional[str] = None):
         """
         Start synchronized data collection from both devices.
@@ -1231,7 +977,6 @@ class SynchronizedCollector:
         print(f"  - {json_path}")
         print(f"  - {base_path}_eeg.csv")
         print(f"  - {base_path}_hr.csv")
-        print(f"  - {base_path}_gsr.csv")
         print(f"  - {base_path}_markers.json")
         print(f"  - {base_path}_markers.csv")
 
@@ -1251,11 +996,9 @@ def _reset_data_store(collector: SynchronizedCollector) -> None:
     collector._muse_ready.clear()
     collector._muse_failed = False
     collector._polar_ready.clear()
-    collector._gsr_ready.clear()
     collector._record_event.clear()
     collector._muse_paused.clear()
     collector._polar_paused.clear()
-    collector._gsr_paused.clear()
     collector._arduino_paused.clear()
     if collector.arduino is not None:
         collector.arduino._data_store = collector.data_store
@@ -1269,9 +1012,6 @@ def start_collection_threads(collector: SynchronizedCollector):
     polar_thread = threading.Thread(
         target=lambda: asyncio.run(collector._polar_collection_async(None)), daemon=True
     )
-    gsr_thread = threading.Thread(
-        target=collector._gsr_collection_thread, args=(None,), daemon=True
-    )
     if collector.arduino is not None:
         arduino_thread = threading.Thread(
             target=collector.arduino.collection_thread, args=(None,), daemon=True
@@ -1281,9 +1021,8 @@ def start_collection_threads(collector: SynchronizedCollector):
 
     muse_thread.start()
     polar_thread.start()
-    gsr_thread.start()
     arduino_thread.start()
-    return muse_thread, polar_thread, gsr_thread, arduino_thread
+    return muse_thread, polar_thread, arduino_thread
 
 
 def main():
@@ -1291,7 +1030,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description='Synchronized Muse 2 EEG, Polar H10 HR, and eSense GSR data collection'
+        description='Synchronized Muse 2 EEG, Polar H10 HR, and Arduino encoder data collection'
     )
     parser.add_argument(
         '--muse-serial',
@@ -1311,12 +1050,6 @@ def main():
         default="Polar H10",
         help='Name of Polar device to scan for (default: "Polar H10")'
     )
-    parser.add_argument(
-        '--gsr-device',
-        type=int,
-        default=None,
-        help='Audio input device index for eSense GSR (use --list-audio-devices to see options)'
-    )
 
     parser.add_argument(
         '--audio-out-device',
@@ -1327,7 +1060,7 @@ def main():
     parser.add_argument(
         '--list-audio-devices',
         action='store_true',
-        help='List available audio input/output devices and exit'
+        help='List available audio output devices and exit'
     )
 
     parser.add_argument(
@@ -1355,12 +1088,6 @@ def main():
     if args.list_audio_devices:
         import sounddevice as sd
         devices = sd.query_devices()
-        print("\nAvailable audio INPUT devices (for --gsr-device):")
-        print("-" * 50)
-        for i, dev in enumerate(devices):
-            if dev['max_input_channels'] > 0:
-                marker = " [DEFAULT]" if i == sd.default.device[0] else ""
-                print(f"  [{i}] {dev['name']}{marker}  ({dev['default_samplerate']:.0f} Hz)")
         print("\nAvailable audio OUTPUT devices (for --audio-out-device):")
         print("-" * 50)
         for i, dev in enumerate(devices):
@@ -1375,11 +1102,9 @@ def main():
         muse_serial_port=args.muse_serial,
         muse_mac_address=args.muse_mac,
         polar_device_name=args.polar_name,
-        gsr_device=args.gsr_device,
         apply_filter=not args.no_filter,
         use_muse=USE_MUSE,
         use_polar=USE_POLAR,
-        use_gsr=USE_GSR,
         arduino_port=args.arduino_port,
         arduino_baud=args.arduino_baud,
         use_arduino=USE_ARDUINO,
@@ -1444,7 +1169,6 @@ def main():
                     session_id=session_id,
                     data_dir='data',
                     muse=calib_muse,
-                    gsr=collector.gsr if collector.use_gsr else None,
                 ):
                     print("Experiment cancelled at baseline recording.")
                     collector.disconnect_devices()

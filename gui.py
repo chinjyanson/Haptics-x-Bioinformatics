@@ -88,17 +88,6 @@ def show_connection_screen(collector: 'SynchronizedCollector') -> bool:
 
         [sg.Text('')],
 
-        # GSR status
-        [sg.Frame('eSense GSR (Skin Response)', [
-            [sg.Text('Status:', font=('Helvetica', 11)),
-             sg.Text('Disabled' if not collector.use_gsr else 'Waiting...',
-                     key='-GSR_STATUS-', font=('Helvetica', 11, 'bold'),
-                     text_color='gray' if collector.use_gsr else 'purple')],
-            [sg.ProgressBar(100, orientation='h', size=(30, 20), key='-GSR_PROGRESS-', bar_color=('blue', 'lightgray'))]
-        ], font=('Helvetica', 12))],
-
-        [sg.Text('')],
-
         # Arduino status
         [sg.Frame('Arduino Uno R3 (Encoder + Vibration)', [
             [sg.Text('Status:', font=('Helvetica', 11)),
@@ -120,7 +109,6 @@ def show_connection_screen(collector: 'SynchronizedCollector') -> bool:
 
     muse_connected    = not collector.use_muse   # disabled counts as "ok"
     polar_connected   = not collector.use_polar
-    gsr_connected     = not collector.use_gsr
     arduino_connected = not collector.use_arduino
 
     def connect_muse_thread():
@@ -130,10 +118,6 @@ def show_connection_screen(collector: 'SynchronizedCollector') -> bool:
     def connect_polar_thread():
         nonlocal polar_connected
         polar_connected = collector.connect_polar()
-
-    def connect_gsr_thread():
-        nonlocal gsr_connected
-        gsr_connected = collector.connect_gsr()
 
     def connect_arduino_thread():
         nonlocal arduino_connected
@@ -156,9 +140,6 @@ def show_connection_screen(collector: 'SynchronizedCollector') -> bool:
             if collector.use_polar:
                 window['-POLAR_STATUS-'].update('Connecting...', text_color='orange')
                 window['-POLAR_PROGRESS-'].update(50)
-            if collector.use_gsr:
-                window['-GSR_STATUS-'].update('Connecting...', text_color='orange')
-                window['-GSR_PROGRESS-'].update(50)
             if collector.use_arduino:
                 window['-ARDUINO_STATUS-'].update('Connecting...', text_color='orange')
                 window['-ARDUINO_PROGRESS-'].update(50)
@@ -172,10 +153,6 @@ def show_connection_screen(collector: 'SynchronizedCollector') -> bool:
                 threads.append(t)
             if collector.use_polar:
                 t = threading.Thread(target=connect_polar_thread)
-                t.start()
-                threads.append(t)
-            if collector.use_gsr:
-                t = threading.Thread(target=connect_gsr_thread)
                 t.start()
                 threads.append(t)
             if collector.use_arduino:
@@ -215,17 +192,6 @@ def show_connection_screen(collector: 'SynchronizedCollector') -> bool:
                 window['-POLAR_STATUS-'].update(f'Failed: {error_msg[:30]}', text_color='red')
                 window['-POLAR_PROGRESS-'].update(0)
 
-            # Update GSR status
-            if not collector.use_gsr:
-                window['-GSR_STATUS-'].update('Disabled', text_color='purple')
-                window['-GSR_PROGRESS-'].update(0)
-            elif gsr_connected:
-                window['-GSR_STATUS-'].update('Connected', text_color='green')
-                window['-GSR_PROGRESS-'].update(100)
-            else:
-                error_msg = collector.gsr_error or 'Connection failed'
-                window['-GSR_STATUS-'].update(f'Failed: {error_msg[:30]}', text_color='red')
-                window['-GSR_PROGRESS-'].update(0)
 
             # Update Arduino status
             if not collector.use_arduino:
@@ -240,7 +206,7 @@ def show_connection_screen(collector: 'SynchronizedCollector') -> bool:
                 window['-ARDUINO_PROGRESS-'].update(0)
 
             # Enable continue if all enabled devices connected
-            if muse_connected and polar_connected and gsr_connected and arduino_connected:
+            if muse_connected and polar_connected and arduino_connected:
                 window['-CONTINUE-'].update(disabled=False)
             else:
                 window['-CONNECT-'].update(disabled=False, text='Retry Connection')
@@ -358,7 +324,6 @@ def show_reconnect_screen(collector: 'SynchronizedCollector') -> bool:
         [sg.Frame('Device Status', [
             status_row('Muse 2 EEG',      '-MUSE_S-',    disabled=not collector.use_muse),
             status_row('Polar H10 HR',    '-POLAR_S-',   disabled=not collector.use_polar),
-            status_row('eSense GSR',      '-GSR_S-',     disabled=not collector.use_gsr),
             status_row('Arduino Uno R3',  '-ARDUINO_S-', disabled=not collector.use_arduino),
         ], font=('Helvetica', 12), pad=(10, 10))],
         [sg.Text('')],
@@ -383,7 +348,6 @@ def show_reconnect_screen(collector: 'SynchronizedCollector') -> bool:
         polar_failed  = collector.use_polar and getattr(collector, '_polar_failed', False)
         muse_ready    = (not collector.use_muse)    or (collector._muse_ready.is_set()  and not muse_failed)
         polar_ready   = (not collector.use_polar)   or (collector._polar_ready.is_set() and not polar_failed)
-        gsr_ready     = (not collector.use_gsr)     or collector._gsr_ready.is_set()
         arduino_ready = (not collector.use_arduino) or collector._arduino_ready.is_set()
 
         polar_retry = getattr(collector, '_polar_retry_status', '')
@@ -391,7 +355,6 @@ def show_reconnect_screen(collector: 'SynchronizedCollector') -> bool:
         for key, ready, failed, enabled, retry_msg in [
             ('-MUSE_S-',    muse_ready,    muse_failed,   collector.use_muse,    ''),
             ('-POLAR_S-',   polar_ready,   polar_failed,  collector.use_polar,   polar_retry),
-            ('-GSR_S-',     gsr_ready,     False,         collector.use_gsr,     ''),
             ('-ARDUINO_S-', arduino_ready, False,         collector.use_arduino, ''),
         ]:
             if not enabled:
@@ -407,8 +370,18 @@ def show_reconnect_screen(collector: 'SynchronizedCollector') -> bool:
                 else:
                     elem.update(value='Connecting...', text_color='orange')
 
-        if muse_ready and polar_ready and gsr_ready and arduino_ready:
+        if muse_ready and polar_ready and arduino_ready:
             result = True
+            break
+
+        # Auto-abort if Muse failed to connect or its stream died
+        if muse_failed:
+            err_detail = getattr(collector, 'muse_error', '') or ''
+            sg.popup_error(
+                'Muse 2 failed to connect or its stream stopped.\n'
+                f'{err_detail}\n\n'
+                'Please check the device and restart the experiment.',
+                title='Muse Connection Failed', font=('Helvetica', 11))
             break
 
         # Auto-abort if Polar exhausted all retries
@@ -476,7 +449,7 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
         output_path:        Base path to save data to.
         session_id:         Identifier for this session (used for markers and save).
         is_final_session:   If True, call stop_all_threads() at end; else end_session().
-        threads:            Optional (muse_thread, polar_thread, gsr_thread, arduino_thread)
+        threads:            Optional (muse_thread, polar_thread, arduino_thread)
                             if already started before this call. If None, threads are
                             started here (legacy behaviour).
         haptics:            Optional HapticsController for audio/vibration feedback.
@@ -518,14 +491,10 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
                  sg.Text('0', key='-EEG_COUNT-', font=('Helvetica', 11, 'bold'))],
                 [sg.Text('HR Samples:', font=('Helvetica', 11)),
                  sg.Text('0', key='-HR_COUNT-', font=('Helvetica', 11, 'bold'))],
-                [sg.Text('GSR Samples:', font=('Helvetica', 11)),
-                 sg.Text('0', key='-GSR_COUNT-', font=('Helvetica', 11, 'bold'))],
                 [sg.Text('Arduino Events:', font=('Helvetica', 11)),
                  sg.Text('0', key='-ARDUINO_COUNT-', font=('Helvetica', 11, 'bold'))],
                 [sg.Text('Latest HR:', font=('Helvetica', 11)),
                  sg.Text('-- bpm', key='-LATEST_HR-', font=('Helvetica', 11, 'bold'))],
-                [sg.Text('Latest GSR:', font=('Helvetica', 11)),
-                 sg.Text('-- µS', key='-LATEST_GSR-', font=('Helvetica', 11, 'bold'))],
             ], font=('Helvetica', 12))],
             [sg.Text('Current Task:', font=('Helvetica', 11)),
              sg.Text(f'1 / {num_tasks}', key='-TASK_NUM-', font=('Helvetica', 11, 'bold'))],
@@ -561,10 +530,10 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
 
     if threads is not None:
         # Threads were pre-started before the countdown — reuse them.
-        muse_thread, polar_thread, gsr_thread, arduino_thread = threads
+        muse_thread, polar_thread, arduino_thread = threads
     else:
         # Legacy path: start threads now (used when called without pre-starting).
-        muse_thread, polar_thread, gsr_thread, arduino_thread = start_collection_threads(collector)
+        muse_thread, polar_thread, arduino_thread = start_collection_threads(collector)
 
     # Wait for all enabled devices to be ready
     if collector.use_muse:
@@ -578,22 +547,24 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
                 window.close()
                 return
 
+        # Muse may have signalled ready solely to unblock us after an error;
+        # abort the session if the stream is dead.
+        if getattr(collector, '_muse_failed', False):
+            err_detail = getattr(collector, 'muse_error', '') or ''
+            sg.popup_error(
+                'Muse 2 stream stopped before recording could start.\n'
+                f'{err_detail}\n\n'
+                'Aborting experiment — please restart.',
+                title='Muse Connection Failed', font=('Helvetica', 11))
+            collector.stop_all_threads()
+            window.close()
+            return
+
     if collector.use_polar:
         window['-STATUS-'].update('Waiting for Polar to be ready...')
         window.refresh()
 
         while not collector._polar_ready.is_set():
-            event, _ = window.read(timeout=100)
-            if event == '-STOP-' or event == sg.WIN_CLOSED:
-                collector._stop_event.set()
-                window.close()
-                return
-
-    if collector.use_gsr:
-        window['-STATUS-'].update('Waiting for GSR to be ready...')
-        window.refresh()
-
-        while not collector._gsr_ready.is_set():
             event, _ = window.read(timeout=100)
             if event == '-STOP-' or event == sg.WIN_CLOSED:
                 collector._stop_event.set()
@@ -762,9 +733,6 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
 
         with collector._eeg_lock:
             eeg_count = len(collector.data_store.eeg_data)
-        with collector._gsr_lock:
-            gsr_count = len(collector.data_store.gsr_data)
-            latest_gsr = collector.data_store.gsr_data[-1].gsr_uS if gsr_count > 0 else None
         with collector._lock:
             hr_count = len(collector.data_store.hr_data)
             arduino_count = len(collector.data_store.arduino_data)
@@ -772,12 +740,9 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
 
         window['-EEG_COUNT-'].update(str(eeg_count))
         window['-HR_COUNT-'].update(str(hr_count))
-        window['-GSR_COUNT-'].update(str(gsr_count))
         window['-ARDUINO_COUNT-'].update(str(arduino_count))
         if latest_hr:
             window['-LATEST_HR-'].update(f'{latest_hr} bpm')
-        if latest_gsr is not None:
-            window['-LATEST_GSR-'].update(f'{latest_gsr:.4f} µS')
 
         # ── Drain oddball draw commands from background thread ────────────
         while True:
@@ -821,8 +786,6 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
                 print("[Muse] WARNING: thread did not exit cleanly within timeout.")
         if polar_thread is not None:
             polar_thread.join(timeout=10)
-        if gsr_thread is not None:
-            gsr_thread.join(timeout=10)
         if arduino_thread is not None:
             arduino_thread.join(timeout=5)
             if arduino_thread.is_alive():
@@ -843,8 +806,6 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
         'eeg_count':  sum(1 for s in collector.data_store.eeg_data
                          if s.timestamp >= start_ts and (end_ts is None or s.timestamp <= end_ts)),
         'hr_count':   sum(1 for s in collector.data_store.hr_data
-                         if s.timestamp >= start_ts and (end_ts is None or s.timestamp <= end_ts)),
-        'gsr_count':  sum(1 for s in collector.data_store.gsr_data
                          if s.timestamp >= start_ts and (end_ts is None or s.timestamp <= end_ts)),
     }
 
@@ -1028,7 +989,7 @@ def show_completion_screen(sessions: List[Dict], output_base: str) -> None:
 
     Args:
         sessions: list of dicts with keys 'device', 'output_path', 'tlx_scores',
-                  and optionally 'eeg_count', 'hr_count', 'gsr_count', 'duration_s'
+                  and optionally 'eeg_count', 'hr_count', 'duration_s'
                   (populated by show_experiment_screen for display purposes).
         output_base: base output folder path shown to user
     """
@@ -1051,7 +1012,6 @@ def show_completion_screen(sessions: List[Dict], output_base: str) -> None:
 
         eeg_count = s.get('eeg_count', 0)
         hr_count = s.get('hr_count', 0)
-        gsr_count = s.get('gsr_count', 0)
 
         tlx_lines = []
         if tlx:
@@ -1065,7 +1025,7 @@ def show_completion_screen(sessions: List[Dict], output_base: str) -> None:
         session_rows.append(
             sg.Frame(f'{device}', [
                 [sg.Text(f'Duration: {hours:02d}:{mins:02d}:{secs:02d}  |  '
-                         f'EEG: {eeg_count:,}  |  HR: {hr_count:,}  |  GSR: {gsr_count:,}',
+                         f'EEG: {eeg_count:,}  |  HR: {hr_count:,}',
                          font=('Helvetica', 10))],
                 [sg.Text('NASA TLX Scores:', font=('Helvetica', 10, 'bold'))],
                 *tlx_lines,
@@ -1096,16 +1056,13 @@ def show_completion_screen(sessions: List[Dict], output_base: str) -> None:
     window.close()
 
 
-def show_baseline_screen(participant_id: str, session_id: str, data_dir: str = 'data', muse=None, gsr=None) -> bool:
+def show_baseline_screen(participant_id: str, session_id: str, data_dir: str = 'data', muse=None) -> bool:
     """
     Guide the participant through the baseline EEG recording.
 
     Shows instruction + live progress bar for each phase:
       Phase 1 — Eyes Open   (120 s)
       Phase 2 — Eyes Closed  (60 s)
-
-    If gsr is provided, measures a GSR open-circuit baseline before the EEG
-    phases begin and saves it to data/<participant_id>/gsr_baseline.json.
 
     Opens a single Muse 2 connection shared across both phases.
     Saves the two raw CSVs to data/<participant_id>/.
@@ -1230,26 +1187,8 @@ def show_baseline_screen(participant_id: str, session_id: str, data_dir: str = '
         print(f'[baseline] {len(df_holder[0])} samples recorded.')
         return True
 
-    # ── GSR baseline measurement (before EEG phases) ─────────────────────────
     out_dir = os.path.join(data_dir, participant_id)
-    if gsr is not None:
-        gsr_baseline_path = os.path.join(out_dir, 'gsr_baseline.json')
-        sg.popup_quick_message(
-            'Remove eSense finger clips from skin.\n'
-            'Measuring GSR baseline (4 seconds)…',
-            title='GSR Baseline', font=('Helvetica', 12),
-            auto_close_duration=4)
-        time.sleep(1)  # give user time to remove clips
-        try:
-            os.makedirs(out_dir, exist_ok=True)
-            gsr.measure_baseline(duration=4.0, save_path=gsr_baseline_path)
-            sg.popup_quick_message(
-                f'GSR baseline set: {gsr.amplitude_baseline:.5f}\n'
-                'You may now reattach the finger clips.',
-                title='GSR Baseline Done', font=('Helvetica', 12),
-                auto_close_duration=3)
-        except Exception as e:
-            print(f'[GSR] Baseline measurement failed: {e}')
+    os.makedirs(out_dir, exist_ok=True)
 
     # ── Run both phases ───────────────────────────────────────────────────────
     eo_csv       = os.path.join(out_dir, f'{session_id}_baseline_eyes_open.csv')
@@ -1335,7 +1274,7 @@ def show_calibration_screen():
     except Exception as e:
         sg.popup_error(f'Could not connect to Muse 2:\n{e}',
                        title='Connection Error', font=('Helvetica', 11))
-        return False
+        return None
 
     # ── Rolling buffer (4 channels × WIN_SAMPLES) ────────────────────────────
     buf = np.full((4, WIN_SAMPLES), np.nan)
