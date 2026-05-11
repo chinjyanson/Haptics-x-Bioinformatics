@@ -816,11 +816,11 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
     return session_stats
 
 
-def show_red_circle_count_screen(device_name: str, actual_count: int) -> Optional[int]:
+def show_red_circle_count_screen(device_name: str, actual_count: int) -> int:
     """
     Ask the participant how many red circles they counted during the oddball task.
-    Also displays the actual number shown (actual_count) after submission.
-    Returns the integer count, or None if skipped.
+    Mandatory: the window cannot be dismissed without entering a valid whole number.
+    Reveals the actual count after submission, then returns the participant's count.
     """
     import FreeSimpleGUI as sg
 
@@ -840,8 +840,7 @@ def show_red_circle_count_screen(device_name: str, actual_count: int) -> Optiona
         [sg.Text(f'Actual red circles shown: {actual_count}', key='-ACTUAL-',
                  font=('Helvetica', 11), text_color='gray', visible=False)],
         [sg.Text('')],
-        [sg.Button('Submit', size=(15, 1), font=('Helvetica', 12), key='-SUBMIT-'),
-         sg.Button('Skip', size=(15, 1), font=('Helvetica', 12))]
+        [sg.Button('Submit', size=(15, 1), font=('Helvetica', 12), key='-SUBMIT-')]
     ]
 
     window = sg.Window(f'Red Circle Count — {device_name}', layout,
@@ -851,20 +850,20 @@ def show_red_circle_count_screen(device_name: str, actual_count: int) -> Optiona
     count = None
     while True:
         event, values = window.read()
-        if event == 'Skip':
-            break
         if event == '-SUBMIT-':
-            raw = values['-COUNT-'].strip()
-            if raw.isdigit():
-                count = int(raw)
-                # Reveal actual count and wait for user to dismiss
-                window['-ACTUAL-'].update(visible=True)
-                window['-SUBMIT-'].update(text='Close')
-                window['-ERROR-'].update('')
+            if count is None:
+                # First press: validate and reveal the actual count
+                raw = values['-COUNT-'].strip()
+                if raw.isdigit():
+                    count = int(raw)
+                    window['-ACTUAL-'].update(visible=True)
+                    window['-SUBMIT-'].update(text='Close')
+                    window['-ERROR-'].update('')
+                else:
+                    window['-ERROR-'].update('Please enter a valid whole number.')
             else:
-                window['-ERROR-'].update('Please enter a valid whole number.')
-        if event == 'Close':
-            break
+                # Second press ("Close"): exit
+                break
 
     window.close()
     return count

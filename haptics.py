@@ -37,25 +37,35 @@ HAPTIC_SERVO_MAX_ERROR = 5000   # Ticks at which servo reaches max deflection (s
 
 # ── Target loader ─────────────────────────────────────────────────────────────
 
-def load_haptic_targets(tasks_per_device: int = 5) -> Dict[str, List[int]]:
+def load_haptic_targets(tasks_per_device: int = 20) -> Dict[str, List[int]]:
     """
     Load per-session target tick positions from haptic_targets.json.
 
-    Returns a dict mapping session name → list of target ticks (one per task).
-    Missing keys or a missing file fall back to all-zeros so the experiment
-    can still run without any target file.
+    Returns a dict mapping session name → list of target ticks (length == tasks_per_device).
+    If the loaded list is shorter than tasks_per_device, it is cycled to fill the
+    remaining slots. If longer, it is truncated. Missing keys or a missing file
+    fall back to all-zeros so the experiment can still run without any target file.
     """
     defaults: Dict[str, List[int]] = {
         "Auditory":       [0] * tasks_per_device,
         "Vibrations":     [0] * tasks_per_device,
         "Shape Changing": [0] * tasks_per_device,
     }
+
+    def _fit(values: List[int]) -> List[int]:
+        if not values:
+            return [0] * tasks_per_device
+        if len(values) >= tasks_per_device:
+            return list(values[:tasks_per_device])
+        # Cycle the supplied values to fill all tasks
+        return [values[i % len(values)] for i in range(tasks_per_device)]
+
     try:
         with open(HAPTIC_TARGETS_FILE) as f:
             loaded = json.load(f)
         for key in defaults:
             if key in loaded:
-                defaults[key] = loaded[key]
+                defaults[key] = _fit(loaded[key])
     except FileNotFoundError:
         print(f"[Haptics] {HAPTIC_TARGETS_FILE} not found — using zero targets.")
     except Exception as e:
@@ -188,15 +198,16 @@ class HapticsController:
 
         # Remap [0, 1] volume to [MIN_PWM, 255] so the motor turns on the
         # instant we leave the dead zone (no silent sub-startup-PWM region).
+        # Direction convention: participant rotates AWAY from the buzzing side.
         if abs(error) <= HAPTIC_DEAD_ZONE:
             m1 = m2 = 0
         else:
             volume = min(abs(error) / HAPTIC_MOTOR_MAX_ERROR, 1.0)
             pwm = int(HAPTIC_MOTOR_MIN_PWM + volume * (255 - HAPTIC_MOTOR_MIN_PWM))
-            if error < 0:       # Need to go CCW → motor 1
-                m1, m2 = pwm, 0
-            else:               # error > 0: Need to go CW → motor 2
+            if error < 0:       # Need to go CCW → buzz CW side (motor 2)
                 m1, m2 = 0, pwm
+            else:               # error > 0: Need to go CW → buzz CCW side (motor 1)
+                m1, m2 = pwm, 0
 
         self._arduino.send_command({"cmd": "set_vibration", "motor": 1, "intensity": m1})
         self._arduino.send_command({"cmd": "set_vibration", "motor": 2, "intensity": m2})

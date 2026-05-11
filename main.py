@@ -1252,8 +1252,6 @@ def main():
                     and m.timestamp <= (end_ts or float('inf'))
                 )
                 red_count = show_red_circle_count_screen(device_name, actual_red_count)
-                if red_count is None:
-                    print(f"Red circle count skipped for {device_name}.")
 
                 # NASA TLX for this device
                 tlx_scores = show_nasa_tlx_screen(device_name)
