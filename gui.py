@@ -1059,20 +1059,17 @@ def show_baseline_screen(participant_id: str, session_id: str, data_dir: str = '
     """
     Guide the participant through the baseline EEG recording.
 
-    Shows instruction + live progress bar for each phase:
-      Phase 1 — Eyes Open   (120 s)
-      Phase 2 — Eyes Closed  (60 s)
+    Shows instruction + live progress bar for a single eyes-open rest phase (60 s).
 
-    Opens a single Muse 2 connection shared across both phases.
-    Saves the two raw CSVs to data/<participant_id>/.
+    Opens a single Muse 2 connection.
+    Saves the raw CSV to data/<participant_id>/.
     Returns True on success, False if aborted.
     """
     import os
     import FreeSimpleGUI as sg
     import baseline as _bl
 
-    EYES_OPEN_S   = _bl.EYES_OPEN_DURATION_S
-    EYES_CLOSED_S = _bl.EYES_CLOSED_DURATION_S
+    EYES_OPEN_S = _bl.EYES_OPEN_DURATION_S
 
     sg.theme('LightBlue2')
 
@@ -1189,13 +1186,11 @@ def show_baseline_screen(participant_id: str, session_id: str, data_dir: str = '
     out_dir = os.path.join(data_dir, participant_id)
     os.makedirs(out_dir, exist_ok=True)
 
-    # ── Run both phases ───────────────────────────────────────────────────────
-    eo_csv       = os.path.join(out_dir, f'{session_id}_baseline_eyes_open.csv')
-    ec_csv       = os.path.join(out_dir, f'{session_id}_baseline_eyes_closed.csv')
+    eo_csv = os.path.join(out_dir, f'{session_id}_baseline_eyes_open.csv')
 
     try:
         ok = _run_phase(
-            phase_label='Phase 1 \u2014 Eyes Open Rest',
+            phase_label='Eyes Open Rest',
             instruction_lines=[
                 'Please relax and look straight ahead.',
                 'Do not blink excessively or move your head.',
@@ -1203,18 +1198,6 @@ def show_baseline_screen(participant_id: str, session_id: str, data_dir: str = '
             ],
             duration_s=EYES_OPEN_S,
             out_csv=eo_csv,
-        )
-        if not ok:
-            return False
-
-        ok = _run_phase(
-            phase_label='Phase 2 \u2014 Eyes Closed Rest',
-            instruction_lines=[
-                'Please close your eyes and remain completely still.',
-                'Breathe normally and try to relax.',
-            ],
-            duration_s=EYES_CLOSED_S,
-            out_csv=ec_csv,
         )
         if not ok:
             return False

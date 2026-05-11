@@ -1,8 +1,8 @@
 """
 baseline.py - Baseline EEG Recording and Feature Extraction
 
-Captures resting-state EEG (eyes-open and eyes-closed) at the start of each
-session. Produces reference metrics consumed by analysis.py for:
+Captures resting-state EEG (eyes-open) at the start of each session.
+Produces reference metrics consumed by analysis.py for:
   - ERD/ERS normalisation
   - ERSP baseline correction
   - DFA reference values
@@ -29,8 +29,7 @@ from denoising import denoise_session, SAMPLE_RATE, CHANNELS
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-EYES_OPEN_DURATION_S  = 120  # seconds
-EYES_CLOSED_DURATION_S = 60  # seconds
+EYES_OPEN_DURATION_S  = 60  # seconds
 
 BANDS = {
     'Delta': (0.5, 4),
@@ -84,7 +83,7 @@ def _record_phase(muse, duration_s, label):
 
 def record_baseline(participant_id, session_id, data_dir='data', muse=None):
     """
-    REQ-B1: Record eyes-open (120 s) and eyes-closed (60 s) resting EEG.
+    REQ-B1: Record eyes-open (60 s) resting EEG.
 
     Parameters:
         participant_id : str
@@ -97,16 +96,14 @@ def record_baseline(participant_id, session_id, data_dir='data', muse=None):
 
     Saves:
         data/<participant_id>/<session_id>_baseline_eyes_open.csv
-        data/<participant_id>/<session_id>_baseline_eyes_closed.csv
 
     Returns:
-        (eyes_open_path, eyes_closed_path)
+        eyes_open_path
     """
     out_dir = os.path.join(data_dir, participant_id)
     os.makedirs(out_dir, exist_ok=True)
 
-    eyes_open_path   = os.path.join(out_dir, f'{session_id}_baseline_eyes_open.csv')
-    eyes_closed_path = os.path.join(out_dir, f'{session_id}_baseline_eyes_closed.csv')
+    eyes_open_path = os.path.join(out_dir, f'{session_id}_baseline_eyes_open.csv')
 
     _owns_muse = muse is None
     if _owns_muse:
@@ -115,9 +112,8 @@ def record_baseline(participant_id, session_id, data_dir='data', muse=None):
         muse = MuseBrainFlowProcessor()
 
     try:
-        # ── Phase 1: Eyes Open ────────────────────────────────────────────────
         print()
-        print("[baseline] === Phase 1: Eyes Open Rest ===")
+        print("[baseline] === Eyes Open Rest ===")
         print("[baseline] Please relax and look straight ahead.")
         print("[baseline] Do not blink excessively or move your head.")
         _countdown()
@@ -125,18 +121,7 @@ def record_baseline(participant_id, session_id, data_dir='data', muse=None):
 
         eo_df = _record_phase(muse, EYES_OPEN_DURATION_S, 'eyes_open')
         eo_df.to_csv(eyes_open_path, index=False)
-        print(f"[baseline] Phase 1 complete. {len(eo_df)} samples recorded.")
-
-        # ── Phase 2: Eyes Closed ──────────────────────────────────────────────
-        print()
-        print("[baseline] === Phase 2: Eyes Closed Rest ===")
-        print("[baseline] Please close your eyes and remain still.")
-        _countdown()
-        print(f"[baseline] Recording... ({EYES_CLOSED_DURATION_S}s)", flush=True)
-
-        ec_df = _record_phase(muse, EYES_CLOSED_DURATION_S, 'eyes_closed')
-        ec_df.to_csv(eyes_closed_path, index=False)
-        print(f"[baseline] Phase 2 complete. {len(ec_df)} samples recorded.")
+        print(f"[baseline] Recording complete. {len(eo_df)} samples recorded.")
 
     finally:
         if _owns_muse:
@@ -144,52 +129,38 @@ def record_baseline(participant_id, session_id, data_dir='data', muse=None):
 
     print()
     print(f"[baseline] Saved: {eyes_open_path}")
-    print(f"[baseline] Saved: {eyes_closed_path}")
 
-    return eyes_open_path, eyes_closed_path
+    return eyes_open_path
 
 
 # ── REQ-B2: Baseline Preprocessing ───────────────────────────────────────────
 
 def preprocess_baseline(participant_id, session_id, data_dir='data', out_dir='output'):
     """
-    REQ-B2: Run the denoising pipeline on both baseline raw CSVs.
+    REQ-B2: Run the denoising pipeline on the eyes-open baseline CSV.
 
     Reads:
         data/<participant_id>/<session_id>_baseline_eyes_open.csv
-        data/<participant_id>/<session_id>_baseline_eyes_closed.csv
 
     Writes to output/<participant_id>/:
         <session_id>_baseline_eyes_open_erp_clean.csv
         <session_id>_baseline_eyes_open_psd_clean.csv
-        <session_id>_baseline_eyes_closed_erp_clean.csv
-        <session_id>_baseline_eyes_closed_psd_clean.csv
 
     Returns:
-        dict with keys 'eo_erp', 'eo_psd', 'ec_erp', 'ec_psd' mapping to file paths.
+        dict with keys 'eo_erp', 'eo_psd' mapping to file paths.
     """
     in_dir  = os.path.join(data_dir, participant_id)
     proc_dir = os.path.join(out_dir, participant_id)
     os.makedirs(proc_dir, exist_ok=True)
 
-    phases = [
-        ('eyes_open',   'eo'),
-        ('eyes_closed', 'ec'),
-    ]
+    raw_path = os.path.join(in_dir,   f'{session_id}_baseline_eyes_open.csv')
+    erp_out  = os.path.join(proc_dir, f'{session_id}_baseline_eyes_open_erp_clean.csv')
+    psd_out  = os.path.join(proc_dir, f'{session_id}_baseline_eyes_open_psd_clean.csv')
 
-    paths = {}
-    for phase_name, key in phases:
-        raw_path = os.path.join(in_dir,   f'{session_id}_baseline_{phase_name}.csv')
-        erp_out  = os.path.join(proc_dir, f'{session_id}_baseline_{phase_name}_erp_clean.csv')
-        psd_out  = os.path.join(proc_dir, f'{session_id}_baseline_{phase_name}_psd_clean.csv')
+    print("\n[baseline] === Denoising eyes_open ===")
+    denoise_session(raw_path, erp_out, psd_out)
 
-        print(f"\n[baseline] === Denoising {phase_name} ===")
-        denoise_session(raw_path, erp_out, psd_out)
-
-        paths[f'{key}_erp'] = erp_out
-        paths[f'{key}_psd'] = psd_out
-
-    return paths
+    return {'eo_erp': erp_out, 'eo_psd': psd_out}
 
 
 # ── REQ-B3: Baseline Feature Extraction ──────────────────────────────────────
@@ -319,13 +290,11 @@ def _permutation_entropy(sig, m=3, tau=1):
 
 def extract_baseline_features(participant_id, session_id, out_dir='output'):
     """
-    REQ-B3: Compute all reference metrics from the four preprocessed baseline CSVs.
+    REQ-B3: Compute all reference metrics from the preprocessed eyes-open baseline CSVs.
 
     Reads from output/<participant_id>/:
         <session_id>_baseline_eyes_open_erp_clean.csv
         <session_id>_baseline_eyes_open_psd_clean.csv
-        <session_id>_baseline_eyes_closed_erp_clean.csv
-        <session_id>_baseline_eyes_closed_psd_clean.csv
 
     Saves:
         output/<participant_id>/<session_id>_baseline_features.json
@@ -337,12 +306,9 @@ def extract_baseline_features(participant_id, session_id, out_dir='output'):
 
     eo_erp_path = os.path.join(proc_dir, f'{session_id}_baseline_eyes_open_erp_clean.csv')
     eo_psd_path = os.path.join(proc_dir, f'{session_id}_baseline_eyes_open_psd_clean.csv')
-    ec_erp_path = os.path.join(proc_dir, f'{session_id}_baseline_eyes_closed_erp_clean.csv')
-    ec_psd_path = os.path.join(proc_dir, f'{session_id}_baseline_eyes_closed_psd_clean.csv')
 
     eo_erp_df = pd.read_csv(eo_erp_path)
     eo_psd_df = pd.read_csv(eo_psd_path)
-    ec_psd_df = pd.read_csv(ec_psd_path)
 
     # ── B3a: Band Power Reference (from eo_psd) ───────────────────────────────
     # Individual channels + pooled
