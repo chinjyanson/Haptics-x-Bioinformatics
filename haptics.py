@@ -29,15 +29,17 @@ HAPTIC_MAX_ERROR      = 10000   # Ticks at which auditory feedback reaches maxim
 HAPTIC_DEAD_ZONE      = 5       # Ticks of silence around the target (±)
 HAPTIC_TONE_HZ        = 440     # Sine tone frequency for auditory feedback (Hz)
 HAPTIC_MOTOR_INTERVAL = 0       # Minimum seconds between vibration motor command updates
-HAPTIC_MOTOR_MIN_PWM  = 110     # PWM at which the ERM motor reliably spins (below this it stalls)
+HAPTIC_MOTOR_MIN_PWM  = 80      # PWM at which the ERM motor reliably spins (below this it stalls)
 HAPTIC_MOTOR_MAX_ERROR = 3000   # Ticks at which vibration reaches max intensity (separate from auditory)
+HAPTIC_MOTOR_KICK_PWM = 255     # Brief high-PWM pulse to overcome ERM static friction on startup
+HAPTIC_MOTOR_KICK_S   = 0.10    # Duration of the kick pulse (seconds)
 HAPTIC_SERVO_MAX_DEG  = 70      # Max servo deflection from neutral 90° (i.e. range 20°–160°)
 HAPTIC_SERVO_MAX_ERROR = 5000   # Ticks at which servo reaches max deflection (separate from other modes)
 
 
 # ── Target loader ─────────────────────────────────────────────────────────────
 
-def load_haptic_targets(tasks_per_device: int = 20) -> Dict[str, List[int]]:
+def load_haptic_targets(tasks_per_device: int = 25) -> Dict[str, List[int]]:
     """
     Load per-session target tick positions from haptic_targets.json.
 
@@ -111,6 +113,11 @@ class HapticsController:
 
         # Motor throttle (vibrations mode only)
         self._last_motor_update: float = 0.0
+        # Motor kick state (vibrations mode only): per-motor (1, 2),
+        # tracks the time at which a kick pulse was sent so we hold
+        # KICK_PWM until KICK_S elapses before dropping to normal PWM.
+        self._motor_kick_until: Dict[int, float] = {1: 0.0, 2: 0.0}
+        self._motor_was_on:     Dict[int, bool]  = {1: False, 2: False}
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -211,6 +218,27 @@ class HapticsController:
 
         self._arduino.send_command({"cmd": "set_vibration", "motor": 1, "intensity": m1})
         self._arduino.send_command({"cmd": "set_vibration", "motor": 2, "intensity": m2})
+        # Apply a brief KICK_PWM pulse whenever a motor transitions off → on,
+        # to overcome ERM static friction. The kick is held for KICK_S; after
+        # that we drop back to the proportional PWM. The transition is detected
+        # per-motor by comparing the current target PWM against last cycle.
+        for motor, pwm_target in ((1, m1), (2, m2)):
+            if pwm_target > 0 and not self._motor_was_on[motor]:
+                # Off → on transition: schedule a kick
+                self._motor_kick_until[motor] = now + HAPTIC_MOTOR_KICK_S
+            self._motor_was_on[motor] = pwm_target > 0
+
+        def _with_kick(motor: int, pwm_target: int) -> int:
+            if pwm_target == 0:
+                return 0
+            if now < self._motor_kick_until[motor]:
+                return HAPTIC_MOTOR_KICK_PWM
+            return pwm_target
+
+        out1 = _with_kick(1, m1)
+        out2 = _with_kick(2, m2)
+        self._arduino.send_command({"cmd": "set_vibration", "motor": 1, "intensity": out1})
+        self._arduino.send_command({"cmd": "set_vibration", "motor": 2, "intensity": out2})
 
     def _update_shape(self, error: int) -> None:
         """Drive the servo motor proportionally to encoder error.

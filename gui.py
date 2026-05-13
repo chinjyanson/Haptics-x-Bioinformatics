@@ -665,26 +665,24 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
     while True:
         event, _ = window.read(timeout=50)
 
-        # Feed new encoder deltas to haptics
+        # Feed new encoder deltas to haptics. Aggregate the batch and call
+        # update_encoder ONCE per loop iteration with the summed delta — this
+        # bounds the work per GUI tick (which keeps Tk responsive) and bounds
+        # the number of motor/servo serial writes per tick to 2 commands.
+        # Without this cap, a burst of encoder events could starve Tk's event
+        # loop and freeze the window while position kept incrementing.
         if haptics is not None:
             with collector._lock:
                 new_events = collector.data_store.arduino_data[_last_arduino_idx:]
                 _last_arduino_idx += len(new_events)
+            total_delta = 0
+            n_encoder_events = 0
             for ev in new_events:
                 if ev.event_type == "encoder":
-                    delta = ev.data.get("delta", 0)
-                    haptics.update_encoder(delta)
-                    error = haptics.current_position - haptics.target
-                    if haptics._mode == "shape_changing":
-                        from haptics import HAPTIC_SERVO_MAX_ERROR, HAPTIC_SERVO_MAX_DEG, HAPTIC_DEAD_ZONE
-                        if abs(error) <= HAPTIC_DEAD_ZONE:
-                            servo_angle = 90
-                        else:
-                            prop = min(abs(error) / HAPTIC_SERVO_MAX_ERROR, 1.0)
-                            servo_angle = int(90 + prop * HAPTIC_SERVO_MAX_DEG) if error < 0 else int(90 - prop * HAPTIC_SERVO_MAX_DEG)
-                        print(f"[Haptics] encoder delta={delta:+d}  pos={haptics.current_position:+d}  error={error:+d}  servo={servo_angle}°")
-                    else:
-                        print(f"[Haptics] encoder delta={delta:+d}  pos={haptics.current_position:+d}  L={haptics._left_gain:.2f}  R={haptics._right_gain:.2f}")
+                    total_delta += ev.data.get("delta", 0)
+                    n_encoder_events += 1
+            if n_encoder_events > 0:
+                haptics.update_encoder(total_delta)
 
         if event == "-NEXT_TASK-":
             # Record error before advancing
@@ -777,6 +775,13 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
     window.refresh()
 
     if is_final_session:
+        # Emit the session_end marker first so save_session_data has a slice
+        # endpoint (otherwise session_end_unix is null in _markers.json and
+        # downstream GSR slicing skips this session).
+        with collector._lock:
+            collector.data_store.add_task_marker(
+                time.time(), 0, "session_end", extra={"session_id": session_id}
+            )
         # Terminal stop — shut down all threads and wait for them to exit
         collector.stop_all_threads()
 

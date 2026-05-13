@@ -1057,9 +1057,11 @@ def save_session_summary(band_df, task_onset_epochs,
 
 # ── GSR analysis ─────────────────────────────────────────────────────────────
 #
-# GSR is recorded externally on the Mindfield eSense iPad app and exported as
-# a CSV that this pipeline reads via gsr_io.load_ipad_gsr_csv. The iPad's
-# onboard SCR detector populates an `scr_per_min` column that increments
+# A single iPad eSense recording per participant spans all three device sessions
+# (started before the GUI, stopped after it). For each session, the iPad rows
+# are sliced to the session's window using `session_start_unix` /
+# `session_end_unix` from `_markers.json` (see gsr_io.load_session_gsr). The
+# iPad's onboard SCR detector populates an `scr_per_min` column that increments
 # cumulatively each time it identifies an SCR event; we use that as the
 # authoritative SCR count rather than recomputing offline. SCL is reported as
 # the mean of the calibrated `gsr_uS` samples.
@@ -1269,47 +1271,38 @@ def run_arduino_analysis(arduino_path, events_path, out_prefix=''):
     print(f"[analysis] Saved {csv_path}")
 
 
-def run_gsr_analysis(gsr_path, events_path, out_prefix=''):
+def run_gsr_analysis(gsr_path, markers_json_path, events_path, out_prefix=''):
     """Plot the iPad-imported GSR trace against the session's task markers and
     save per-session GSR metrics.
 
-    The CSV at `gsr_path` is expected to be a Mindfield eSense iPad export
-    (manually copied into the participant folder under the canonical
-    `session_*_*_gsr.csv` name). Time is re-anchored to study time using
-    `session_start_unix` from the matching `_markers.json` so that GSR aligns
-    with the EEG / HR / Arduino streams from the same session.
+    The CSV at `gsr_path` is a single per-participant Mindfield eSense iPad
+    export (one recording covering all three device sessions). The session
+    window is read from `markers_json_path` (`session_start_unix` /
+    `session_end_unix`) and used to slice the iPad rows so the resulting
+    `time` axis is session-relative (t=0 at session start), matching the
+    EEG / HR / Arduino streams from the same session.
     """
     print("\n[analysis] --- GSR Analysis ---")
     if not os.path.exists(gsr_path):
         print(f"[analysis] WARNING: GSR file not found: {gsr_path}, skipping.")
         return
-
-    from gsr_io import is_ipad_export, load_ipad_gsr_csv, load_session_start_unix
-
-    if not is_ipad_export(gsr_path):
-        print(f"[analysis] WARNING: {gsr_path} is not an iPad eSense export; skipping.")
+    if not os.path.exists(markers_json_path):
+        print(f"[analysis] WARNING: markers JSON not found: {markers_json_path}, skipping.")
         return
 
-    pdir = os.path.dirname(gsr_path)
-    basename = os.path.basename(gsr_path).replace("_gsr.csv", "")
-    session_start = load_session_start_unix(pdir, basename)
-    gsr_df, ipad_meta = load_ipad_gsr_csv(gsr_path, session_start_unix=session_start)
-    if session_start is None:
-        print(f"[analysis] WARNING: no session_start_unix in {basename}_markers.json; "
-              "GSR time axis is iPad-relative, not study-relative.")
+    from gsr_io import load_session_gsr
+
+    try:
+        gsr_df = load_session_gsr(gsr_path, markers_json_path)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"[analysis] WARNING: could not load GSR for this session: {e}")
+        return
 
     if gsr_df.empty:
-        print(f"[analysis] WARNING: GSR data is empty after parsing; skipping.")
+        print(f"[analysis] WARNING: no iPad samples inside session window; skipping.")
         return
 
-    # Drop any rows that fall outside the session window when re-anchored
-    if session_start is not None:
-        gsr_df = gsr_df[gsr_df["time"] >= 0].reset_index(drop=True)
-        if gsr_df.empty:
-            print(f"[analysis] WARNING: GSR samples all precede session_start; skipping.")
-            return
-
-    # Load task_end markers (already in study-time)
+    # Load task_end markers (already in session-relative time)
     task_ends = []
     if events_path and os.path.exists(events_path):
         ev = pd.read_csv(events_path)
@@ -1421,9 +1414,13 @@ def analyse_session(erp_path, psd_path, events_path,
                          baseline_features, out_prefix)
 
     # Stage 13: GSR analysis
-    # GSR CSV lives alongside the markers CSV: same dir, _gsr.csv suffix
-    gsr_path = events_path.replace('_markers.csv', '_gsr.csv')
-    run_gsr_analysis(gsr_path, events_path, out_prefix)
+    # Single per-participant iPad export at data/<pid>/<pid>_gsr.csv;
+    # sliced to this session's window via the markers JSON.
+    participant_dir = os.path.dirname(events_path)
+    participant_id  = os.path.basename(participant_dir)
+    gsr_path = os.path.join(participant_dir, f'{participant_id}_gsr.csv')
+    markers_json_path = events_path.replace('_markers.csv', '_markers.json')
+    run_gsr_analysis(gsr_path, markers_json_path, events_path, out_prefix)
 
     # Stage 14: Encoder (rotary knob) metrics
     arduino_path = events_path.replace('_markers.csv', '_arduino.csv')

@@ -26,7 +26,7 @@ from arduino.bridge import ArduinoBridge, TimestampedArduinoEvent, ARDUINO_DEFAU
 
 # ── Device enable flags — set to False to run without a device ────────────────
 USE_MUSE    = True
-USE_POLAR   = False
+USE_POLAR   = True
 USE_ARDUINO = True
 
 # ── Baseline recording flag — set to False to skip baseline at session start ──
@@ -273,6 +273,7 @@ class SynchronizedDataStore:
         with open(markers_json, 'w') as f:
             json.dump({
                 'session_start_unix': start_ts,
+                'session_end_unix':   end_ts,
                 'session_id': session_id,
                 'markers': [
                     {'time': round(rel(m.timestamp), 6), 'task_number': m.task_number,

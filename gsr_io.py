@@ -2,14 +2,13 @@
 
 The iPad app exports CSV files with ~24 lines of metadata, a questionnaire
 section, then a `STATISTICS` header, then a `;`-delimited time-series block
-sampled at 5 Hz. This module hides that format and returns a clean DataFrame
-with columns (time, gsr_uS, scr, scr_per_min) so that downstream analysis
-code can treat the iPad CSV like any other physiological time-series.
+sampled at 5 Hz. This module hides that format.
 
-The iPad clock and the host clock have independent origins, so when a
-markers.json (produced by main.py at session start) is available the iPad
-SECOND axis is re-anchored to study time using the wall-clock difference
-between the iPad's recording-start datetime and `session_start_unix`.
+A single iPad recording spans the entire participant visit (started before
+the GUI runs, stopped after it). For each device session, the iPad rows are
+sliced to that session's window using `session_start_unix` /
+`session_end_unix` from the session's `_markers.json`, and the resulting
+DataFrame's `time` column is re-anchored so `t=0` is the session start.
 """
 from __future__ import annotations
 
@@ -55,8 +54,6 @@ def _parse_ipad_metadata(path: str) -> Tuple[dict, int]:
             if ";" in line:
                 key, _, val = line.partition(";")
                 key = key.strip()
-                # Trailing empty fields appear because the CSV has 6 columns
-                # but most metadata rows only fill the first two.
                 val = val.split(";")[0].strip()
                 if key and val:
                     meta[key] = val
@@ -78,21 +75,15 @@ def _parse_ipad_start_unix(meta: dict) -> Optional[float]:
         return None
 
 
-def load_ipad_gsr_csv(path: str,
-                      session_start_unix: Optional[float] = None
-                      ) -> Tuple[pd.DataFrame, dict]:
-    """Read an iPad eSense export.
+def _read_ipad_raw(path: str) -> Tuple[pd.DataFrame, dict]:
+    """Parse the full iPad export into a DataFrame with absolute Unix time.
 
     Returns (df, metadata):
       df columns:
-        time         seconds, optionally re-anchored to study time
+        unix_time    Unix timestamp of the sample (ipad_start + SECOND)
         gsr_uS       skin conductance in microsiemens
         scr          cumulative SCR count from the iPad's onboard detector
         scr_per_min  the iPad's rolling SCR rate
-
-    If `session_start_unix` is given, alignment is computed as
-    `time = SECOND + (ipad_start_unix − session_start_unix)`. Otherwise the
-    iPad's relative SECOND axis is returned directly.
     """
     meta, data_header_idx = _parse_ipad_metadata(path)
     df = pd.read_csv(
@@ -104,36 +95,80 @@ def load_ipad_gsr_csv(path: str,
     )
     df.columns = ["second", "gsr_uS", "timestamp", "scr", "scr_per_min", "marker"]
 
-    # Drop "Paused" rows (no real measurement) and any non-numeric debris.
     df = df[df["timestamp"] != "Paused"].copy()
     for col in ("second", "gsr_uS", "scr", "scr_per_min"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=["second", "gsr_uS"]).reset_index(drop=True)
 
     ipad_start = _parse_ipad_start_unix(meta)
-    if session_start_unix is not None and ipad_start is not None:
-        offset = ipad_start - session_start_unix
-        df["time"] = df["second"] + offset
-    else:
-        if session_start_unix is not None:
-            print(f"[gsr_io] WARNING: could not parse iPad start time from {path}; "
-                  f"GSR will not be re-anchored to study time.")
-        df["time"] = df["second"]
-
-    return df[["time", "gsr_uS", "scr", "scr_per_min"]], meta
+    if ipad_start is None:
+        raise ValueError(
+            f"Could not parse iPad start time from {path}. "
+            "The `DATE (HH:MM:SS)` metadata field is required to anchor GSR "
+            "samples to study time."
+        )
+    df["unix_time"] = df["second"] + ipad_start
+    return df[["unix_time", "gsr_uS", "scr", "scr_per_min"]], meta
 
 
-def load_session_start_unix(participant_dir: str, basename: str) -> Optional[float]:
-    """Read `session_start_unix` from `<participant_dir>/<basename>_markers.json`.
+def load_session_window(markers_json_path: str) -> Tuple[float, float]:
+    """Read `session_start_unix` and `session_end_unix` from a session's markers JSON.
 
-    Returns None if the markers file is missing or has no anchor.
+    Raises FileNotFoundError if the file is missing and ValueError if
+    `session_start_unix` is absent. If `session_end_unix` is absent (older
+    recordings of the final device session, before that bug was fixed),
+    fall back to start + last task_end's session-relative time.
     """
-    markers_path = os.path.join(participant_dir, f"{basename}_markers.json")
-    if not os.path.exists(markers_path):
-        return None
-    try:
-        with open(markers_path) as f:
-            v = json.load(f).get("session_start_unix")
-    except (json.JSONDecodeError, OSError):
-        return None
-    return float(v) if v else None
+    if not os.path.exists(markers_json_path):
+        raise FileNotFoundError(markers_json_path)
+    with open(markers_json_path) as f:
+        m = json.load(f)
+    start = m.get("session_start_unix")
+    if start is None:
+        raise ValueError(
+            f"{markers_json_path} is missing session_start_unix — "
+            "re-run the experiment so the GUI writes it."
+        )
+    end = m.get("session_end_unix")
+    if end is None:
+        markers = m.get("markers") or []
+        rel_times = [mk.get("time") for mk in markers
+                     if isinstance(mk.get("time"), (int, float))]
+        if not rel_times:
+            raise ValueError(
+                f"{markers_json_path} has no session_end_unix and no markers "
+                "to derive it from."
+            )
+        end = float(start) + max(rel_times)
+    return float(start), float(end)
+
+
+def participant_gsr_path(participant_dir: str, participant_id: str) -> str:
+    """Canonical path of the single per-participant GSR CSV."""
+    return os.path.join(participant_dir, f"{participant_id}_gsr.csv")
+
+
+def load_session_gsr(participant_gsr_csv: str,
+                     markers_json_path: str) -> pd.DataFrame:
+    """Slice the participant-level iPad GSR CSV to a single session's window.
+
+    Returns a DataFrame with columns (time, gsr_uS, scr, scr_per_min) where
+    `time` is seconds since `session_start_unix`. Empty DataFrame if no iPad
+    samples fall inside the window.
+
+    Raises:
+        FileNotFoundError  if the iPad CSV or markers JSON is missing
+        ValueError         if the file isn't an iPad export, lacks a parseable
+                           start time, or the markers JSON has no window
+    """
+    if not os.path.exists(participant_gsr_csv):
+        raise FileNotFoundError(participant_gsr_csv)
+    if not is_ipad_export(participant_gsr_csv):
+        raise ValueError(f"{participant_gsr_csv} is not an iPad eSense export")
+
+    start_unix, end_unix = load_session_window(markers_json_path)
+    raw, _meta = _read_ipad_raw(participant_gsr_csv)
+
+    sl = raw[(raw["unix_time"] >= start_unix) & (raw["unix_time"] <= end_unix)].copy()
+    sl["time"] = sl["unix_time"] - start_unix
+    return sl[["time", "gsr_uS", "scr", "scr_per_min"]].reset_index(drop=True)

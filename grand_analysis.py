@@ -150,27 +150,29 @@ def load_arduino(data_dir: str, pid: str, device: str) -> pd.DataFrame | None:
 
 
 def load_gsr(data_dir: str, pid: str, device: str) -> pd.DataFrame | None:
-    """Load the iPad eSense export for one participant/device.
+    """Slice the per-participant iPad GSR recording for one device session.
 
-    Returns None if no CSV exists, the file isn't an iPad export, or parsing
-    fails. The returned DataFrame has columns (time, gsr_uS, scr, scr_per_min).
+    Reads the single per-participant CSV at data/<pid>/<pid>_gsr.csv and
+    slices it to the device session's window using session_start_unix /
+    session_end_unix from the corresponding _markers.json.
+    Returns None if any required file is missing or the slice is empty.
+    The returned DataFrame has columns (time, gsr_uS, scr, scr_per_min) and
+    `time` is session-relative (t=0 at session_start).
     """
-    path = _glob_first(os.path.join(data_dir, pid, f"session_*_{device}_gsr.csv"))
-    if not path:
+    gsr_path = os.path.join(data_dir, pid, f"{pid}_gsr.csv")
+    if not os.path.exists(gsr_path):
         return None
-    from gsr_io import is_ipad_export, load_ipad_gsr_csv, load_session_start_unix
-    if not is_ipad_export(path):
+    markers_json = _glob_first(os.path.join(data_dir, pid,
+                                            f"session_*_{device}_markers.json"))
+    if not markers_json:
         return None
+    from gsr_io import load_session_gsr
     try:
-        basename = os.path.basename(path).replace("_gsr.csv", "")
-        sstart = load_session_start_unix(os.path.dirname(path), basename)
-        df, _meta = load_ipad_gsr_csv(path, session_start_unix=sstart)
-        if sstart is not None:
-            df = df[df["time"] >= 0].reset_index(drop=True)
-        return df if not df.empty else None
+        df = load_session_gsr(gsr_path, markers_json)
     except Exception as e:
-        print(f"[grand_analysis] WARNING: failed to load iPad GSR {path}: {e}")
+        print(f"[grand_analysis] WARNING: failed to slice GSR for {pid}/{device}: {e}")
         return None
+    return df if not df.empty else None
 
 
 def load_hr(data_dir: str, pid: str, device: str) -> pd.DataFrame | None:
@@ -375,10 +377,30 @@ def plot_band_power_avg(data: dict, out_dir: str):
 # ---------------------------------------------------------------------------
 
 def plot_band_power_diff(data: dict, out_dir: str):
-    """Bar chart: (late tasks mean) - (early tasks mean) per device per band."""
-    early_tasks = {"task_1", "task_2"}
-    late_tasks  = {"task_4", "task_5"}
+    """Bar chart: (late tasks mean) - (early tasks mean) per device per band.
+
+    "Early" and "late" are derived per-(participant, device) as the first and
+    last 20% of task_* conditions actually present, by numeric task index. This
+    is robust to varying task counts and to conditions being dropped upstream
+    (e.g. by bad-segment rejection).
+    """
     channels = ["TP_pool", "AF_pool"]
+
+    def _split_early_late(conds):
+        """Return (early_set, late_set) from a list of 'task_N' condition labels."""
+        numbered = []
+        for c in conds:
+            try:
+                numbered.append((int(str(c).split("_")[1]), c))
+            except (IndexError, ValueError):
+                continue
+        numbered.sort()
+        if len(numbered) < 2:
+            return set(), set()
+        n_edge = max(1, len(numbered) // 5)  # first/last 20%, minimum 1
+        early = {c for _, c in numbered[:n_edge]}
+        late  = {c for _, c in numbered[-n_edge:]}
+        return early, late
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     fig.suptitle("Band Power Change: Late Tasks − Early Tasks (Absolute Power)", fontsize=13, fontweight="bold")
@@ -397,8 +419,13 @@ def plot_band_power_diff(data: dict, out_dir: str):
                 ch_rows = bp[bp["channel"] == ch]
                 if ch_rows.empty:
                     continue
-                early_rows = ch_rows[ch_rows["condition"].isin(early_tasks)]
-                late_rows  = ch_rows[ch_rows["condition"].isin(late_tasks)]
+                task_conds = [c for c in ch_rows["condition"].unique()
+                              if str(c).startswith("task_")]
+                early_set, late_set = _split_early_late(task_conds)
+                if not early_set or not late_set:
+                    continue
+                early_rows = ch_rows[ch_rows["condition"].isin(early_set)]
+                late_rows  = ch_rows[ch_rows["condition"].isin(late_set)]
                 if early_rows.empty or late_rows.empty:
                     continue
                 diff = [late_rows[f"{b}_abs"].mean() - early_rows[f"{b}_abs"].mean() for b in BANDS]
@@ -823,7 +850,8 @@ def plot_erd_ers_grand(data: dict, out_dir: str):
 # Plot F: GSR grand average — timeseries + SCL / SCR metrics
 # ---------------------------------------------------------------------------
 
-# GSR comes from the iPad eSense app (loaded via gsr_io.load_ipad_gsr_csv).
+# GSR comes from the iPad eSense app (loaded via gsr_io.load_session_gsr,
+# which slices the single per-participant CSV to each session's window).
 # The iPad's onboard SCR detector populates `scr_per_min` as a cumulative
 # counter — we use its max as the authoritative SCR count rather than
 # recomputing offline. SCL is just the time-mean of `gsr_uS`. Per-event SCR
@@ -1239,8 +1267,21 @@ def plot_theta_alpha_grand(data: dict, out_dir: str):
 # Plot M: Oddball detection accuracy
 # ---------------------------------------------------------------------------
 
+def _detection_accuracy_pct(detected, actual):
+    """Symmetric detection-accuracy metric, bounded [0, 100].
+
+    accuracy = max(0, 1 − |detected − actual| / actual) × 100
+    Over- and under-reporting are penalised equally. Returns None if either
+    input is missing or actual ≤ 0.
+    """
+    if detected is None or actual is None or actual <= 0:
+        return None
+    err = abs(float(detected) - float(actual)) / float(actual)
+    return max(0.0, 1.0 - err) * 100.0
+
+
 def plot_detection_accuracy(data: dict, out_dir: str):
-    """Bar chart: detected / actual red circles (%) per device."""
+    """Bar chart: oddball detection accuracy (%) per device. Bounded [0, 100]."""
     fig, ax = plt.subplots(figsize=(7, 5))
 
     x = np.arange(len(DEVICES))
@@ -1251,10 +1292,12 @@ def plot_detection_accuracy(data: dict, out_dir: str):
             tlx = data[pid][device]["nasa_tlx"]
             if tlx is None:
                 continue
-            detected = tlx.get("red_circle_count")
-            actual   = tlx.get("actual_red_circle_count")
-            if detected is not None and actual and actual > 0:
-                vals.append(detected / actual * 100)
+            acc = _detection_accuracy_pct(
+                tlx.get("red_circle_count"),
+                tlx.get("actual_red_circle_count"),
+            )
+            if acc is not None:
+                vals.append(acc)
         means.append(safe_mean(vals))
         sems.append(safe_sem(vals))
         all_pts.append(vals)
@@ -1271,8 +1314,9 @@ def plot_detection_accuracy(data: dict, out_dir: str):
     ax.set_xticks(x)
     ax.set_xticklabels([DEVICE_LABELS[d] for d in DEVICES])
     ax.set_xlabel("Haptic Device")
-    ax.set_ylabel("Detection Accuracy\n(reported count / actual count × 100%)")
-    ax.set_ylim(0, 115)
+    ax.set_ylabel("Detection Accuracy (%)\n"
+                  "max(0, 1 − |reported − actual| / actual) × 100")
+    ax.set_ylim(0, 105)
     ax.axhline(100, color="green", linewidth=1, linestyle="--",
                label="Perfect accuracy (100%)")
     ax.set_title("Oddball Detection Accuracy per Device\n"
@@ -1434,10 +1478,12 @@ def run_grand_statistics(data: dict, out_dir: str):
             tlx = data[pid][dev]["nasa_tlx"]
             if tlx is None:
                 continue
-            detected = tlx.get("red_circle_count")
-            actual   = tlx.get("actual_red_circle_count")
-            if detected is not None and actual and actual > 0:
-                groups[dev].append(float(detected) / float(actual) * 100.0)
+            acc = _detection_accuracy_pct(
+                tlx.get("red_circle_count"),
+                tlx.get("actual_red_circle_count"),
+            )
+            if acc is not None:
+                groups[dev].append(acc)
     all_rows += _run_device_stats("Behavioural_detection_accuracy_pct", groups)
 
     # ── NASA-TLX: subscales + average ─────────────────────────────────────────
