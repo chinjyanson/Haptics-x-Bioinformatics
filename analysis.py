@@ -29,11 +29,7 @@ warnings.filterwarnings('ignore')
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 SAMPLE_RATE      = 256
-EPOCH_PRE_MS     = 200
-EPOCH_POST_MS    = 800
-BASELINE_PRE_MS  = 200
 ARTIFACT_THRESH  = 100.0
-MIN_EPOCHS       = 20
 KURTOSIS_THRESH  = 5.0
 
 WINDOW_SEC    = 2
@@ -130,15 +126,10 @@ def add_pooled_channels(df):
 def parse_events(events_df):
     """
     Returns:
-        oddball_triggers  : list[float]
-        standard_triggers : list[float]
-        task_intervals    : list[dict]  {task_number, start, end}
-        task_starts       : list[float]
+        task_intervals : list[dict]  {task_number, start, end}
+        task_starts    : list[float]
     """
     events_df = events_df.copy().sort_values('time').reset_index(drop=True)
-
-    oddball_triggers  = events_df.loc[events_df['event'] == 'oddball_onset',  'time'].tolist()
-    standard_triggers = events_df.loc[events_df['event'] == 'standard_onset', 'time'].tolist()
 
     task_ends      = events_df[events_df['event'] == 'task_end'].sort_values('time')
     task_starts_ev = events_df[events_df['event'] == 'task_start'].sort_values('time')
@@ -165,7 +156,7 @@ def parse_events(events_df):
             })
             prev_end = float(row['time'])
 
-    return oddball_triggers, standard_triggers, task_intervals, task_starts
+    return task_intervals, task_starts
 
 
 def get_condition_at_time(t, task_intervals):
@@ -192,71 +183,6 @@ def _interp_epoch(df, t_start, t_end, n_samples, channels):
             continue
         data[:, ci] = np.interp(t_interp, seg['time'].values, seg[ch].values)
     return data
-
-
-def extract_epochs(erp_df, triggers, pre_ms=EPOCH_PRE_MS, post_ms=EPOCH_POST_MS,
-                   all_triggers=None):
-    """
-    Scheme A — stimulus-locked epochs.
-    Returns: (epochs, n_bad_seg, n_overlap, n_amplitude, n_kurtosis)
-    """
-    pre_s     = pre_ms  / 1000.0
-    post_s    = post_ms / 1000.0
-    n_samples = int((pre_s + post_s) * SAMPLE_RATE)
-    time_ms   = np.linspace(-pre_ms, post_ms, n_samples)
-    channels  = _ALL_WITH_POOL
-    all_other = set(all_triggers or []) - set(triggers)
-
-    epochs = []
-    n_bad_seg = n_overlap = n_amplitude = n_kurtosis = 0
-
-    for t in triggers:
-        t_start = t - pre_s
-        t_end   = t + post_s
-        times   = erp_df['time'].values
-        mask    = (times >= t_start) & (times < t_end)
-        seg     = erp_df[mask]
-
-        if 'bad_segment' in seg.columns and seg['bad_segment'].any():
-            n_bad_seg += 1
-            continue
-
-        if any(t_start <= ot < t_end for ot in all_other):
-            n_overlap += 1
-            continue
-
-        data = _interp_epoch(erp_df, t_start, t_end, n_samples, channels)
-        if data is None:
-            n_bad_seg += 1
-            continue
-
-        pk2pk = data.max(axis=0) - data.min(axis=0)
-        if np.any(pk2pk > 2 * ARTIFACT_THRESH):
-            n_amplitude += 1
-            continue
-
-        kurt = sp_kurtosis(data, axis=0)
-        if np.any(np.abs(kurt) > KURTOSIS_THRESH):
-            n_kurtosis += 1
-            continue
-
-        epochs.append({'data': data, 'time_ms': time_ms, 'trigger_time': t,
-                       'channels': channels})
-
-    print(f"[analysis] Epochs extracted: {len(epochs)} "
-          f"(bad_seg={n_bad_seg}, overlap={n_overlap}, "
-          f"amplitude={n_amplitude}, kurtosis={n_kurtosis})")
-    return epochs, n_bad_seg, n_overlap, n_amplitude, n_kurtosis
-
-
-def baseline_correct(epochs, pre_ms=BASELINE_PRE_MS):
-    pre_samples = int(pre_ms / 1000.0 * SAMPLE_RATE)
-    corrected = []
-    for ep in epochs:
-        d = ep['data'].copy()
-        d -= d[:pre_samples, :].mean(axis=0)
-        corrected.append({**ep, 'data': d})
-    return corrected
 
 
 def extract_task_onset_epochs(erp_df, task_starts, task_intervals,
@@ -1375,7 +1301,7 @@ def analyse_session(erp_path, psd_path, events_path,
     psd_df = add_pooled_channels(psd_df)
 
     # Stage 1: Parse events
-    _, _, task_intervals, task_starts = parse_events(events_df)
+    task_intervals, task_starts = parse_events(events_df)
 
     # Stage 2: Epoching
     print("\n[analysis] --- Epoching ---")
