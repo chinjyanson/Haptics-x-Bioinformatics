@@ -117,7 +117,11 @@ def load_arduino(data_dir: str, pid: str, device: str) -> pd.DataFrame | None:
     enc = enc[["time", "position"]].reset_index(drop=True)
 
     # task_end rows give us task boundaries and targets
-    task_ends = markers[markers["event"] == "task_end"][["time", "task_number", "target"]].copy()
+    task_ends = markers[markers["event"] == "task_end"].copy()
+    if task_ends.empty or "target" not in task_ends.columns:
+        return None
+    task_ends = task_ends[["time", "task_number", "target"]]
+    task_ends = task_ends.dropna(subset=["target"])
     task_ends = task_ends.sort_values("time").reset_index(drop=True)
     if task_ends.empty:
         return None
@@ -146,7 +150,14 @@ def load_arduino(data_dir: str, pid: str, device: str) -> pd.DataFrame | None:
 
     if not rows:
         return None
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    # The Arduino's "position" field is a continuous cumulative count that
+    # does NOT reset between tasks, but each task's "target" is expressed
+    # relative to the position at task start (haptics.set_target zeros
+    # current_position). Re-zero position per task so the two are in the
+    # same reference frame.
+    df["position"] = df.groupby("task_number")["position"].transform(lambda s: s - s.iloc[0])
+    return df
 
 
 def load_gsr(data_dir: str, pid: str, device: str) -> pd.DataFrame | None:

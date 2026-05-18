@@ -28,9 +28,29 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import serial
+from serial.tools import list_ports  # type: ignore[import-untyped]
 
-# ── Defaults (override via ARDUINO_DEFAULT_PORT in main.py or --arduino-port CLI) ──
-ARDUINO_DEFAULT_PORT: Optional[str] = "/dev/tty.usbmodem1401"
+# Known USB vendor IDs for Arduino boards and common clone USB-serial chips.
+# Covers official Arduino (LLC + SA), CH340/CH341 clones, FTDI, and Silicon Labs CP210x.
+_ARDUINO_VIDS = {0x2341, 0x2A03, 0x1A86, 0x0403, 0x10C4}
+
+
+def autodetect_arduino_port() -> Optional[str]:
+    """Return the device path of the first connected Arduino-like serial port,
+    or None if none is found. Matches by USB vendor ID so it survives plugging
+    into different USB ports (which changes the trailing digits of usbmodemXXXX
+    on macOS)."""
+    for p in list_ports.comports():
+        if p.vid in _ARDUINO_VIDS:
+            return p.device
+    return None
+
+
+# ── Defaults (override via --arduino-port CLI) ──
+# Auto-detected at import time, with a hardcoded fallback if no Arduino-like
+# device is currently plugged in (e.g. the user will plug it in shortly).
+_ARDUINO_FALLBACK_PORT = "/dev/tty.usbmodem1401"
+ARDUINO_DEFAULT_PORT: Optional[str] = _ARDUINO_FALLBACK_PORT or autodetect_arduino_port()
 ARDUINO_DEFAULT_BAUD: int = 115200
 
 

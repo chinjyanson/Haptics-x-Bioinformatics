@@ -25,20 +25,16 @@ from arduino.bridge import ArduinoBridge, TimestampedArduinoEvent, ARDUINO_DEFAU
 
 
 # ── Device enable flags — set to False to run without a device ────────────────
-USE_MUSE    = True
-USE_POLAR   = True
-USE_ARDUINO = True
-
-# ── Baseline recording flag — set to False to skip baseline at session start ──
-RUN_BASELINE = True
+USE_MUSE    = False
+USE_POLAR   = False
+USE_ARDUINO = False
 
 from haptics import HapticsController, load_haptic_targets
-import baseline
 from gui import (
     show_participant_screen, show_connection_screen, show_consent_screen,
     show_reconnect_screen, show_countdown_screen, show_experiment_screen,
     show_red_circle_count_screen, show_nasa_tlx_screen, show_device_swap_screen, show_completion_screen,
-    show_error_popup, show_baseline_screen, show_calibration_screen,
+    show_error_popup, show_calibration_screen,
 )
 
 @dataclass
@@ -1144,11 +1140,11 @@ def main():
                 collector.disconnect_devices()
                 return
 
-            # Step 4: Baseline recording (skipped if RUN_BASELINE = False).
-            session_id = f"session_{session_timestamp}"
-            if RUN_BASELINE:
-                # Release the existing Muse session so the calibration/baseline
-                # screens can open their own fresh connections.
+            # Step 4: EEG signal check — live calibration view before sessions.
+            # show_calibration_screen opens its own Muse session, so release the
+            # collector's existing one first and let the per-session thread
+            # re-acquire it afterwards.
+            if collector.use_muse:
                 if collector.muse is not None:
                     try:
                         collector.muse.stop()
@@ -1157,35 +1153,24 @@ def main():
                     collector.muse = None
                     collector.muse_connected = False
 
-                # Step 4a: EEG calibration — live signal check before baseline.
                 calib_muse = show_calibration_screen()
                 if calib_muse is None:
-                    print("Experiment cancelled at EEG calibration.")
+                    print("Experiment cancelled at EEG signal check.")
                     collector.disconnect_devices()
                     return
+                # Stop the calibration session so the BLE stack is free for
+                # the collection thread to open a fresh one.
+                try:
+                    calib_muse.stop()
+                except Exception:
+                    pass
+                # BrainFlow's BLE teardown is not instantaneous; give it time
+                # before the collection thread calls prepare_session().
+                time.sleep(5)
 
-                # Pass the live muse session into baseline to avoid reconnect.
-                if not show_baseline_screen(
-                    participant_id=participant_id,
-                    session_id=session_id,
-                    data_dir='data',
-                    muse=calib_muse,
-                ):
-                    print("Experiment cancelled at baseline recording.")
-                    collector.disconnect_devices()
-                    return
-
-                baseline.preprocess_baseline(
-                    participant_id=participant_id,
-                    session_id=session_id,
-                    data_dir='data',
-                    out_dir='data',
-                )
-                baseline.extract_baseline_features(
-                    participant_id=participant_id,
-                    session_id=session_id,
-                    out_dir='data',
-                )
+            # Baseline recording, denoising, and feature extraction are run
+            # separately via `python baseline.py` before launching main.py.
+            session_id = f"session_{session_timestamp}"
 
             # Run three device sessions — threads start ONCE and run continuously.
             completed_sessions = []
@@ -1254,34 +1239,20 @@ def main():
                 )
                 red_count = show_red_circle_count_screen(device_name, actual_red_count)
 
-                # NASA TLX for this device
+                # NASA TLX for this device (compulsory — always returns scores)
                 tlx_scores = show_nasa_tlx_screen(device_name)
-                if tlx_scores is None:
-                    print(f"NASA TLX skipped for {device_name}.")
 
-                # Save TLX scores (and red circle count) alongside sensor data
-                if tlx_scores:
-                    tlx_path = f"{output_path}_nasa_tlx.json"
-                    with open(tlx_path, 'w') as f:
-                        json.dump({
-                            'device': device_name,
-                            'participant_id': participant_id,
-                            'red_circle_count': red_count,
-                            'actual_red_circle_count': actual_red_count,
-                            'scores': tlx_scores,
-                            'average': sum(tlx_scores.values()) / len(tlx_scores)
-                        }, f, indent=2)
-                    print(f"NASA TLX scores saved to {tlx_path}")
-                elif red_count is not None:
-                    count_path = f"{output_path}_red_circle_count.json"
-                    with open(count_path, 'w') as f:
-                        json.dump({
-                            'device': device_name,
-                            'participant_id': participant_id,
-                            'red_circle_count': red_count,
-                            'actual_red_circle_count': actual_red_count,
-                        }, f, indent=2)
-                    print(f"Red circle count saved to {count_path}")
+                tlx_path = f"{output_path}_nasa_tlx.json"
+                with open(tlx_path, 'w') as f:
+                    json.dump({
+                        'device': device_name,
+                        'participant_id': participant_id,
+                        'red_circle_count': red_count,
+                        'actual_red_circle_count': actual_red_count,
+                        'scores': tlx_scores,
+                        'average': sum(tlx_scores.values()) / len(tlx_scores)
+                    }, f, indent=2)
+                print(f"NASA TLX scores saved to {tlx_path}")
 
                 completed_sessions.append({
                     'device': device_name,

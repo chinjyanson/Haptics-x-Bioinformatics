@@ -649,7 +649,7 @@ def run_psd_analysis(condition_segments, baseline_features, out_prefix=''):
     print("\n[analysis] --- PSD Analysis (multitaper) ---")
     if not condition_segments:
         print("[analysis] WARNING: No condition segments for PSD analysis.")
-        return {}, pd.DataFrame(), pd.DataFrame()
+        return {}, pd.DataFrame()
 
     psds = {}
     min_samp = int(WINDOW_SEC * SAMPLE_RATE)
@@ -676,7 +676,7 @@ def run_psd_analysis(condition_segments, baseline_features, out_prefix=''):
                       'channels': ch_list}
 
     if not psds:
-        return {}, pd.DataFrame(), pd.DataFrame()
+        return {}, pd.DataFrame()
 
     band_df = extract_band_power(psds, baseline_features)
     band_df = compute_theta_alpha_ratio(band_df)

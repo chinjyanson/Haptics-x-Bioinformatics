@@ -1,31 +1,36 @@
 """
-baseline.py - Baseline EEG Recording and Feature Extraction
+baseline.py - Baseline EEG Recording, Denoising, and Feature Extraction
 
-Captures resting-state EEG (eyes-open) at the start of each session.
-Produces reference metrics consumed by analysis.py for:
-  - ERD/ERS normalisation
-  - ERSP baseline correction
-  - DFA reference values
-  - PermEn reference values
+Standalone pre-experiment step. Run this BEFORE main.py:
+
+  1. Asks for the participant ID via GUI.
+  2. Opens the EEG calibration screen so the operator can verify electrode
+     contact.
+  3. Records 60 s of eyes-open resting EEG via the baseline GUI screen.
+  4. Denoises the recording (in-process call to denoising.denoise_session).
+  5. Extracts reference features (band power, DFA, PermEn, theta/alpha) used
+     downstream by analysis.py for ERD/ERS normalisation and ERSP baseline
+     correction.
 
 Usage:
-    python baseline.py <participant_id> <session_id> [--data-dir data] [--out-dir output]
-
-Example:
-    python baseline.py 001 session_20260303_185045
+    python baseline.py
+    python baseline.py --participant-id 001          # skip the GUI prompt
 """
+
+from __future__ import annotations
 
 import os
 import sys
 import time
 import json
 import argparse
+from datetime import datetime
 import numpy as np
 import pandas as pd
 from scipy import signal as scipy_signal
 from scipy.integrate import trapezoid
 
-from denoising import denoise_session, SAMPLE_RATE, CHANNELS
+from denoising import SAMPLE_RATE, CHANNELS, denoise_session
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -135,22 +140,21 @@ def record_baseline(participant_id, session_id, data_dir='data', muse=None):
 
 # ── REQ-B2: Baseline Preprocessing ───────────────────────────────────────────
 
-def preprocess_baseline(participant_id, session_id, data_dir='data', out_dir='output'):
+def denoise_baseline(participant_id, session_id, data_dir='data', out_dir='data'):
     """
-    REQ-B2: Run the denoising pipeline on the eyes-open baseline CSV.
+    REQ-B2: Run the shared denoising pipeline on the eyes-open baseline CSV.
 
     Reads:
-        data/<participant_id>/<session_id>_baseline_eyes_open.csv
+        <data_dir>/<participant_id>/<session_id>_baseline_eyes_open.csv
 
-    Writes to output/<participant_id>/:
+    Writes to <out_dir>/<participant_id>/:
         <session_id>_baseline_eyes_open_erp_clean.csv
         <session_id>_baseline_eyes_open_psd_clean.csv
 
-    Returns:
-        dict with keys 'eo_erp', 'eo_psd' mapping to file paths.
+    Returns dict with keys 'eo_erp', 'eo_psd' mapping to file paths.
     """
-    in_dir  = os.path.join(data_dir, participant_id)
-    proc_dir = os.path.join(out_dir, participant_id)
+    in_dir   = os.path.join(data_dir, participant_id)
+    proc_dir = os.path.join(out_dir,  participant_id)
     os.makedirs(proc_dir, exist_ok=True)
 
     raw_path = os.path.join(in_dir,   f'{session_id}_baseline_eyes_open.csv')
@@ -408,41 +412,81 @@ def extract_baseline_features(participant_id, session_id, out_dir='output'):
 # ── REQ-B4: CLI Entry Point ───────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Record and process baseline EEG for a participant session.'
+    """
+    Standalone baseline runner — driven by the same GUI screens main.py uses.
+
+    Flow: participant ID → EEG calibration → 60 s eyes-open recording →
+    denoise → feature extraction. Output is written under <data-dir>/<pid>/.
+    """
+    from gui import (
+        show_participant_screen, show_calibration_screen, show_baseline_screen,
+        show_error_popup,
     )
-    parser.add_argument('participant_id',
-                        help='Participant ID (e.g. 001)')
-    parser.add_argument('session_id',
-                        help='Session ID (e.g. session_20260303_185045)')
+
+    parser = argparse.ArgumentParser(
+        description='Record, denoise, and extract features from baseline EEG '
+                    '(eyes-open rest). Run this before main.py.'
+    )
+    parser.add_argument('--participant-id', default=None,
+                        help='Participant ID. If omitted, the GUI prompts for it.')
     parser.add_argument('--data-dir', default='data',
                         help='Root data directory (default: data)')
     parser.add_argument('--out-dir', default='data',
                         help='Root output directory (default: data)')
     args = parser.parse_args()
 
-    record_baseline(
-        participant_id=args.participant_id,
-        session_id=args.session_id,
-        data_dir=args.data_dir,
-    )
+    # Step 1: Participant ID — GUI prompt, unless supplied on the CLI.
+    participant_id = args.participant_id
+    if not participant_id:
+        participant_id = show_participant_screen()
+        if not participant_id:
+            print('[baseline] Cancelled at participant registration.')
+            sys.exit(1)
 
-    preprocess_baseline(
-        participant_id=args.participant_id,
-        session_id=args.session_id,
-        data_dir=args.data_dir,
-        out_dir=args.out_dir,
-    )
+    session_id = f'session_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+    print(f'[baseline] Participant: {participant_id}')
+    print(f'[baseline] Session ID:  {session_id}')
 
+    # Step 2: EEG calibration — live signal check. Returns a live Muse session
+    # that we hand to the recording screen so we don't reconnect twice.
+    calib_muse = show_calibration_screen(proceed_label='Proceed to Baseline')
+    if calib_muse is None:
+        print('[baseline] Cancelled at EEG calibration.')
+        sys.exit(1)
+
+    # Step 3: Record 60 s eyes-open via the existing GUI screen.
+    if not show_baseline_screen(
+        participant_id=participant_id,
+        session_id=session_id,
+        data_dir=args.data_dir,
+        muse=calib_muse,
+    ):
+        print('[baseline] Cancelled at baseline recording.')
+        sys.exit(1)
+
+    # Step 4: Denoise the recording (in-process, no subprocess).
+    try:
+        denoise_baseline(
+            participant_id=participant_id,
+            session_id=session_id,
+            data_dir=args.data_dir,
+            out_dir=args.out_dir,
+        )
+    except Exception as e:
+        show_error_popup(f'Baseline denoising failed:\n{e}')
+        print(f'[baseline] Denoising failed: {e}')
+        sys.exit(1)
+
+    # Step 5: Extract reference features for analysis.py.
     extract_baseline_features(
-        participant_id=args.participant_id,
-        session_id=args.session_id,
+        participant_id=participant_id,
+        session_id=session_id,
         out_dir=args.out_dir,
     )
 
-    feat_path = os.path.join(args.out_dir, args.participant_id,
-                             f'{args.session_id}_baseline_features.json')
-    print(f"[baseline] Baseline complete. Features saved to {feat_path}")
+    feat_path = os.path.join(args.out_dir, participant_id,
+                             f'{session_id}_baseline_features.json')
+    print(f'[baseline] Baseline complete. Features saved to {feat_path}')
 
 
 if __name__ == '__main__':

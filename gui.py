@@ -327,15 +327,18 @@ def show_reconnect_screen(collector: 'SynchronizedCollector') -> bool:
             status_row('Arduino Uno R3',  '-ARDUINO_S-', disabled=not collector.use_arduino),
         ], font=('Helvetica', 12), pad=(10, 10))],
         [sg.Text('')],
-        [sg.Button('Abort', size=(12, 1), font=('Helvetica', 12),
+        [sg.Button('Ready', size=(14, 2), font=('Helvetica', 13, 'bold'),
+                   button_color=('white', 'green'), key='-READY-', disabled=True),
+         sg.Button('Abort', size=(12, 2), font=('Helvetica', 12),
                    button_color=('white', 'red'), key='-ABORT-')],
     ]
 
     window = sg.Window('BCI Experiment - Reconnecting', layout,
-                       element_justification='center', finalize=True, size=(440, 280),
+                       element_justification='center', finalize=True, size=(440, 320),
                        disable_close=True)
 
     result = False
+    ready_enabled = False
     while True:
         event, _ = window.read(timeout=100)
 
@@ -370,7 +373,12 @@ def show_reconnect_screen(collector: 'SynchronizedCollector') -> bool:
                 else:
                     elem.update(value='Connecting...', text_color='orange')
 
-        if muse_ready and polar_ready and arduino_ready:
+        all_ready = muse_ready and polar_ready and arduino_ready
+        if all_ready and not ready_enabled:
+            window['-READY-'].update(disabled=False)
+            ready_enabled = True
+
+        if event == '-READY-' and all_ready:
             result = True
             break
 
@@ -874,10 +882,11 @@ def show_red_circle_count_screen(device_name: str, actual_count: int) -> int:
     return count
 
 
-def show_nasa_tlx_screen(device_name: str) -> Optional[Dict[str, int]]:
+def show_nasa_tlx_screen(device_name: str) -> Dict[str, int]:
     """
     Show NASA TLX questionnaire for the given device condition.
-    Returns a dict of dimension -> score (0-100), or None if cancelled.
+    The window cannot be dismissed without submitting, so this always returns
+    a dict of dimension -> score (0-100).
     """
     import FreeSimpleGUI as sg
 
@@ -911,20 +920,18 @@ def show_nasa_tlx_screen(device_name: str) -> Optional[Dict[str, int]]:
         [sg.Text('Please rate your experience with the device you just used.',
                  font=('Helvetica', 11), justification='center', expand_x=True)],
         [sg.Text('')],
-        [sg.Column(slider_rows, scrollable=True, vertical_scroll_only=True, size=(620, 420))],
+        [sg.Column(slider_rows, element_justification='center')],
         [sg.Text('')],
-        [sg.Button('Submit', size=(15, 1), font=('Helvetica', 12), key='-SUBMIT-'),
-         sg.Button('Cancel', size=(15, 1), font=('Helvetica', 12))]
+        [sg.Button('Submit', size=(15, 1), font=('Helvetica', 12), key='-SUBMIT-')]
     ]
 
     window = sg.Window(f'NASA TLX — {device_name}', layout,
-                       element_justification='center', finalize=True, size=(680, 620))
+                       element_justification='center', finalize=True,
+                       size=(780, 1000), disable_close=True)
 
     scores = None
     while True:
         event, values = window.read()
-        if event in (sg.WIN_CLOSED, 'Cancel'):
-            break
         if event == '-SUBMIT-':
             scores = {}
             for dim, _ in dimensions:
@@ -1196,11 +1203,7 @@ def show_baseline_screen(participant_id: str, session_id: str, data_dir: str = '
     try:
         ok = _run_phase(
             phase_label='Eyes Open Rest',
-            instruction_lines=[
-                'Please relax and look straight ahead.',
-                'Do not blink excessively or move your head.',
-                'Remain as still as possible for the full duration.',
-            ],
+            instruction_lines=[],
             duration_s=EYES_OPEN_S,
             out_csv=eo_csv,
         )
@@ -1216,22 +1219,20 @@ def show_baseline_screen(participant_id: str, session_id: str, data_dir: str = '
         # attempts a new prepare_session().
         time.sleep(5)
 
-    # ── Completion notice ─────────────────────────────────────────────────────
-    sg.popup('Baseline recording complete!\n\n'
-             'Processing will now begin in the background.\n'
-             'The experiment will start shortly.',
-             title='Baseline Complete', font=('Helvetica', 12),
-             auto_close=True, auto_close_duration=4)
     return True
 
 
-def show_calibration_screen():
+def show_calibration_screen(proceed_label: str = 'Proceed'):
     """
     Show a live EEG calibration screen before baseline recording.
 
     Connects to the Muse 2, displays a real-time scrolling plot of all 4 EEG
     channels (TP9, AF7, AF8, TP10) so the experimenter can verify electrode
     contact quality.
+
+    Args:
+        proceed_label: Text shown on the proceed button. Callers can customise
+            for context (e.g. baseline uses 'Proceed to Baseline').
 
     Returns the live MuseBrainFlowProcessor if the user proceeds (caller must
     stop it), or None if aborted or connection failed.
@@ -1313,11 +1314,21 @@ def show_calibration_screen():
         [sg.Image(data=initial_img, key='-EEG_PLOT-',
                   size=(CANVAS_W, CANVAS_H))],
         [sg.Text('')],
-        [sg.Text('Signal quality:  ', font=('Helvetica', 11)),
+        [sg.Text('Overall signal quality:  ', font=('Helvetica', 11)),
          sg.Text('Waiting for data…', key='-QUALITY-',
                  font=('Helvetica', 11, 'bold'), text_color='gray')],
+        [sg.Text('Per-channel (1–40 Hz RMS, μV):',
+                 font=('Helvetica', 10), text_color='gray')],
+        [sg.Text('TP9',  font=('Helvetica', 10, 'bold'), size=(5, 1)),
+         sg.Text('—', key='-Q_TP9-',  font=('Helvetica', 10), size=(22, 1)),
+         sg.Text('AF7',  font=('Helvetica', 10, 'bold'), size=(5, 1)),
+         sg.Text('—', key='-Q_AF7-',  font=('Helvetica', 10), size=(22, 1))],
+        [sg.Text('AF8',  font=('Helvetica', 10, 'bold'), size=(5, 1)),
+         sg.Text('—', key='-Q_AF8-',  font=('Helvetica', 10), size=(22, 1)),
+         sg.Text('TP10', font=('Helvetica', 10, 'bold'), size=(5, 1)),
+         sg.Text('—', key='-Q_TP10-', font=('Helvetica', 10), size=(22, 1))],
         [sg.Text('')],
-        [sg.Button('Proceed to Baseline', size=(20, 1),
+        [sg.Button(proceed_label, size=(20, 1),
                    font=('Helvetica', 12), button_color=('white', '#2255aa'),
                    key='-PROCEED-'),
          sg.Button('Abort', size=(12, 1), font=('Helvetica', 12),
@@ -1370,28 +1381,58 @@ def show_calibration_screen():
                         margin = max(20, (vmax - vmin) * 0.2)
                         axes[i].set_ylim(vmin - margin, vmax + margin)
 
-                # Compute a simple signal quality metric: RMS of last 256 samples
-                recent = display_buf[:, -SAMPLING_RATE:]
-                valid_mask = ~np.isnan(recent)
-                rms_vals = []
-                for ch_idx in range(4):
-                    ch_data = recent[ch_idx, valid_mask[ch_idx]]
-                    if len(ch_data) > 10:
-                        rms_vals.append(float(np.sqrt(np.mean(ch_data ** 2))))
+                # ── Signal quality metric ─────────────────────────────────
+                # Bandpass-filter the last 2 s to 1–40 Hz before computing RMS.
+                # The 1 Hz high-pass strips eye blinks and slow drift (which
+                # otherwise inflate raw RMS into "noisy" territory on a
+                # perfectly seated headband); the 40 Hz low-pass clips mains
+                # residue and high-frequency EMG out of the amplitude metric.
+                #
+                # Thresholds (μV RMS, bandpassed):
+                #   <  3   Quiet (unusually low — verify electrode contact)
+                #   3–25   Good
+                #  25–60   Noisy — adjust headband
+                #   > 60   Very noisy — likely loose / moving electrode
+                QUALITY_WINDOW_S = 2
+                q_samples = QUALITY_WINDOW_S * SAMPLING_RATE
+                recent = display_buf[:, -q_samples:]
+                # filtfilt does not tolerate NaNs — wait until the 2 s window is
+                # fully populated before computing quality. During start-up the
+                # readout stays on its initial "Waiting…" text.
+                if not np.isnan(recent).any():
+                    bp = muse._apply_bandpass(recent, lowcut=1.0, highcut=40.0, order=4)
 
-                if rms_vals:
-                    avg_rms = np.mean(rms_vals)
-                    if avg_rms < 5:
-                        quality_text  = 'Flat / disconnected'
-                        quality_color = 'red'
-                    elif avg_rms < 30:
-                        quality_text  = 'Good'
-                        quality_color = 'green'
+                    per_ch_status: list[tuple[str, str, float]] = []  # (label, colour, rms)
+                    for ch_idx, ch_name in enumerate(CHANNELS):
+                        rms = float(np.sqrt(np.mean(bp[ch_idx] ** 2)))
+                        if rms < 3:
+                            label, colour = 'Quiet', 'orange'
+                        elif rms < 25:
+                            label, colour = 'Good', 'green'
+                        elif rms < 60:
+                            label, colour = 'Noisy', 'orange'
+                        else:
+                            label, colour = 'Very noisy', 'red'
+                        per_ch_status.append((label, colour, rms))
+
+                    # Update per-channel readouts
+                    for ch_name, (label, colour, rms) in zip(CHANNELS, per_ch_status):
+                        window[f'-Q_{ch_name}-'].update(
+                            f'{label}  ({rms:4.1f})', text_color=colour,
+                        )
+
+                    # Overall verdict: worst category wins so a single bad
+                    # electrode is not hidden behind 3 good ones.
+                    rank = {'green': 1, 'orange': 2, 'red': 3}
+                    worst_label, worst_colour, _ = max(per_ch_status,
+                                                       key=lambda s: rank[s[1]])
+                    if worst_colour == 'green':
+                        window['-QUALITY-'].update('Good', text_color='green')
                     else:
-                        quality_text  = 'Noisy — adjust headband'
-                        quality_color = 'orange'
-                    window['-QUALITY-'].update(quality_text,
-                                               text_color=quality_color)
+                        window['-QUALITY-'].update(
+                            f'{worst_label} — adjust headband',
+                            text_color=worst_colour,
+                        )
 
                 # Re-render and push to the GUI image element
                 png_bytes = _render_frame()

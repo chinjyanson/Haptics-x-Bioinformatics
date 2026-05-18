@@ -51,7 +51,18 @@ read AUDIO_DEVICE
 
 echo ""
 
-# ── Step 3: Launch experiment ─────────────────────────────────────────────────
+# ── Step 3: Baseline (optional) ───────────────────────────────────────────────
+echo "${BOLD}Run baseline recording before the experiment?${NC} (y/N): \c"
+read RUN_BASELINE
+if [[ "$RUN_BASELINE" =~ ^[Yy]$ ]]; then
+    echo ""
+    echo "${CYAN}Starting baseline...${NC}"
+    "$PYTHON" baseline.py
+    echo "${GREEN}Baseline complete.${NC}"
+    echo ""
+fi
+
+# ── Step 4: Launch experiment ─────────────────────────────────────────────────
 echo "${CYAN}Starting experiment...${NC}"
 echo ""
 if [[ -z "$AUDIO_DEVICE" ]]; then
