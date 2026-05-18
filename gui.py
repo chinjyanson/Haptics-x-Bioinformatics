@@ -506,7 +506,7 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
             ], font=('Helvetica', 12))],
             [sg.Text('Current Task:', font=('Helvetica', 11)),
              sg.Text(f'1 / {num_tasks}', key='-TASK_NUM-', font=('Helvetica', 11, 'bold'))],
-            [sg.Text('Press Right Arrow to end current task and move to next.', font=('Helvetica', 10))],
+            [sg.Text('Press Space to end current task and move to next.', font=('Helvetica', 10))],
             [sg.Text('')],
             [sg.Text(f'Session ends automatically after task {num_tasks}.', font=('Helvetica', 10))],
             [sg.Text('')],
@@ -528,8 +528,8 @@ def show_experiment_screen(collector: 'SynchronizedCollector', output_path: str,
                        element_justification='center', finalize=True, size=(820, 520),
                        disable_close=True)  # Prevent accidental close
 
-    # Bind right arrow for task transitions (window must be focused)
-    window.bind("<Right>", "-NEXT_TASK-")
+    # Bind space bar for task transitions (window must be focused)
+    window.bind("<space>", "-NEXT_TASK-")
 
     current_task = 1
 
