@@ -1022,80 +1022,57 @@ def start_collection_threads(collector: SynchronizedCollector):
     return muse_thread, polar_thread, arduino_thread
 
 
-def main():
-    """Main entry point for synchronized data collection with GUI"""
+# ── Mode metadata (shared by main.py and the standalone launchers) ───────────
+# Maps a CLI-friendly slug to (display name, HapticsController session_mode).
+MODE_MAP = {
+    "auditory":       ("Auditory",       "auditory"),
+    "vibrations":     ("Vibrations",     "vibrations"),
+    "shape_changing": ("Shape Changing", "shape_changing"),
+}
+
+
+def _build_arg_parser(description: str):
+    """Build the argparse parser shared by main.py and the per-mode launchers."""
     import argparse
-
-    parser = argparse.ArgumentParser(
-        description='Synchronized Muse 2 EEG, Polar H10 HR, and Arduino encoder data collection'
-    )
-    parser.add_argument(
-        '--muse-serial',
-        type=str,
-        default=None,
-        help='Serial port for BLED112 dongle (e.g. /dev/ttyACM0 or COM3); omit for native Bluetooth'
-    )
-    parser.add_argument(
-        '--muse-mac',
-        type=str,
-        default=None,
-        help='MAC address of Muse 2 device'
-    )
-    parser.add_argument(
-        '--polar-name',
-        type=str,
-        default="Polar H10",
-        help='Name of Polar device to scan for (default: "Polar H10")'
-    )
-
-    parser.add_argument(
-        '--audio-out-device',
-        type=int,
-        default=None,
-        help='Audio output device index for haptic feedback (use --list-audio-devices to see options)'
-    )
-    parser.add_argument(
-        '--list-audio-devices',
-        action='store_true',
-        help='List available audio output devices and exit'
-    )
-
-    parser.add_argument(
-        '--no-filter',
-        action='store_true',
-        help='Disable bandpass/notch filtering for EEG data'
-    )
-    parser.add_argument(
-        '--arduino-port',
-        type=str,
-        default=ARDUINO_DEFAULT_PORT,
-        help='Serial port for Arduino Uno R3 (e.g. /dev/ttyACM0 or COM3)'
-    )
-    parser.add_argument(
-        '--arduino-baud',
-        type=int,
-        default=ARDUINO_DEFAULT_BAUD,
-        help='Baud rate for Arduino serial communication (default: 115200)'
-    )
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument('--muse-serial', type=str, default=None,
+        help='Serial port for BLED112 dongle (e.g. /dev/ttyACM0 or COM3); omit for native Bluetooth')
+    parser.add_argument('--muse-mac', type=str, default=None,
+        help='MAC address of Muse 2 device')
+    parser.add_argument('--polar-name', type=str, default="Polar H10",
+        help='Name of Polar device to scan for (default: "Polar H10")')
+    parser.add_argument('--audio-out-device', type=int, default=None,
+        help='Audio output device index for haptic feedback (use --list-audio-devices to see options)')
+    parser.add_argument('--list-audio-devices', action='store_true',
+        help='List available audio output devices and exit')
+    parser.add_argument('--no-filter', action='store_true',
+        help='Disable bandpass/notch filtering for EEG data')
+    parser.add_argument('--arduino-port', type=str, default=ARDUINO_DEFAULT_PORT,
+        help='Serial port for Arduino Uno R3 (e.g. /dev/ttyACM0 or COM3)')
+    parser.add_argument('--arduino-baud', type=int, default=ARDUINO_DEFAULT_BAUD,
+        help='Baud rate for Arduino serial communication (default: 115200)')
+    return parser
 
 
-    args = parser.parse_args()
+def _maybe_list_audio_devices_and_exit(args) -> bool:
+    """If --list-audio-devices was passed, print them and return True."""
+    if not args.list_audio_devices:
+        return False
+    import sounddevice as sd
+    devices = sd.query_devices()
+    print("\nAvailable audio OUTPUT devices (for --audio-out-device):")
+    print("-" * 50)
+    for i, dev in enumerate(devices):
+        if dev['max_output_channels'] > 0:
+            marker = " [DEFAULT]" if i == sd.default.device[1] else ""
+            print(f"  [{i}] {dev['name']}{marker}  ({dev['default_samplerate']:.0f} Hz)")
+    print("-" * 50)
+    return True
 
-    # Handle list audio devices
-    if args.list_audio_devices:
-        import sounddevice as sd
-        devices = sd.query_devices()
-        print("\nAvailable audio OUTPUT devices (for --audio-out-device):")
-        print("-" * 50)
-        for i, dev in enumerate(devices):
-            if dev['max_output_channels'] > 0:
-                marker = " [DEFAULT]" if i == sd.default.device[1] else ""
-                print(f"  [{i}] {dev['name']}{marker}  ({dev['default_samplerate']:.0f} Hz)")
-        print("-" * 50)
-        return
 
-    # Create collector
-    collector = SynchronizedCollector(
+def _build_collector(args) -> 'SynchronizedCollector':
+    """Construct a SynchronizedCollector from parsed CLI args."""
+    return SynchronizedCollector(
         muse_serial_port=args.muse_serial,
         muse_mac_address=args.muse_mac,
         polar_device_name=args.polar_name,
@@ -1108,183 +1085,239 @@ def main():
         audio_out_device=args.audio_out_device,
     )
 
-    # Load haptic targets once — used by all three device sessions
+
+def run_single_session(
+    collector: 'SynchronizedCollector',
+    participant_folder: Path,
+    session_timestamp: str,
+    participant_id: str,
+    device_name: str,
+    session_mode: str,
+    haptic_targets: list,
+    session_threads,
+    is_final_session: bool,
+    next_device_name: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Run one experiment session for a single feedback mode.
+
+    Returns the completed-session dict (the same shape as items in main()'s
+    completed_sessions list), or None if the session was cancelled at countdown
+    or device swap. Caller is responsible for collector lifecycle (begin/end
+    threads, disconnect_devices).
+    """
+    print(f"\n{'='*60}")
+    print(f"SESSION: {device_name}")
+    print(f"{'='*60}")
+
+    device_slug = device_name.lower().replace(' ', '_')
+    session_id  = device_slug
+    output_path = str(
+        participant_folder / f"session_{session_timestamp}_{device_slug}"
+    )
+
+    if not show_countdown_screen():
+        print(f"Experiment cancelled at countdown for {device_name}.")
+        return None
+
+    haptics = HapticsController(
+        arduino_bridge=collector.arduino,
+        session_mode=session_mode,
+        audio_out_device=collector.audio_out_device,
+    )
+
+    session_stats = show_experiment_screen(
+        collector, output_path,
+        session_id=session_id,
+        is_final_session=is_final_session,
+        threads=session_threads,
+        haptics=haptics,
+        haptic_targets=haptic_targets,
+    )
+
+    start_ts, end_ts = collector.data_store.get_session_slice(session_id)
+    actual_red_count = sum(
+        1 for m in collector.data_store.task_markers
+        if m.event == "oddball_onset"
+        and m.timestamp >= (start_ts or 0)
+        and m.timestamp <= (end_ts or float('inf'))
+    )
+    red_count = show_red_circle_count_screen(device_name, actual_red_count)
+
+    tlx_scores = show_nasa_tlx_screen(device_name)
+
+    tlx_path = f"{output_path}_nasa_tlx.json"
+    with open(tlx_path, 'w') as f:
+        json.dump({
+            'device': device_name,
+            'participant_id': participant_id,
+            'red_circle_count': red_count,
+            'actual_red_circle_count': actual_red_count,
+            'scores': tlx_scores,
+            'average': sum(tlx_scores.values()) / len(tlx_scores),
+        }, f, indent=2)
+    print(f"NASA TLX scores saved to {tlx_path}")
+
+    session_summary: Dict[str, Any] = {
+        'device': device_name,
+        'output_path': output_path,
+        'tlx_scores': tlx_scores,
+        'red_circle_count': red_count,
+        'actual_red_circle_count': actual_red_count,
+        **(session_stats or {}),
+    }
+
+    # Device-swap screen (only if there's another session coming next)
+    if not is_final_session and next_device_name is not None:
+        if not show_device_swap_screen(next_device_name):
+            print("Experiment aborted at device swap.")
+            session_summary['_aborted_at_swap'] = True
+
+    return session_summary
+
+
+def run_experiment(mode_slugs: List[str]) -> None:
+    """
+    Run the full experiment for the given ordered list of mode slugs.
+
+    mode_slugs: subset (and order) of MODE_MAP keys, e.g.
+        ["auditory", "vibrations", "shape_changing"]  — full 3-session flow
+        ["auditory"]                                   — single mode standalone
+
+    Handles argparse, device connections, calibration, the per-session loop,
+    and final completion screen. This is the shared body of main.py and the
+    three standalone launchers.
+    """
+    # Validate mode_slugs
+    for slug in mode_slugs:
+        if slug not in MODE_MAP:
+            raise ValueError(f"Unknown mode '{slug}'. Valid modes: {list(MODE_MAP)}")
+
+    parser = _build_arg_parser(
+        'Synchronized Muse 2 EEG, Polar H10 HR, and Arduino encoder data collection'
+    )
+    args = parser.parse_args()
+
+    if _maybe_list_audio_devices_and_exit(args):
+        return
+
+    collector = _build_collector(args)
     haptic_targets_all = load_haptic_targets()
 
-    DEVICES = ['Auditory', 'Vibrations', 'Shape Changing']
-    if True:
+    # Resolve mode_slugs to display names in order
+    device_names = [MODE_MAP[s][0] for s in mode_slugs]
 
-        try:
-            # Step 1: Participant ID
-            participant_id = show_participant_screen()
-            if not participant_id:
-                print("Experiment cancelled at participant registration.")
-                return
+    try:
+        # Step 1: Participant ID
+        participant_id = show_participant_screen()
+        if not participant_id:
+            print("Experiment cancelled at participant registration.")
+            return
 
-            # Create participant folder
-            participant_folder = create_participant_folder(participant_id)
-            session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        participant_folder = create_participant_folder(participant_id)
+        session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-            print(f"Participant: {participant_id}")
-            print(f"Data will be saved under: {participant_folder}")
+        print(f"Participant: {participant_id}")
+        print(f"Data will be saved under: {participant_folder}")
 
-            # Step 2: Device Connection (done once — sensors stay on throughout)
-            if not show_connection_screen(collector):
-                print("Experiment cancelled at device connection.")
-                collector.disconnect_devices()
-                return
+        # Step 2: Device Connection (done once — sensors stay on throughout)
+        if not show_connection_screen(collector):
+            print("Experiment cancelled at device connection.")
+            collector.disconnect_devices()
+            return
 
-            # Step 3: Consent Form
-            if not show_consent_screen():
-                print("Experiment cancelled - consent not given.")
-                collector.disconnect_devices()
-                return
+        # Step 3: Consent Form
+        if not show_consent_screen():
+            print("Experiment cancelled - consent not given.")
+            collector.disconnect_devices()
+            return
 
-            # Step 4: EEG signal check — live calibration view before sessions.
-            # show_calibration_screen opens its own Muse session, so release the
-            # collector's existing one first and let the per-session thread
-            # re-acquire it afterwards.
-            if collector.use_muse:
-                if collector.muse is not None:
-                    try:
-                        collector.muse.stop()
-                    except Exception:
-                        pass
-                    collector.muse = None
-                    collector.muse_connected = False
-
-                calib_muse = show_calibration_screen()
-                if calib_muse is None:
-                    print("Experiment cancelled at EEG signal check.")
-                    collector.disconnect_devices()
-                    return
-                # Stop the calibration session so the BLE stack is free for
-                # the collection thread to open a fresh one.
+        # Step 4: EEG signal check — live calibration view before sessions.
+        # show_calibration_screen opens its own Muse session, so release the
+        # collector's existing one first and let the per-session thread
+        # re-acquire it afterwards.
+        if collector.use_muse:
+            if collector.muse is not None:
                 try:
-                    calib_muse.stop()
+                    collector.muse.stop()
                 except Exception:
                     pass
-                # BrainFlow's BLE teardown is not instantaneous; give it time
-                # before the collection thread calls prepare_session().
-                time.sleep(5)
+                collector.muse = None
+                collector.muse_connected = False
 
-            # Baseline recording, denoising, and feature extraction are run
-            # separately via `python baseline.py` before launching main.py.
-            session_id = f"session_{session_timestamp}"
+            calib_muse = show_calibration_screen()
+            if calib_muse is None:
+                print("Experiment cancelled at EEG signal check.")
+                collector.disconnect_devices()
+                return
+            try:
+                calib_muse.stop()
+            except Exception:
+                pass
+            # BrainFlow's BLE teardown is not instantaneous; give it time
+            # before the collection thread calls prepare_session().
+            time.sleep(5)
 
-            # Run three device sessions — threads start ONCE and run continuously.
-            completed_sessions = []
+        # Initialise data store and start all threads (they will block until
+        # begin_session() is called inside show_experiment_screen).
+        _reset_data_store(collector)
+        session_threads = start_collection_threads(collector)
 
-            # Initialise data store and start all threads (they will block until
-            # begin_session() is called inside show_experiment_screen).
-            _reset_data_store(collector)
-            session_threads = start_collection_threads(collector)
+        # First session only: wait for all devices to signal ready.
+        if not show_reconnect_screen(collector):
+            print("Experiment aborted at reconnect screen.")
+            collector.stop_all_threads()
+            collector.disconnect_devices()
+            return
 
-            # First session only: wait for all devices to signal ready.
-            if not show_reconnect_screen(collector):
-                print("Experiment aborted at reconnect screen.")
+        completed_sessions: List[Dict[str, Any]] = []
+
+        for session_idx, slug in enumerate(mode_slugs):
+            device_name, session_mode = MODE_MAP[slug]
+            is_final = (session_idx == len(mode_slugs) - 1)
+            next_device = device_names[session_idx + 1] if not is_final else None
+
+            summary = run_single_session(
+                collector=collector,
+                participant_folder=participant_folder,
+                session_timestamp=session_timestamp,
+                participant_id=participant_id,
+                device_name=device_name,
+                session_mode=session_mode,
+                haptic_targets=haptic_targets_all.get(device_name, []),
+                session_threads=session_threads,
+                is_final_session=is_final,
+                next_device_name=next_device,
+            )
+
+            if summary is None:
+                # Cancelled at countdown
                 collector.stop_all_threads()
                 collector.disconnect_devices()
                 return
 
-            for session_idx, device_name in enumerate(DEVICES):
-                print(f"\n{'='*60}")
-                print(f"SESSION {session_idx + 1}/3: {device_name}")
-                print(f"{'='*60}")
+            completed_sessions.append(summary)
 
-                device_slug = device_name.lower().replace(' ', '_')
-                session_id  = device_slug
-                output_path = str(
-                    participant_folder / f"session_{session_timestamp}_{device_slug}"
-                )
-                is_final = (session_idx == len(DEVICES) - 1)
+            # Abort triggered from device-swap screen
+            if summary.get('_aborted_at_swap'):
+                collector.stop_all_threads()
+                collector.disconnect_devices()
+                break
 
-                # Countdown
-                if not show_countdown_screen():
-                    print(f"Experiment cancelled at countdown for {device_name}.")
-                    collector.stop_all_threads()
-                    collector.disconnect_devices()
-                    return
+        show_completion_screen(completed_sessions, str(participant_folder))
+        print("\nExperiment completed successfully!")
 
-                # Build a per-session HapticsController
-                session_mode = {
-                    "Auditory":       "auditory",
-                    "Vibrations":     "vibrations",
-                    "Shape Changing": "shape_changing",
-                }.get(device_name, "auditory")
-                haptics = HapticsController(
-                    arduino_bridge=collector.arduino,
-                    session_mode=session_mode,
-                    audio_out_device=collector.audio_out_device,
-                )
-                session_targets = haptic_targets_all.get(device_name, [])
+    except Exception as e:
+        show_error_popup(f'An error occurred:\n{str(e)}')
+        print(f"\nError during experiment: {e}")
+        raise
+    finally:
+        collector.disconnect_devices()
 
-                # Run the experiment session
-                session_stats = show_experiment_screen(
-                    collector, output_path,
-                    session_id=session_id,
-                    is_final_session=is_final,
-                    threads=session_threads,
-                    haptics=haptics,
-                    haptic_targets=session_targets,
-                )
 
-                # Red circle count (scoped to this session's markers)
-                start_ts, end_ts = collector.data_store.get_session_slice(session_id)
-                actual_red_count = sum(
-                    1 for m in collector.data_store.task_markers
-                    if m.event == "oddball_onset"
-                    and m.timestamp >= (start_ts or 0)
-                    and m.timestamp <= (end_ts or float('inf'))
-                )
-                red_count = show_red_circle_count_screen(device_name, actual_red_count)
-
-                # NASA TLX for this device (compulsory — always returns scores)
-                tlx_scores = show_nasa_tlx_screen(device_name)
-
-                tlx_path = f"{output_path}_nasa_tlx.json"
-                with open(tlx_path, 'w') as f:
-                    json.dump({
-                        'device': device_name,
-                        'participant_id': participant_id,
-                        'red_circle_count': red_count,
-                        'actual_red_circle_count': actual_red_count,
-                        'scores': tlx_scores,
-                        'average': sum(tlx_scores.values()) / len(tlx_scores)
-                    }, f, indent=2)
-                print(f"NASA TLX scores saved to {tlx_path}")
-
-                completed_sessions.append({
-                    'device': device_name,
-                    'output_path': output_path,
-                    'tlx_scores': tlx_scores,
-                    'red_circle_count': red_count,
-                    'actual_red_circle_count': actual_red_count,
-                    **(session_stats or {}),
-                })
-
-                # Device swap screen (not shown after the last session)
-                if not is_final:
-                    next_device = DEVICES[session_idx + 1]
-                    if not show_device_swap_screen(next_device):
-                        print("Experiment aborted at device swap.")
-                        collector.stop_all_threads()
-                        collector.disconnect_devices()
-                        break
-                    # Threads are already paused (end_session was called inside
-                    # show_experiment_screen). No reset or reconnect needed.
-
-            # Step 8: Final completion screen
-            show_completion_screen(completed_sessions, str(participant_folder))
-
-            print("\nExperiment completed successfully!")
-
-        except Exception as e:
-            show_error_popup(f'An error occurred:\n{str(e)}')
-            print(f"\nError during experiment: {e}")
-            raise
-        finally:
-            collector.disconnect_devices()
+def main():
+    """Default entry point — runs the full 3-session flow."""
+    run_experiment(["auditory", "vibrations", "shape_changing"])
 
 
 if __name__ == "__main__":
